@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "description": "CLODEx RP Studio — Physiology & 18+ Biology Tracker, Director panel & Anti-Slop, Living World (phone, session wiki, hidden thoughts), Lore Navigator (Codex), and Live Scene Backgrounds/Video for Tavo AI (.tpg) and SillyTavern",
-  "license": "MIT",
+  "license": "LicenseRef-CLODEx-Source-Available-1.0",
   "homepage": "https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio",
   "repository": {
     "type": "git",

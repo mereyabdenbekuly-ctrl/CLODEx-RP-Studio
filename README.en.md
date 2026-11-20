@@ -2,7 +2,7 @@
 
 **AI Physiology & 18+ Biology Tracker + Underworld, Wanted & Relics (Casino, Pawn Shop, Shadow Services, 12 Egg Skins & ES256 Signed Relics) + Director & Living World (One-Turn Director Strip, Local Anti-Slop Radar, Hidden Thoughts & Action Buttons, Click-to-Reveal Smartphone/Diary, Living Session Wiki, Branch-Safe Journals & `.clodex-pack` Presets) + Cradle & Familiar + Lore Navigator (Codex) + Live Scene Backgrounds, Video & Voice — powered by a single CLODEx API key.**
 
-[Русская документация](README.md) · [Changelog](CHANGELOG.md) · [MIT](LICENSE)
+[Русская документация](README.md) · [Changelog](CHANGELOG.md) · [License](LICENSE)
 
 ---
 

@@ -1,21 +1,100 @@
-MIT License
+CLODEx RP Studio Source-Available License v1.0
+Copyright (c) 2026 CLODEx (https://clodex.xyz). All rights reserved.
 
-Copyright (c) 2026 CLODEx
+========================================================================
+ENGLISH VERSION (CONTROLLING TEXT)
+========================================================================
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+1. Purpose
+The source code of CLODEx RP Studio (the "Software") is made publicly readable
+for transparency and security auditing by the roleplay community. It is NOT
+licensed under an open-source license such as MIT, Apache, or GPL.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+2. Permitted Uses
+Subject to the restrictions in Section 3, CLODEx grants you a personal,
+worldwide, royalty-free, non-exclusive, revocable license to:
+  (a) download, install, and use the Software in Tavo AI, SillyTavern, or
+      personal roleplay clients in conjunction with the official CLODEx
+      platform (https://clodex.xyz);
+  (b) read and inspect the source code for security review, debugging, and
+      educational study;
+  (c) submit bug reports, issues, and pull requests to the official CLODEx
+      repository; and
+  (d) freely create, share, publish, and distribute user-generated content
+      created with the Software (including .clodex-pack data presets, PNG
+      Character Cards, screenshots, and recordings).
 
+3. Prohibited Uses (Strict Restrictions)
+Without prior written permission from CLODEx, you may NOT:
+  (a) Endpoint-Modified Forks & Redistribution: publish, distribute, host,
+      mirror, or share any fork, modified build, .tpg package, .zip archive,
+      or derivative work that alters, replaces, proxies, or bypasses the
+      official https://clodex.xyz API origin, API key validation, billing or
+      quota logic, or ES256 relic signature verification;
+  (b) Competing Services & Commercial Exploitation: use, copy, adapt, or
+      incorporate the Software (or any substantial part of its simulation
+      core, UI, prompts, underworld/casino mechanics, gacha/skin systems, or
+      bundler) to build, operate, promote, or support any competing AI API
+      provider, proxy, reseller, key shop, paid extension, or commercial
+      product;
+  (c) Rebranding & Notice Removal: remove, obscure, or alter any CLODEx
+      copyright notice, brand name, attribution, or this LICENSE file, or
+      redistribute the Software under a different product name.
+
+4. Termination
+Any breach of Section 3 automatically and immediately terminates all rights
+granted to you under this License and constitutes copyright infringement
+subject to takedown notices (including DMCA takedowns) and legal remedies.
+
+5. Disclaimer of Warranty & Limitation of Liability
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL
+CLODEX OR THE COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+========================================================================
+РУССКАЯ ВЕРСИЯ (ИНФОРМАЦИОННЫЙ ПЕРЕВОД)
+========================================================================
+
+Лицензия CLODEx RP Studio с открытым для чтения кодом (v1.0)
+Copyright (c) 2026 CLODEx (https://clodex.xyz). Все права защищены.
+
+1. Назначение
+Исходный код CLODEx RP Studio («ПО») открыт для чтения ради прозрачности и
+проверки безопасности пользователями. Данное ПО НЕ распространяется под
+свободными лицензиями (MIT, Apache, GPL и т.п.).
+
+2. Разрешённое использование
+При соблюдении ограничений Раздела 3 вам предоставляется бесплатная личная
+неисключительная отзывная лицензия на:
+  (а) скачивание, установку и использование ПО в Tavo AI, SillyTavern и
+      личных клиентах совместно с официальной платформой CLODEx
+      (https://clodex.xyz);
+  (б) чтение и аудит исходного кода в целях проверки безопасности и обучения;
+  (в) отправку баг-репортов и pull request'ов в официальный репозиторий;
+  (г) свободное создание и распространение пользовательского контента
+      (файлов пресетов .clodex-pack, PNG-карточек персонажей, скриншотов и видео).
+
+3. Строгие запреты
+Без предварительного письменного согласия CLODEx ЗАПРЕЩАЕТСЯ:
+  (а) Публикация форков с подменой эндпоинта: публиковать, выкладывать в
+      открытый доступ, распространять или пересылать модифицированные версии,
+      форки, пакеты .tpg, архивы .zip или производные расширения, в которых
+      изменён, заменён, проксирован или обойдён официальный эндпоинт
+      https://clodex.xyz, проверка ключей, логика квот/баланса или проверка
+      криптоподписей Реликвий (ES256);
+  (б) Использование в сторонних прокси и коммерции: копировать, портировать
+      или использовать ПО (полностью или в существенной части — включая ядро
+      симуляции, UI, промпты, казик/подполье, гачу/скины и сборщик) для работы,
+      рекламы или продвижения сторонних API-прокси, реселлеров, магазинов
+      ключей или платных продуктов;
+  (в) Ребрендинг и удаление копирайтов: удалять упоминания CLODEx и данный
+      файл LICENSE либо распространять ПО под чужим названием.
+
+4. Прекращение действия
+Любое нарушение Раздела 3 автоматически прекращает действие данной лицензии
+и влечёт отзыв прав и подачу официальных жалоб о нарушении авторских прав
+(включая DMCA Takedown).
