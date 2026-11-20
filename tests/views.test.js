@@ -6,7 +6,7 @@ import { createRpStudioController } from '../src/core/hud.js';
 import { EN_CATALOG, RU_CATALOG } from '../src/core/localesData.js';
 import { packBuild } from '../src/core/pack.js';
 import { phoneCreateStore, phoneIngestEvents } from '../src/core/phone.js';
-import { createChatState } from '../src/core/physiology.js';
+import { createChatState, layEggs, triggerConception } from '../src/core/physiology.js';
 import { TRACKER_MAX_TOKENS } from '../src/core/prompts.js';
 import { wikiCreateStore, wikiManualEdit } from '../src/core/wiki.js';
 
@@ -32,7 +32,7 @@ function makeFakeDom() {
             this.ownerDocument = doc;
             this.nodeType = 1;
             this.tagName = String(tag).toUpperCase();
-            this.style = {};
+            this._style = {};
             this.dataset = {};
             this.attributes = {};
             this.childNodes = [];
@@ -48,6 +48,9 @@ function makeFakeDom() {
             this.id = '';
             this.title = '';
             this.src = '';
+            this.href = '';
+            this.target = '';
+            this.rel = '';
             this.alt = '';
             this.rows = 0;
             this.min = '';
@@ -62,6 +65,12 @@ function makeFakeDom() {
             this.loop = false;
             this.muted = false;
             this.playsInline = false;
+        }
+        get style() {
+            return this._style;
+        }
+        set style(_v) {
+            throw new TypeError('Strict WebView: cannot assign string directly to Element.style');
         }
         get textContent() {
             return this.childNodes.map(c => c.textContent ?? '').join('');
@@ -216,7 +225,7 @@ function makeFakeDom() {
     return doc;
 }
 
-function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, settingsOverrides = {}, fetchHandler = null } = {}) {
+function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, settingsOverrides = {}, rpPrefsOverrides = null, fetchHandler = null, confirm = async () => true } = {}) {
     const doc = makeFakeDom();
     let currentLocale = locale;
     let currentInsets = { topBar: 12, bottomInput };
@@ -226,7 +235,10 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
     let state = createChatState('2026-11-19');
     Object.assign(state.world, chatOverrides.world || {});
     Object.assign(state.counters, chatOverrides.counters || {});
+    if (chatOverrides.underworld) Object.assign(state.underworld, chatOverrides.underworld);
+    if (chatOverrides.inventory) Object.assign(state.inventory, chatOverrides.inventory);
     if (Array.isArray(chatOverrides.companions)) state.companions = chatOverrides.companions;
+    let savedRpPrefs = rpPrefsOverrides ? structuredClone(rpPrefsOverrides) : {};
 
     const settings = {
         apiKey: 'sk-views_test_123456',
@@ -274,11 +286,15 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         ],
     };
 
-    const calls = { chat: [], image: [], speech: [], confirm: [], exported: [], savedMedia: [] };
+    const calls = { chat: [], image: [], speech: [], confirm: [], exported: [], savedMedia: [], copied: [] };
     let nextImportPack = null;
 
     const mockFetch = async (url, init = {}) => {
         const u = String(url);
+        if (fetchHandler) {
+            const custom = await fetchHandler(u, init, calls);
+            if (custom) return custom;
+        }
         if (u.endsWith('/v1/models')) {
             return new Response(JSON.stringify({
                 data: [
@@ -294,9 +310,11 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         if (u.endsWith('/api/pricing') || u.endsWith('/api/status')) {
             return new Response(JSON.stringify({ data: [] }), { status: 200 });
         }
-        if (fetchHandler) {
-            const custom = await fetchHandler(u, init, calls);
-            if (custom) return custom;
+        if (u.endsWith('/v1/rp/relics/catalog')) {
+            return new Response(JSON.stringify({ editions: [] }), { status: 200 });
+        }
+        if (u.endsWith('/v1/rp/relics/inventory')) {
+            return new Response(JSON.stringify({ relics: [] }), { status: 200 });
         }
         if (u.endsWith('/v1/chat/completions')) {
             const body = JSON.parse(init.body);
@@ -345,7 +363,7 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         getInsets: () => currentInsets,
         onInsetsChange: cb => { insetListeners.add(cb); return () => insetListeners.delete(cb); },
         t,
-        confirm: async msg => { calls.confirm.push(msg); return true; },
+        confirm: async msg => { calls.confirm.push(msg); return confirm(msg); },
         getEffectiveKey: () => settings.apiKey,
         getSettings: () => settings,
         async updateSettings(patch) { Object.assign(settings, patch); },
@@ -355,6 +373,10 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         getLatestTurnKey: async () => latestTurnKey,
         loadStore: async name => (stores[name] ? structuredClone(stores[name]) : null),
         saveStore: async (name, value) => { stores[name] = structuredClone(value); },
+        loadRpPrefs: async () => structuredClone(savedRpPrefs),
+        saveRpPrefs: async value => { savedRpPrefs = structuredClone(value || {}); },
+        resolveMediaSrc: path => (path && !/^(data:|https?:|resolved:)/.test(path) ? `resolved://${path}` : path),
+        copyText: async txt => { calls.copied.push(String(txt)); },
         savePhoneMedia: async ({ entryId, kind }) => {
             const path = `files/chat/clodex-phone-${entryId}.${kind === 'voice' ? 'mp3' : 'png'}`;
             calls.savedMedia.push(path);
@@ -377,6 +399,7 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         stores,
         getState: () => state,
         getSettings: () => settings,
+        getRpPrefs: () => savedRpPrefs,
         setActiveKeys: k => { activeKeys = k; },
         setLatestTurnKey: k => { latestTurnKey = k; },
         setImportPack: p => { nextImportPack = p; },
@@ -393,6 +416,23 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
 }
 
 const flush = () => new Promise(resolve => setTimeout(resolve, 15));
+
+test('paid ritual sends no model requests before confirmation or after cancellation', async () => {
+    let answer;
+    const h = makeTestHarness({ locale: 'en', confirm: () => new Promise(resolve => { answer = resolve; }) });
+    h.controller.openTab('gacha');
+    const button = h.doc.body.querySelector('[data-rp-action="paid-ritual"]');
+    assert.ok(button);
+    button.click();
+    assert.equal(h.calls.confirm.length, 1);
+    assert.match(h.calls.confirm[0], /Estimated cost/);
+    assert.equal(h.calls.chat.length, 0);
+    assert.equal(h.calls.image.length, 0);
+    answer(false);
+    await flush();
+    assert.equal(h.calls.chat.length, 0);
+    assert.equal(h.calls.image.length, 0);
+});
 
 test('All screens, header order, single-row 4 tabs, HUD <= 4 chips, and RU/EN localization parity', async () => {
     const h = makeTestHarness({
@@ -423,15 +463,19 @@ test('All screens, header order, single-row 4 tabs, HUD <= 4 chips, and RU/EN lo
     assert.match(chips[2].textContent, /🐣/);
     assert.match(chips[3].textContent, /📱 \+2.*🎬/);
 
-    // Check every screen & sub-tab in both RU and EN with zero missing / raw keys
+    // Check every screen & sub-tab in both RU and EN with zero missing / raw keys & zero nested .clodex-rp-tab-body
     for (const lang of ['ru', 'en']) {
         h.setLocale(lang);
-        for (const tab of ['tracker', 'cradle', 'codex', 'wiki', 'style', 'scene', 'forge', 'packs', 'account', 'phone']) {
+        for (const tab of ['tracker', 'underworld', 'cradle', 'gacha', 'relics', 'codex', 'wiki', 'style', 'scene', 'forge', 'packs', 'account', 'phone']) {
             h.controller.openTab(tab);
             await flush();
 
             const drawer = h.doc.body.querySelector('.clodex-rp-drawer');
             assert.ok(drawer, `Drawer must exist for ${tab}`);
+
+            // Never nest .clodex-rp-tab-body inside .clodex-rp-tab-body (prevents double 24px padding on 390px mobile)
+            assert.equal(drawer.querySelectorAll('.clodex-rp-tab-body .clodex-rp-tab-body').length, 0,
+                `Double .clodex-rp-tab-body nesting detected on ${lang}/${tab}`);
 
             // Primary navigation stays strictly 4 tabs in 1 row
             const tabBtns = drawer.querySelectorAll('.clodex-rp-tabs .clodex-rp-tab-btn');
@@ -448,7 +492,7 @@ test('All screens, header order, single-row 4 tabs, HUD <= 4 chips, and RU/EN lo
 
             // No raw unresolved keys leaked into visible text
             const text = drawer.textContent;
-            assert.ok(!/\b(?:director|slop|turn|phone|wiki|pack|codex|tab|hud|account)\.[a-z0-9_]+\b/i.test(text),
+            assert.ok(!/\b(?:director|slop|turn|phone|wiki|pack|codex|tab|hud|account|uw|gacha|relic|cradle|bio|vitals|meters|inv|scene|voice|forge|tracker)\.[a-z][a-zA-Z0-9_]*\b/.test(text),
                 `Raw key found in ${lang}/${tab}: ${text}`);
         }
     }
@@ -767,5 +811,411 @@ test('Mobile Tavo hotfix: drawer mask starts hidden/non-blocking, X closes clean
     assert.equal(mask.hidden, true);
     assert.equal(mask.style.display, 'none');
 
+    h.controller.dispose();
+});
+
+test('HUD pill renders compact underworld secondary chip when heat >= 1 or turnsInDebt >= 1 while capping <= 4 chips', async () => {
+    const h = makeTestHarness({
+        locale: 'ru',
+        chatOverrides: {
+            world: { enableVitals: true, enableAdultBiology: true },
+            underworld: { heat: 0, debt: 0, turnsInDebt: 0, currency: '$' },
+        },
+    });
+    await flush();
+
+    const pill = h.doc.body.querySelector('.clodex-rp-hud-pill');
+    assert.equal(pill.querySelector('[data-rp-chip="underworld"]'), null);
+
+    const st = h.getState();
+    st.underworld.heat = 2.5;
+    st.underworld.debt = 1500;
+    st.underworld.turnsInDebt = 2;
+    h.controller.renderAll();
+
+    const uwChip = pill.querySelector('[data-rp-chip="underworld"]');
+    assert.ok(uwChip);
+    assert.equal(uwChip.textContent, '🚔 2.5★ · 💸 $1500');
+    assert.ok(pill.querySelectorAll('.clodex-rp-chip').length <= 4);
+
+    h.controller.dispose();
+});
+
+test('Underworld Casino UI: skin switching, visible Dice roll, 3-reel Slots, active Blackjack cards/totals + Double, and Story Wagers', async () => {
+    const h = makeTestHarness({
+        locale: 'ru',
+        chatOverrides: {
+            underworld: { cash: 1000, currency: '$', skin: 'crime' },
+        },
+    });
+    await flush();
+
+    h.controller.openTab('underworld');
+    await flush();
+
+    // Skin selector switches titles & presets dynamically
+    const skinSelect = h.doc.body.querySelector('[data-rp-action="uw-skin"]');
+    assert.ok(skinSelect);
+    skinSelect.value = 'syndicate';
+    skinSelect.dispatchEvent({ type: 'change', target: skinSelect });
+    await flush();
+    assert.equal(h.doc.body.querySelector('[data-rp-view="underworld"]').dataset.skin, 'syndicate');
+    assert.match(h.doc.body.querySelector('[data-rp-view="uw-casino"]').textContent, /Неоновый клуб Синдиката/);
+
+    skinSelect.value = 'crime';
+    skinSelect.dispatchEvent({ type: 'change', target: skinSelect });
+    await flush();
+
+    // 1. Dice (2d6): localized buttons & visible roll outcome
+    const diceOverBtn = h.doc.body.querySelector('[data-rp-action="uw-dice"][data-side="over"]');
+    assert.match(diceOverBtn.textContent, /Больше 7 ×2/);
+    assert.match(h.doc.body.querySelector('[data-rp-action="uw-dice"][data-side="seven"]').textContent, /Ровно 7 ×4\.5/);
+    assert.match(h.doc.body.querySelector('[data-rp-action="uw-dice"][data-side="double"]').textContent, /Дубль ×5/);
+    diceOverBtn.click();
+    await flush();
+    let outcome = h.doc.body.querySelector('[data-rp-view="casino-outcome"]');
+    assert.ok(outcome);
+    assert.equal(outcome.dataset.game, 'dice');
+    assert.match(outcome.textContent, /🎲 \[\d\] \+ \[\d\] = \d+/);
+
+    // 2. Slots: big 3-reel display + payout/net
+    h.doc.body.querySelector('[data-rp-action="uw-slots"]').click();
+    await flush();
+    const reels = h.doc.body.querySelector('[data-rp-view="slots-reels"]');
+    assert.ok(reels);
+    assert.match(reels.textContent, /^\[ .+ \| .+ \| .+ \]$/);
+    outcome = h.doc.body.querySelector('[data-rp-view="casino-outcome"]');
+    assert.equal(outcome.dataset.game, 'slots');
+    assert.match(outcome.textContent, /Выплата.*Итог/);
+
+    // 3. Blackjack (21): active hand renders Player cards + total, Dealer upcard + [🂠], Hit/Stand/Double
+    const st = h.getState();
+    const remainingDeck = Array.from({ length: 52 }, (_, i) => i).filter(c => ![0, 8, 12, 4].includes(c));
+    st.underworld.cash = 300;
+    st.underworld.blackjack = {
+        wager: 50,
+        deck: remainingDeck, // pop() draws 51 = K♣ (10), making A♠(11)+9♠(9)+K♣(10) = 20!
+        player: [0, 8],      // A♠ + 9♠ = 20
+        dealer: [12, 4],     // K♠ + 5♠ = 15
+        status: 'playing',
+    };
+    h.controller.renderAll();
+
+    const bjBox = h.doc.body.querySelector('[data-rp-view="blackjack-active"]');
+    assert.ok(bjBox);
+    assert.equal(bjBox.querySelector('[data-rp-view="bj-player-hand"]').textContent, 'A♠ 9♠ (20)');
+    assert.equal(bjBox.querySelector('[data-rp-view="bj-dealer-hand"]').textContent, 'K♠ [🂠]');
+    assert.match(bjBox.querySelector('[data-rp-action="uw-bj-hit"]').textContent, /Ещё/);
+    assert.match(bjBox.querySelector('[data-rp-action="uw-bj-stand"]').textContent, /Хватит/);
+    const doubleBtn = bjBox.querySelector('[data-rp-action="uw-bj-double"]');
+    assert.match(doubleBtn.textContent, /Удвоить/);
+    assert.equal(doubleBtn.disabled, false);
+
+    // Double disabled when cash < wager
+    st.underworld.cash = 20;
+    h.controller.renderAll();
+    assert.equal(h.doc.body.querySelector('[data-rp-action="uw-bj-double"]').disabled, true);
+
+    // Restore cash and click Double -> resolves hand and shows both full hands + totals + net
+    st.underworld.cash = 300;
+    h.controller.renderAll();
+    h.doc.body.querySelector('[data-rp-action="uw-bj-double"]').click();
+    await flush();
+    assert.equal(st.underworld.blackjack, null);
+    outcome = h.doc.body.querySelector('[data-rp-view="casino-outcome"]');
+    assert.equal(outcome.dataset.game, 'blackjack');
+    assert.match(outcome.textContent, /A♠ 9♠ K♣ \(20\)/);
+    assert.match(outcome.textContent, /K♠ 5♠/);
+    assert.match(outcome.textContent, /Итог:/);
+
+    // 4. Story Wager with {{char}}: choose stake, check cooldown & armed pendingWorldEvent badge
+    h.doc.body.querySelector('[data-rp-action="uw-wager-stake"][data-stake="secret"]').click();
+    await flush();
+    h.doc.body.querySelector('[data-rp-action="uw-wager"]').click();
+    await flush();
+    assert.equal(st.underworld.wagerCooldown, 3);
+    assert.match(st.underworld.pendingWorldEvent, /reveal one guarded secret/);
+    assert.ok(h.doc.body.querySelector('[data-rp-view="uw-world-event"]'));
+    assert.ok(h.doc.body.querySelector('[data-rp-view="uw-wager-cooldown"]'));
+
+    assert.deepEqual(h.getMissingKeys(), []);
+    h.controller.dispose();
+});
+
+test('Underworld Pawn Shop: separate pawnValueDraft, preset apartment pawn, inventory pawn/redeem, and name safety guard', async () => {
+    const h = makeTestHarness({
+        locale: 'ru',
+        chatOverrides: {
+            underworld: { cash: 500, debt: 0, skin: 'crime', currency: '$' },
+            inventory: { char: [], user: ['Серебряный перстень', 'Старинный ключ'] },
+            companions: [{ id: 'c1', name: 'Люкс', stage: 'infant', mood: 90, archetype: 'familiar_fox' }],
+        },
+    });
+    await flush();
+
+    h.controller.openTab('underworld');
+    await flush();
+
+    // Changing casino bet input NEVER touches pawnValueDraft (defaults to 500)
+    const betInput = h.doc.body.querySelector('[data-rp-action="uw-bet"]');
+    const pawnValInput = h.doc.body.querySelector('[data-rp-action="uw-pawn-value"]');
+    assert.equal(pawnValInput.value, '500');
+    betInput.value = '15';
+    betInput.dispatchEvent({ type: 'input', target: betInput });
+    assert.equal(h.doc.body.querySelector('[data-rp-action="uw-pawn-value"]').value, '500');
+
+    // 1-click preset Apartment pawn (+$15,000)
+    const aptBtn = h.doc.body.querySelector('[data-rp-action="uw-pawn-preset"][data-preset="apartment"]');
+    assert.ok(aptBtn);
+    assert.match(aptBtn.textContent, /🏠 Квартира.*15/);
+    aptBtn.click();
+    await flush();
+    assert.equal(h.getState().underworld.cash, 15500);
+    assert.equal(h.getState().underworld.debt, 15000);
+    const colList = h.doc.body.querySelector('[data-rp-view="uw-collateral-list"]');
+    assert.match(colList.textContent, /Квартира.*Выкуп: \$17.*осталось 6 х\./);
+
+    // Inventory pawning removes item from state.inventory.user; redeeming restores it
+    const invPawnBtn = h.doc.body.querySelector('[data-rp-action="uw-pawn-inv"][data-index="0"]');
+    assert.ok(invPawnBtn);
+    assert.equal(invPawnBtn.dataset.item, 'Серебряный перстень');
+    invPawnBtn.click();
+    await flush();
+    assert.deepEqual(h.getState().inventory.user, ['Старинный ключ']);
+    const ringEntry = h.getState().underworld.collateral.find(c => c.kind === 'inventory');
+    assert.ok(ringEntry);
+    assert.equal(ringEntry.pawnValue, 500);
+
+    // Add extra cash to cover 15% redeem fee and redeem the ring
+    h.getState().underworld.cash += 500;
+    h.controller.renderAll();
+    h.doc.body.querySelector(`[data-rp-action="uw-redeem"][data-collateral-id="${ringEntry.id}"]`).click();
+    await flush();
+    assert.deepEqual(h.getState().inventory.user, ['Старинный ключ', 'Серебряный перстень']);
+
+    // Custom collateral blocks character, user, and companion names
+    for (const forbidden of ['Маттео', 'Данте', 'Люкс']) {
+        const colInput = h.doc.body.querySelector('[data-rp-action="uw-collateral-label"]');
+        colInput.value = forbidden;
+        colInput.dispatchEvent({ type: 'input', target: colInput });
+        h.doc.body.querySelector('[data-rp-action="uw-pawn-custom"]').click();
+        await flush();
+        assert.equal(h.getState().underworld.collateral.some(c => c.label.includes(forbidden)), false);
+        assert.ok(h.doc.body.querySelector('.clodex-rp-error'));
+    }
+
+    assert.deepEqual(h.getMissingKeys(), []);
+    h.controller.dispose();
+});
+
+test('Underworld Wanted, Wiki faction import, muscle world event, and npcDossier phone DM + cancel/error refund', async () => {
+    let allowConfirm = false;
+    let failDossierApi = false;
+    const wiki = wikiManualEdit(
+        wikiManualEdit(wikiCreateStore(), 'npcs', { name: 'Маттео', role: 'Экзорцист' }, '1:0'),
+        'npcs',
+        { name: 'Инквизитор Варгас', role: 'Судья' },
+        '2:0',
+    );
+    const h = makeTestHarness({
+        locale: 'ru',
+        confirm: async () => allowConfirm,
+        chatOverrides: {
+            underworld: { cash: 1000, heat: 3.5, standing: -40, skin: 'crime' },
+            wikiStore: wiki,
+        },
+        fetchHandler: async (u, init, calls) => {
+            if (!u.endsWith('/v1/chat/completions')) return null;
+            calls.chat.push(JSON.parse(init.body));
+            if (failDossierApi) {
+                return new Response(JSON.stringify({ error: { message: 'Upstream failure' } }), { status: 500 });
+            }
+            return new Response(JSON.stringify({
+                choices: [{ message: { content: 'Варгас тайно выкупает долговые расписки монастыря через подставных ростовщиков.' } }],
+            }), { status: 200 });
+        },
+    });
+    await flush();
+
+    h.controller.openTab('underworld');
+    await flush();
+
+    // Wanted stars & standing rendered
+    const stars = h.doc.body.querySelector('[data-rp-view="uw-wanted-stars"]');
+    assert.ok(stars);
+    assert.equal(stars.dataset.heat, '3.5');
+
+    // Import factions from Wiki uses wikiCache.npcs
+    h.doc.body.querySelector('[data-rp-action="uw-import-factions"]').click();
+    await flush();
+    const factionNames = h.getState().underworld.factions.map(f => f.name);
+    assert.deepEqual(factionNames, ['Маттео', 'Инквизитор Варгас']);
+    assert.match(h.doc.body.querySelector('[data-rp-view="uw-factions"]').textContent, /Инквизитор Варгас/);
+
+    // clearHeat lowers heat by 2★ (-180)
+    h.doc.body.querySelector('[data-rp-action="uw-service"][data-service="clearHeat"]').click();
+    await flush();
+    assert.equal(h.getState().underworld.heat, 1.5);
+    assert.equal(h.getState().underworld.cash, 820);
+
+    // muscle deducts 320 and arms pendingWorldEvent (kind: 'service')
+    const targetInput = h.doc.body.querySelector('[data-rp-action="uw-target"]');
+    targetInput.value = 'Инквизитор Варгас';
+    targetInput.dispatchEvent({ type: 'input', target: targetInput });
+    h.doc.body.querySelector('[data-rp-action="uw-service"][data-service="muscle"]').click();
+    await flush();
+    assert.equal(h.getState().underworld.cash, 500);
+    assert.equal(h.getState().underworld.eventKind, 'service');
+    assert.match(h.getState().underworld.pendingWorldEvent, /Инквизитор Варгас/);
+    assert.ok(h.doc.body.querySelector('[data-rp-view="uw-world-event"]'));
+
+    // npcDossier cancelled -> 0 API calls and full 260 refund
+    allowConfirm = false;
+    h.doc.body.querySelector('[data-rp-action="uw-service"][data-service="npcDossier"]').click();
+    await flush();
+    assert.equal(h.calls.chat.length, 0);
+    assert.equal(h.getState().underworld.cash, 500);
+
+    // npcDossier API failure -> full 260 refund
+    allowConfirm = true;
+    failDossierApi = true;
+    h.doc.body.querySelector('[data-rp-action="uw-service"][data-service="npcDossier"]').click();
+    await flush();
+    await flush();
+    assert.equal(h.calls.chat.length, 1);
+    assert.equal(h.getState().underworld.cash, 500);
+    assert.ok(h.doc.body.querySelector('.clodex-rp-error'));
+
+    // npcDossier success -> deducts 260 and ingests leaked dossier DM into clodex_rp_phone
+    failDossierApi = false;
+    const tIn = h.doc.body.querySelector('[data-rp-action="uw-target"]');
+    tIn.value = 'Инквизитор Варгас';
+    tIn.dispatchEvent({ type: 'input', target: tIn });
+    h.doc.body.querySelector('[data-rp-action="uw-service"][data-service="npcDossier"]').click();
+    await flush();
+    await flush();
+    assert.equal(h.getState().underworld.cash, 240);
+
+    h.controller.openTab('phone');
+    await flush();
+    const phoneText = h.doc.body.querySelector('[data-rp-view="phone"]').textContent;
+    assert.match(phoneText, /Варгас тайно выкупает долговые расписки/);
+
+    assert.deepEqual(h.getMissingKeys(), []);
+    h.controller.dispose();
+});
+
+test('Altar pending egg details & re-skinning, Companion & Oviposition Nest skin selectors, and Relics <a> link + copy', async () => {
+    const h = makeTestHarness({
+        locale: 'ru',
+        rpPrefsOverrides: {
+            unlockedEggSkins: ['obsidian_kintsugi', 'seraph_porcelain'],
+            pendingEggs: [{
+                id: 'egg-altar-1',
+                rarity: 'mythic',
+                eggSkin: 'obsidian_kintsugi',
+                archetype: 'celestial_wisp',
+                mutationTrait: 'пепельный резонанс',
+                personality: 'тихий наблюдатель',
+                prophecy: 'пробудится под колокольный звон',
+                warmth: 60,
+                hatched: false,
+                name: 'Серафиэль',
+                artPath: 'egg-seraph.png',
+            }],
+        },
+        chatOverrides: {
+            world: { enableAdultBiology: true },
+            companions: [{
+                id: 'comp-1',
+                name: 'Люкс',
+                stage: 'child',
+                rarity: 'ssr',
+                eggSkin: 'obsidian_kintsugi',
+                mood: 92,
+                archetype: 'familiar_fox',
+                needsStageArt: false,
+            }],
+        },
+        fetchHandler: async u => {
+            if (u.endsWith('/v1/rp/relics/catalog')) {
+                return new Response(JSON.stringify({
+                    editions: [{
+                        editionKey: 'ash_seraph_2026',
+                        titleRu: 'Пепельный Серафим',
+                        titleEn: 'Ash Seraph',
+                        mintedCount: 7,
+                        maxSupply: 100,
+                    }],
+                }), { status: 200 });
+            }
+            return null;
+        },
+    });
+    await flush();
+
+    // 1. Altar: displays artPath via resolveMediaSrc, mutationTrait, personality, prophecy, and equips unlocked skin
+    h.controller.openTab('gacha');
+    await flush();
+    const eggArt = h.doc.body.querySelector('[data-rp-view="gacha-egg-art"]');
+    assert.ok(eggArt);
+    assert.equal(eggArt.src, 'resolved://egg-seraph.png');
+    const altarText = h.doc.body.querySelector('[data-rp-view="gacha-pending"]').textContent;
+    assert.match(altarText, /пепельный резонанс/);
+    assert.match(altarText, /тихий наблюдатель/);
+    assert.match(altarText, /пробудится под колокольный звон/);
+    assert.match(altarText, /Мифический/);
+
+    const eggSkinSelect = h.doc.body.querySelector('[data-rp-action="gacha-egg-skin"]');
+    assert.ok(eggSkinSelect);
+    eggSkinSelect.value = 'seraph_porcelain';
+    eggSkinSelect.dispatchEvent({ type: 'change', target: eggSkinSelect });
+    await flush();
+    assert.equal(h.getRpPrefs().pendingEggs[0].eggSkin, 'seraph_porcelain');
+    assert.match(h.doc.body.querySelector('[data-rp-view="gacha-pending"]').textContent, /Фарфор Серафима/);
+
+    // 2. Cradle -> Companions: shows rarity/skin badge and equips unlocked skin on existing companion
+    h.controller.openTab('cradle');
+    await flush();
+    const compSkinSelect = h.doc.body.querySelector('[data-rp-action="companion-egg-skin"]');
+    assert.ok(compSkinSelect);
+    compSkinSelect.value = 'seraph_porcelain';
+    compSkinSelect.dispatchEvent({ type: 'change', target: compSkinSelect });
+    await flush();
+    assert.equal(h.getState().companions[0].eggSkin, 'seraph_porcelain');
+    assert.equal(h.getState().companions[0].needsStageArt, true);
+
+    // 3. Tracker -> Oviposition & Nest Pro: equips unlocked skin on nest egg
+    const st = h.getState();
+    st.entities.char.bio.mode = 'oviposition';
+    triggerConception(st.entities.char, st, { force: true });
+    layEggs(st.entities.char, st, 2);
+    h.controller.openTab('tracker');
+    await flush();
+    const nestSelect = h.doc.body.querySelector('[data-rp-action="nest-egg-skin"][data-egg-index="0"]');
+    assert.ok(nestSelect);
+    nestSelect.value = 'seraph_porcelain';
+    nestSelect.dispatchEvent({ type: 'change', target: nestSelect });
+    await flush();
+    assert.equal(st.entities.char.bio.nest.eggs[0].eggSkin, 'seraph_porcelain');
+
+    // 4. Relics: renders WebView-safe <a target="_blank" rel="noopener noreferrer"> + copy-link button
+    h.controller.openTab('relics');
+    await flush();
+    await flush();
+    const mintAnchor = h.doc.body.querySelector('[data-rp-action="relic-mint-link"]');
+    assert.ok(mintAnchor);
+    assert.equal(mintAnchor.tagName, 'A');
+    assert.equal(mintAnchor.getAttribute('href'), 'https://clodex.xyz/console/rp-relics?edition=ash_seraph_2026');
+    assert.equal(mintAnchor.getAttribute('target'), '_blank');
+    assert.equal(mintAnchor.getAttribute('rel'), 'noopener noreferrer');
+
+    const copyBtn = h.doc.body.querySelector('[data-rp-action="relic-copy-link"]');
+    assert.ok(copyBtn);
+    copyBtn.click();
+    await flush();
+    assert.deepEqual(h.calls.copied, ['https://clodex.xyz/console/rp-relics?edition=ash_seraph_2026']);
+
+    assert.deepEqual(h.getMissingKeys(), []);
     h.controller.dispose();
 });

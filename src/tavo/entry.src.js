@@ -80,6 +80,10 @@ tavo.plugin.onSidebarAction('open-cradle', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-cradle' });
 });
 
+tavo.plugin.onSidebarAction('open-underworld', async () => {
+    tavo.plugin.emit('clodex-command', { action: 'open-underworld' });
+});
+
 tavo.plugin.onSidebarAction('open-phone', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-phone' });
 });
@@ -157,7 +161,14 @@ tavo.plugin.on('generation:prepare', async event => {
     }
     const slop = slopMode === 'inject' ? String(state.world?.slopRule ?? '') : '';
 
-    const packed = ctxPack({ director, scene, wiki, slop, maxTokens: ENTRY_CTX_MAX_TOKENS });
+    const packed = ctxPack({
+        director,
+        worldEvent: injectAllowed ? String(state.underworld?.pendingWorldEvent || '') : '',
+        scene,
+        wiki,
+        slop,
+        maxTokens: ENTRY_CTX_MAX_TOKENS,
+    });
     if (packed.main) {
         event.addContext({
             text: packed.main,

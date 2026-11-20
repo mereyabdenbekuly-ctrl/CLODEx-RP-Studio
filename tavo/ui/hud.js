@@ -124,7 +124,7 @@ class ClodexApi {
         this.now = now;
     }
 
-    async request(path, { method = 'GET', body, auth = true, signal, timeout = 60_000, blob = false } = {}) {
+    async request(path, { method = 'GET', body, auth = true, signal, timeout = 60_000, blob = false, headers: extraHeaders = {} } = {}) {
         if (!/^\/(v1\/|api\/(usage\/token\/|status$|pricing$))/.test(path)
             || path.includes('..') || path.includes('\\') || path.includes('#')) {
             throw new ApiError('Invalid API path.', { code: 'invalid_path' });
@@ -133,6 +133,9 @@ class ClodexApi {
         const headers = new Headers();
         if (key) headers.set('Authorization', `Bearer ${key}`);
         if (body !== undefined) headers.set('Content-Type', 'application/json');
+        for (const [name, value] of Object.entries(extraHeaders || {})) {
+            if (value !== undefined && value !== null) headers.set(name, String(value));
+        }
 
         const controller = new AbortController();
         const onAbort = () => controller.abort(signal.reason);
@@ -183,6 +186,28 @@ class ClodexApi {
 
     pricing(signal) {
         return this.request('/api/pricing', { signal, auth: false, timeout: 15_000 });
+    }
+
+    rpRelicCatalog(signal) {
+        return this.request('/v1/rp/relics/catalog', { signal, auth: false, timeout: 30_000 });
+    }
+
+    rpRelicInventory(signal) {
+        return this.request('/v1/rp/relics/inventory', { signal, timeout: 30_000 });
+    }
+
+    rpRelicMint({ editionKey, idempotencyKey } = {}, signal) {
+        const key = String(editionKey || '').trim();
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(key)) throw new ApiError('Invalid relic edition.', { code: 'invalid_input' });
+        const idem = String(idempotencyKey || '').trim();
+        if (!/^[a-zA-Z0-9._:-]{8,80}$/.test(idem)) throw new ApiError('Invalid idempotency key.', { code: 'invalid_input' });
+        return this.request('/v1/rp/relics/mint', {
+            method: 'POST',
+            body: { editionKey: key },
+            headers: { 'Idempotency-Key': idem },
+            signal,
+            timeout: 90_000,
+        });
     }
 
     status(signal) {
@@ -607,6 +632,202 @@ function formatShortDate(isoDate, locale = 'ru') {
     }
 }
 
+// --- src/core/gacha.js ---
+// U4: autonomous altar/gacha. Only the paid summon path is allowed to call
+// the host API, and callers must explicitly confirm before doing so.
+const GA_RARITIES = Object.freeze(['common', 'rare', 'epic', 'ssr', 'mythic']);
+const GA_RARITY_WEIGHTS = Object.freeze({ common: 0.52, rare: 0.30, epic: 0.13, ssr: 0.042, mythic: 0.008 });
+const GA_PITY_EPIC = 10;
+const GA_PITY_SSR = 30;
+const EGG_SKINS = Object.freeze([
+    { id: 'obsidian_kintsugi', name: 'Obsidian Kintsugi', rarity: 'epic', theme: 'linear-gradient(145deg,#0b1020,#c9933d)', descriptor: 'Obsidian egg with luminous golden kintsugi seams, velvet-black reflections, solemn shrine lighting, ornate cracks like repaired constellations.' },
+    { id: 'abyssal_crystal', name: 'Abyssal Crystal', rarity: 'ssr', theme: 'linear-gradient(145deg,#07152c,#3c83d8)', descriptor: 'Deep-blue crystal egg with translucent facets, tiny stars suspended inside, cold abyssal glow, prismatic edges, mysterious underwater silence.' },
+    { id: 'seraph_porcelain', name: 'Seraph Porcelain', rarity: 'mythic', theme: 'linear-gradient(145deg,#fff6dc,#d9b6ff)', descriptor: 'Ivory porcelain egg with six subtle halo rings, rose-gold filigree, soft celestial radiance, sacred calm, immaculate museum-quality finish.' },
+    { id: 'cyber_pod', name: 'Cyber Pod', rarity: 'rare', theme: 'linear-gradient(145deg,#071b24,#22d3ee)', descriptor: 'Sleek cybernetic egg pod with cyan status lights, graphite shell panels, tiny holographic glyphs, rain-slick neon reflections, sci-fi lab mood.' },
+    { id: 'dragon_amber', name: 'Dragon Amber', rarity: 'epic', theme: 'linear-gradient(145deg,#34140b,#f59e0b)', descriptor: 'Warm amber egg with a tiny dragon silhouette inside, smoky inclusions, ember sparks, carved scale motifs, dramatic volcanic sunset light.' },
+    { id: 'crimson_reliquary', name: 'Crimson Reliquary', rarity: 'ssr', theme: 'linear-gradient(145deg,#24080f,#e11d48)', descriptor: 'Crimson reliquary egg with dark ruby glass, silver lockwork, candlelit gothic altar, restrained occult elegance, faint red inner pulse.' },
+    { id: 'lunar_jade', name: 'Lunar Jade', rarity: 'rare', theme: 'linear-gradient(145deg,#072620,#8dd3b8)', descriptor: 'Moonlit jade egg with soft green translucence, silver crescent engravings, misty garden shadows, serene nocturnal atmosphere, polished stone texture.' },
+    { id: 'astral_nebula', name: 'Astral Nebula', rarity: 'mythic', theme: 'linear-gradient(145deg,#110b30,#a855f7)', descriptor: 'Cosmic egg containing a swirling nebula, violet and indigo clouds, distant galaxies, tiny comet trails, impossible depth, elegant astral glow.' },
+    { id: 'frost_rune', name: 'Frost Rune', rarity: 'epic', theme: 'linear-gradient(145deg,#10243a,#bae6fd)', descriptor: 'Frosted blue egg etched with luminous runes, crystalline snow dust, pale winter light, clean geometric facets, quiet enchanted cold.' },
+    { id: 'clockwork_brass', name: 'Clockwork Brass', rarity: 'rare', theme: 'linear-gradient(145deg,#2b1d0e,#fbbf24)', descriptor: 'Brass clockwork egg with visible gears, tiny springs, warm workshop light, engraved numerals, whimsical precision, richly aged metal patina.' },
+    { id: 'velvet_thorn', name: 'Velvet Thorn', rarity: 'ssr', theme: 'linear-gradient(145deg,#220c22,#ec4899)', descriptor: 'Deep velvet egg wrapped in delicate silver thorns, magenta bloom highlights, romantic gothic still life, soft theatrical shadows, luxurious texture.' },
+    { id: 'solar_halo', name: 'Solar Halo', rarity: 'mythic', theme: 'linear-gradient(145deg,#51200b,#fde047)', descriptor: 'Radiant solar egg with layered golden halo rings, sunlit enamel, tiny phoenix silhouette, warm bloom, triumphant mythic fantasy presentation.' },
+]);
+const GA_ARCHETYPES = Object.freeze(['familiar_fox', 'shadow_raven', 'dragon_whelp', 'homunculus', 'celestial_wisp']);
+
+function gaClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+function gaRng() {
+    if (globalThis.crypto?.getRandomValues) {
+        const data = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(data);
+        return data[0] / 0x1_0000_0000;
+    }
+    return Math.random();
+}
+function gaNormalizePrefs(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const unlocked = [...new Set((Array.isArray(source.unlockedEggSkins) ? source.unlockedEggSkins : []).map(String).filter(id => EGG_SKINS.some(skin => skin.id === id)))];
+    return {
+        version: 1,
+        unlockedEggSkins: unlocked.slice(0, EGG_SKINS.length),
+        epicPity: Math.trunc(gaClamp(source.epicPity, 0, GA_PITY_EPIC - 1, 0)),
+        ssrPity: Math.trunc(gaClamp(source.ssrPity, 0, GA_PITY_SSR - 1, 0)),
+        relics: Array.isArray(source.relics) ? source.relics.filter(x =>
+            typeof x?.payload === 'string' && x.payload.length <= 16_384
+            && typeof x?.sig === 'string' && x.sig.length <= 256
+        ).map(({ payload, sig }) => ({ payload, sig })) : [],
+        hatchedRelicUids: [...new Set((Array.isArray(source.hatchedRelicUids) ? source.hatchedRelicUids : [])
+            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(value)))],
+        pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
+    };
+}
+function gaNormalizeEgg(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const skin = EGG_SKINS.some(item => item.id === raw.eggSkin) ? raw.eggSkin : EGG_SKINS[0].id;
+    const rarity = GA_RARITIES.includes(raw.rarity) ? raw.rarity : 'common';
+    const archetype = GA_ARCHETYPES.includes(raw.archetype) ? raw.archetype : GA_ARCHETYPES[0];
+    return {
+        id: String(raw.id || `egg-${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
+        rarity,
+        eggSkin: skin,
+        archetype,
+        mutationTrait: String(raw.mutationTrait || 'stable lineage').replace(/[<>]/g, '').slice(0, 120),
+        warmth: Math.max(0, Math.min(100, Math.trunc(Number(raw.warmth) || 0))),
+        hatched: raw.hatched === true,
+        name: String(raw.name || '').replace(/[<>]/g, '').slice(0, 80),
+        personality: String(raw.personality || '').replace(/[<>]/g, '').slice(0, 240),
+        prophecy: String(raw.prophecy || '').replace(/[<>]/g, '').slice(0, 240),
+        artPath: String(raw.artPath || '').slice(0, 512),
+        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
+    };
+}
+function gaWarmEgg(prefs, eggId, amount = 20) {
+    const next = gaNormalizePrefs(prefs);
+    const egg = next.pendingEggs.find(item => item.id === String(eggId) && !item.hatched);
+    if (!egg) return { ok: false, reason: 'egg_not_found', prefs: next };
+    egg.warmth = Math.min(100, egg.warmth + Math.max(1, Math.trunc(Number(amount) || 0)));
+    return { ok: true, ready: egg.warmth >= 100, egg, prefs: next };
+}
+function gaEquipSkinOnEgg(prefs, eggId, skinId) {
+    const next = gaNormalizePrefs(prefs);
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!EGG_SKINS.some(item => item.id === cleanSkin)) {
+        return { ok: false, reason: 'invalid_skin', egg: null, prefs: next };
+    }
+    if (!next.unlockedEggSkins.includes(cleanSkin)) {
+        return { ok: false, reason: 'skin_locked', egg: null, prefs: next };
+    }
+    const egg = next.pendingEggs.find(item => item.id === String(eggId) && !item.hatched);
+    if (!egg) return { ok: false, reason: 'egg_not_found', egg: null, prefs: next };
+    egg.eggSkin = cleanSkin;
+    if (prefs && typeof prefs === 'object' && Array.isArray(prefs.pendingEggs)) {
+        const rawEgg = prefs.pendingEggs.find(item => item && String(item.id) === String(eggId) && !item.hatched);
+        if (rawEgg) rawEgg.eggSkin = cleanSkin;
+    }
+    return { ok: true, egg, prefs: next };
+}
+function gaHatchEgg(prefs, eggId) {
+    const next = gaNormalizePrefs(prefs);
+    const egg = next.pendingEggs.find(item => item.id === String(eggId));
+    if (!egg) return { ok: false, reason: 'egg_not_found', prefs: next };
+    if (egg.hatched || egg.warmth < 100) return { ok: false, reason: 'not_ready', egg, prefs: next };
+    next.pendingEggs = next.pendingEggs.filter(item => item !== egg);
+    if (egg.relicUid && !next.hatchedRelicUids.includes(egg.relicUid)) next.hatchedRelicUids.push(egg.relicUid);
+    egg.hatched = true;
+    return { ok: true, egg, prefs: next };
+}
+
+// Only call with claims from relVerifyInventory (not the unsigned inventory wrapper).
+function gaQueueVerifiedRelicEgg(prefs, claims) {
+    const next = gaNormalizePrefs(prefs);
+    if (next.hatchedRelicUids.includes(claims.relicUid) || next.pendingEggs.some(egg => egg.relicUid === claims.relicUid)) {
+        return { ok: false, reason: 'already_added', prefs: next };
+    }
+    if (next.pendingEggs.length >= 24) return { ok: false, reason: 'cradle_full', prefs: next };
+    const egg = gaNormalizeEgg({
+        ...claims, id: claims.relicUid, name: claims.edition, mutationTrait: claims.genes.trait,
+    });
+    next.pendingEggs.push(egg);
+    return { ok: true, egg, prefs: next };
+}
+function gaRollRarity(prefs = {}, { rng = gaRng } = {}) {
+    const state = gaNormalizePrefs(prefs);
+    const nextEpic = state.epicPity + 1;
+    const nextSsr = state.ssrPity + 1;
+    if (nextSsr >= GA_PITY_SSR) return rng() < 0.2 ? 'mythic' : 'ssr';
+    if (nextEpic >= GA_PITY_EPIC) {
+        const roll = rng();
+        if (roll < GA_RARITY_WEIGHTS.mythic / (GA_RARITY_WEIGHTS.ssr + GA_RARITY_WEIGHTS.mythic)) return 'mythic';
+        return 'epic';
+    }
+    const roll = rng();
+    let cursor = 0;
+    for (const rarity of GA_RARITIES) {
+        cursor += GA_RARITY_WEIGHTS[rarity];
+        if (roll < cursor) return rarity;
+    }
+    return 'common';
+}
+function gaApplyPity(prefs, rarity) {
+    const state = gaNormalizePrefs(prefs);
+    const high = rarity === 'ssr' || rarity === 'mythic';
+    const epic = high || rarity === 'epic';
+    state.epicPity = epic ? 0 : Math.min(GA_PITY_EPIC - 1, state.epicPity + 1);
+    state.ssrPity = high ? 0 : Math.min(GA_PITY_SSR - 1, state.ssrPity + 1);
+    return state;
+}
+function gaPickSkin(rarity, prefs = {}, { rng = gaRng } = {}) {
+    const unlocked = gaNormalizePrefs(prefs).unlockedEggSkins;
+    const eligible = EGG_SKINS.filter(skin => skin.rarity === rarity || (rarity === 'mythic' && skin.rarity === 'ssr'));
+    const pool = eligible.length ? eligible : EGG_SKINS;
+    const skin = pool[Math.floor(rng() * pool.length)];
+    return skin || EGG_SKINS[0];
+}
+function gaCreateSummon(prefs = {}, { cash = 0, cost = 50, rng = gaRng, archetypes = GA_ARCHETYPES } = {}) {
+    if (Number(cash) < Number(cost)) return { ok: false, reason: 'insufficient_cash', cost: Number(cost) };
+    if (gaNormalizePrefs(prefs).pendingEggs.filter(egg => !egg.hatched).length >= 24) {
+        return { ok: false, reason: 'cradle_full' };
+    }
+    const rarity = gaRollRarity(prefs, { rng });
+    const skin = gaPickSkin(rarity, prefs, { rng });
+    const nextPrefs = gaApplyPity(prefs, rarity);
+    if (!nextPrefs.unlockedEggSkins.includes(skin.id)) nextPrefs.unlockedEggSkins.push(skin.id);
+    const archetypePool = Array.isArray(archetypes) && archetypes.length ? archetypes : GA_ARCHETYPES;
+    const egg = {
+        id: `egg-${Date.now().toString(36)}-${Math.floor(rng() * 1e6).toString(36)}`,
+        rarity,
+        eggSkin: skin.id,
+        archetype: archetypePool[Math.floor(rng() * archetypePool.length)],
+        mutationTrait: rarity === 'mythic' ? 'mythic resonance' : rarity === 'ssr' ? 'rare mutation' : 'stable lineage',
+        warmth: 0,
+        hatched: false,
+    };
+    nextPrefs.pendingEggs = nextPrefs.pendingEggs.filter(item => !item.hatched);
+    nextPrefs.pendingEggs.push(egg);
+    return { ok: true, egg, prefs: nextPrefs, cash: Number(cash) - Number(cost), cost: Number(cost) };
+}
+function gaBuildPaidPrompt({ rarity, skinId, locale = 'ru', charName = '{{char}}' } = {}) {
+    const skin = EGG_SKINS.find(item => item.id === skinId) || EGG_SKINS[0];
+    const language = locale === 'ru' ? 'Russian and English' : 'English';
+    return [
+        'Return one compact JSON object only.',
+        `Create a ${rarity} companion egg in the ${skin.name} skin for ${charName}.`,
+        `Visual descriptor: ${skin.descriptor}`,
+        `Include name, mutationTrait, personality, prophecy in ${language}; keep the JSON under 300 tokens.`,
+    ].join(' ');
+}
+function gaCanStartPaid({ confirmPaid = true, confirmed = false } = {}) {
+    return !confirmPaid || confirmed === true;
+}
+function gaRegisterHatch(prefs, egg) {
+    const next = gaNormalizePrefs(prefs);
+    if (egg?.eggSkin && !next.unlockedEggSkins.includes(egg.eggSkin)) next.unlockedEggSkins.push(egg.eggSkin);
+    return next;
+}
+
 // --- src/core/companion.js ---
 const COMPANION_STAGES = Object.freeze(['infant', 'child', 'teen', 'adult']);
 const COMPANION_ARCHETYPES = Object.freeze([
@@ -867,6 +1088,11 @@ function normalizeCompanion(raw, idx = 0) {
         videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
         needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
         lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
+        ...(GA_RARITIES.includes(src.rarity) ? { rarity: src.rarity } : {}),
+        ...(EGG_SKINS.some(skin => skin.id === src.eggSkin) ? { eggSkin: src.eggSkin } : {}),
+        ...(typeof src.mutationTrait === 'string' && src.mutationTrait
+            ? { mutationTrait: src.mutationTrait.replace(/[<>]/g, '').slice(0, 120) } : {}),
+        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
     };
 }
 function createCompanionFromArchetype(archetypeId, { customName = '', locale = 'ru' } = {}) {
@@ -984,7 +1210,12 @@ function createCompanionFromOffspring(child, state, { locale = 'ru' } = {}) {
     if (state && typeof state === 'object') {
         if (!Array.isArray(state.companions)) state.companions = [];
         const existing = state.companions.find(c => c && c.originChildId === childId);
-        if (existing) return existing;
+        if (existing) {
+            if (!existing.eggSkin && EGG_SKINS.some(skin => skin.id === srcChild.eggSkin)) {
+                existing.eggSkin = srcChild.eggSkin;
+            }
+            return existing;
+        }
     }
 
     const gender = srcChild.gender === 'male' ? 'male' : 'female';
@@ -1021,6 +1252,7 @@ function createCompanionFromOffspring(child, state, { locale = 'ru' } = {}) {
         videoTaskId: '',
         needsStageArt: true,
         lastActionAt: String(state?.world?.rpDate ?? ''),
+        ...(EGG_SKINS.some(skin => skin.id === srcChild.eggSkin) ? { eggSkin: srcChild.eggSkin } : {}),
     });
 
     if (state && Array.isArray(state.companions) && state.companions.length < 6) {
@@ -1067,6 +1299,28 @@ function advanceCompanionsDays(companions, deltaDays) {
     }
     return companions;
 }
+
+function compUnlockedSkinSet(unlockedEggSkins) {
+    if (Array.isArray(unlockedEggSkins)) return new Set(unlockedEggSkins.map(String));
+    if (unlockedEggSkins instanceof Set) return new Set([...unlockedEggSkins].map(String));
+    if (Array.isArray(unlockedEggSkins?.unlockedEggSkins)) return new Set(unlockedEggSkins.unlockedEggSkins.map(String));
+    return new Set();
+}
+function equipCompanionEggSkin(companion, skinId, unlockedEggSkins = []) {
+    if (!companion || typeof companion !== 'object') {
+        return { ok: false, reason: 'companion_not_found', companion: null };
+    }
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!EGG_SKINS.some(skin => skin.id === cleanSkin)) {
+        return { ok: false, reason: 'invalid_skin', companion };
+    }
+    if (!compUnlockedSkinSet(unlockedEggSkins).has(cleanSkin)) {
+        return { ok: false, reason: 'skin_locked', companion };
+    }
+    companion.eggSkin = cleanSkin;
+    companion.needsStageArt = true;
+    return { ok: true, companion };
+}
 function buildCompanionPortraitPrompt(companion, {
     charName = '',
     charDescription = '',
@@ -1076,6 +1330,7 @@ function buildCompanionPortraitPrompt(companion, {
     const comp = normalizeCompanion(companion);
     const profile = COMP_ARCHETYPE_PROFILES[comp.archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
     const stageDesc = COMP_STAGE_VISUALS[comp.stage] || COMP_STAGE_VISUALS.infant;
+    const skinObj = comp.eggSkin ? EGG_SKINS.find(item => item.id === comp.eggSkin) : null;
 
     const styleLead = stylePreset === 'dark_gothic'
         ? 'Dark gothic chiaroscuro portrait illustration, warm candlelight, ornate sanctuary backdrop, rich oil-painted textures.'
@@ -1097,7 +1352,7 @@ function buildCompanionPortraitPrompt(companion, {
         .trim()
         .split(' ')
         .filter(Boolean)
-        .slice(0, 14)
+        .slice(0, skinObj ? 8 : 14)
         .join(' ');
 
     const lineageClause = comp.originChildId || comp.archetype === 'offspring'
@@ -1108,13 +1363,22 @@ function buildCompanionPortraitPrompt(companion, {
         ? 'enchanting dragon-blooded fantasy heir with delicate shimmering scales and warm luminous eyes'
         : profile.visualSubject;
 
+    const skinClause = skinObj
+        ? `Shell and aura motif (${skinObj.name}): ${skinObj.descriptor}`
+        : '';
+
+    const framingClause = skinObj
+        ? 'Centered solo portrait framing, soft rim light, no text overlays, no speech bubbles, no watermarks.'
+        : 'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.';
+
     const rawPrompt = [
         styleLead,
         `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
         `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
+        skinClause,
         lineageClause,
-        'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.',
-    ].join(' ');
+        framingClause,
+    ].filter(Boolean).join(' ');
 
     return compEnforceWordRange(rawPrompt, 64, 104, [
         'Warm atmospheric bokeh particles drift gently through the background air, highlighting crisp silhouettes and natural anatomy.',
@@ -1356,7 +1620,923 @@ function parseForgedCardV2(rawText) {
     return { card, avatarPrompt };
 }
 
+// --- src/core/textnorm.js ---
+// Shared text normalisation helpers (RU/EN) for CLODEx RP Studio v1.3.
+// Pure functions, no dependencies. Flat-bundler safe: every top-level name is tn*-prefixed.
+// Unicode property escapes are avoided on purpose (older embedded JS runtimes).
+
+// Apostrophes are glued (don't → dont); every other punctuation/symbol becomes a space.
+const tnApostropheRe = /['\u2019\u02bc`\u00b4]/g;
+const tnSeparatorRe = /[\u0000-\u002f\u003a-\u0040\u005b-\u0060\u007b-\u00bf\u00d7\u00f7\u02b9-\u02ff\u2000-\u2bff\u2e00-\u2e7f\u3000-\u303f\ufe00-\ufe6f\uff00-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65\ud800-\udfff]+/g;
+const tnCyrillicRe = /[\u0400-\u04ff]/;
+function tnNormalize(text) {
+    const raw = String(text ?? '');
+    return (typeof raw.normalize === 'function' ? raw.normalize('NFC') : raw)
+        .toLowerCase()
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/ё/g, 'е')
+        .replace(tnApostropheRe, '')
+        .replace(tnSeparatorRe, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+function tnWords(text) {
+    const norm = tnNormalize(text);
+    return norm ? norm.split(' ') : [];
+}
+
+// Reflexive suffixes are removed first, then the longest matching ending.
+// Past-tense "-л" is intentionally kept so ухмыльнулся / ухмыльнулась / ухмыльнулись → ухмыльнул.
+const TN_RU_REFLEXIVE = Object.freeze(['ся', 'сь']);
+const TN_RU_ENDINGS = Object.freeze([
+    'иями', 'ями', 'ами', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'ешь', 'ишь', 'ете', 'ите', 'ией', 'иям', 'иях',
+    'ая', 'яя', 'ое', 'ее', 'ые', 'ие', 'ую', 'юю', 'ой', 'ей', 'ий', 'ый', 'ым', 'им', 'ых', 'их',
+    'ах', 'ях', 'ов', 'ев', 'ом', 'ем', 'ам', 'ям', 'ия', 'ье', 'ья', 'ью', 'ьи',
+    'ет', 'ут', 'ют', 'ит', 'ат', 'ят', 'ть', 'ти',
+    'а', 'я', 'о', 'е', 'ы', 'и', 'у', 'ю', 'ь', 'й',
+]);
+const TN_RU_MIN_STEM = 3;
+const TN_EN_MIN_STEM = 3;
+
+function tnStemRu(word) {
+    let w = word;
+    for (const suf of TN_RU_REFLEXIVE) {
+        if (w.length - suf.length >= TN_RU_MIN_STEM && w.endsWith(suf)) {
+            w = w.slice(0, -suf.length);
+            break;
+        }
+    }
+    for (const suf of TN_RU_ENDINGS) {
+        if (w.length - suf.length >= TN_RU_MIN_STEM && w.endsWith(suf)) {
+            return w.slice(0, -suf.length);
+        }
+    }
+    return w;
+}
+
+function tnUndouble(w) {
+    const n = w.length;
+    if (n >= 4 && w[n - 1] === w[n - 2] && !'aeioulsz'.includes(w[n - 1])) return w.slice(0, -1);
+    return w;
+}
+
+function tnStemEn(word) {
+    let w = word;
+    if (w.length > 4 && w.endsWith('ies')) return `${w.slice(0, -3)}y`;
+    if (w.length > 4 && w.endsWith('ied')) return `${w.slice(0, -3)}y`;
+    for (const suf of ['ingly', 'edly', 'ing', 'ed']) {
+        if (w.length - suf.length >= TN_EN_MIN_STEM && w.endsWith(suf)) {
+            w = tnUndouble(w.slice(0, -suf.length));
+            return w.length > TN_EN_MIN_STEM && w.endsWith('e') ? w.slice(0, -1) : w;
+        }
+    }
+    if (w.length - 2 >= TN_EN_MIN_STEM && w.endsWith('ly')) return w.slice(0, -2);
+    if (w.length - 2 >= TN_EN_MIN_STEM && /(?:ss|x|z|ch|sh)es$/.test(w)) return w.slice(0, -2);
+    if (w.length - 1 >= TN_EN_MIN_STEM && w.endsWith('s') && !/(?:ss|us|is)$/.test(w)) w = w.slice(0, -1);
+    if (w.length > TN_EN_MIN_STEM && w.endsWith('e')) w = w.slice(0, -1);
+    return w;
+}
+function tnStem(word) {
+    const w = tnNormalize(word).replace(/ /g, '');
+    if (!w) return '';
+    if (/^[0-9]+$/.test(w)) return w;
+    if (tnCyrillicRe.test(w)) return tnStemRu(w);
+    if (/^[a-z]+$/.test(w)) return tnStemEn(w);
+    return w;
+}
+
+const TN_STOP_WORDS = new Set([
+    // RU: pronouns
+    'я', 'ты', 'он', 'она', 'оно', 'мы', 'вы', 'они', 'меня', 'тебя', 'его', 'ее', 'нас', 'вас', 'их', 'мне', 'тебе',
+    'ему', 'ей', 'нам', 'вам', 'им', 'мной', 'мною', 'тобой', 'тобою', 'ним', 'ней', 'нею', 'нами', 'вами', 'ими', 'ними',
+    'него', 'нее', 'нему', 'них', 'себя', 'себе', 'собой', 'собою', 'свой', 'своя', 'свое', 'свои', 'своего', 'своей',
+    'своему', 'своим', 'своих', 'своими', 'свою', 'мой', 'моя', 'мое', 'мои', 'моего', 'моей', 'моему', 'моим', 'моих',
+    'мою', 'твой', 'твоя', 'твое', 'твои', 'твоего', 'твоей', 'твоим', 'твоих', 'твою', 'наш', 'наша', 'наше', 'наши',
+    'ваш', 'ваша', 'ваше', 'ваши', 'этот', 'эта', 'это', 'эти', 'этого', 'этой', 'этому', 'этим', 'этих', 'эту', 'тот',
+    'та', 'то', 'те', 'того', 'той', 'тому', 'тем', 'тех', 'ту', 'кто', 'что', 'кого', 'чего', 'кому', 'чему', 'кем',
+    'чем', 'ком', 'чём', 'весь', 'вся', 'все', 'всё', 'всего', 'всей', 'всем', 'всех', 'всю', 'сам', 'сама', 'само',
+    'сами', 'самой', 'самого', 'который', 'которая', 'которое', 'которые', 'которого', 'которой', 'которых', 'какой',
+    'какая', 'какое', 'какие', 'такой', 'такая', 'такое', 'такие', 'чей', 'чья',
+    // RU: prepositions
+    'в', 'во', 'на', 'с', 'со', 'к', 'ко', 'по', 'за', 'из', 'изо', 'от', 'ото', 'до', 'о', 'об', 'обо', 'у', 'над',
+    'под', 'подо', 'при', 'про', 'для', 'без', 'через', 'между', 'перед', 'передо', 'около', 'вокруг', 'после', 'среди',
+    'сквозь', 'вдоль', 'возле', 'против', 'ради', 'кроме',
+    // RU: conjunctions & particles
+    'и', 'а', 'но', 'или', 'либо', 'да', 'нет', 'не', 'ни', 'же', 'ли', 'бы', 'б', 'ведь', 'вот', 'вон', 'уж', 'уже',
+    'еще', 'ещё', 'лишь', 'только', 'даже', 'тоже', 'также', 'если', 'когда', 'чтобы', 'чтоб', 'как', 'так', 'будто',
+    'словно', 'точно', 'хотя', 'пока', 'потому', 'поэтому', 'зато', 'однако', 'тогда', 'затем', 'потом', 'где', 'куда',
+    'откуда', 'там', 'тут', 'здесь', 'туда', 'сюда', 'ну', 'ох', 'ах', 'эх', 'ой', 'разве', 'неужели', 'пусть', 'дескать',
+    'мол', 'чуть', 'очень', 'всего', 'был', 'была', 'было', 'были', 'быть', 'есть', 'будет', 'будут',
+    // EN
+    'a', 'an', 'the', 'and', 'or', 'but', 'nor', 'so', 'yet', 'if', 'then', 'than', 'as', 'of', 'in', 'on', 'at', 'to',
+    'for', 'from', 'by', 'with', 'without', 'into', 'onto', 'over', 'under', 'up', 'down', 'out', 'off', 'about',
+    'above', 'below', 'across', 'after', 'before', 'behind', 'between', 'through', 'toward', 'towards', 'upon', 'against',
+    'along', 'around', 'among', 'within', 'i', 'me', 'my', 'mine', 'myself', 'you', 'your', 'yours', 'yourself', 'he',
+    'him', 'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'we', 'us', 'our', 'ours', 'they',
+    'them', 'their', 'theirs', 'themselves', 'this', 'that', 'these', 'those', 'who', 'whom', 'whose', 'which', 'what',
+    'is', 'am', 'are', 'was', 'were', 'be', 'been', 'being', 'do', 'does', 'did', 'have', 'has', 'had', 'will', 'would',
+    'shall', 'should', 'can', 'could', 'may', 'might', 'must', 'not', 'no', 'just', 'very', 'too', 'also', 'only',
+    'even', 'still', 'there', 'here', 'when', 'where', 'while', 'how', 'why', 'all', 'any', 'each', 'some', 'such',
+    'own', 'same', 'other', 'again', 'once', 'dont', 'didnt', 'doesnt', 'cant', 'wont', 'im', 'youre', 'hes', 'shes',
+    'its', 'theyre', 'oh', 'ah',
+]);
+function tnIsStopWord(word) {
+    const w = tnNormalize(word);
+    if (!w) return true;
+    return TN_STOP_WORDS.has(w) || /^[0-9]+$/.test(w);
+}
+
+// Unified token estimate (spec 10.3): ceil(latin/4 + cyrillic/2.2 + other/3).
+// "latin" = ASCII letters and Latin-1/Extended-A/B letters; "cyrillic" = U+0400..U+04FF; "other" = every other code unit.
+function tnEstimateTokens(text) {
+    const s = String(text ?? '');
+    if (!s) return 0;
+    let latin = 0;
+    let cyrillic = 0;
+    let other = 0;
+    for (let i = 0; i < s.length; i += 1) {
+        const c = s.charCodeAt(i);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7)) latin += 1;
+        else if (c >= 0x400 && c <= 0x4ff) cyrillic += 1;
+        else other += 1;
+    }
+    return Math.ceil(latin / 4 + cyrillic / 2.2 + other / 3);
+}
+
+// --- src/core/context.js ---
+// Single context assembler for the roleplay model (v1.3, spec 10.3 / 11).
+// Modules hand over RAW strings; only ctxPack trims them, by priority (first = cut last):
+//   slop -> wiki -> scene -> worldEvent -> director.
+// Output: `depth0` (director + world event + anti-slop, very end of context) and `main` (scene + wiki, after the main prompt),
+// sharing one budget (default 250 tokens estimated with tnEstimateTokens).
+//
+// Flat-bundler safe: every top-level name is ctx*-prefixed; only `export function` / `export const`.
+const CTX_MAX_TOKENS = 250;
+const CTX_SLOP_MIN_PHRASES = 3;
+const CTX_ELLIPSIS = '…';
+
+function ctxClean(value) {
+    return String(value ?? '').replace(/\r\n?/g, '\n').trim();
+}
+
+function ctxJoin(a, b) {
+    if (a && b) return `${a}\n${b}`;
+    return a || b || '';
+}
+
+function ctxTokens(text) {
+    return text ? tnEstimateTokens(text) : 0;
+}
+
+// «…» quoted phrases → keep only the first `keep`; otherwise fall back to the last ': a, b, c' list.
+function ctxShrinkSlop(rule, keep) {
+    const quoted = rule.match(/«[^«»]*»/g);
+    if (quoted && quoted.length > keep) {
+        const head = rule.slice(0, rule.indexOf('«')).replace(/\s+$/, '');
+        return `${head} ${quoted.slice(0, keep).join(', ')}.`;
+    }
+    if (quoted) return rule;
+    const colon = rule.lastIndexOf(':');
+    if (colon === -1) return rule;
+    const items = rule.slice(colon + 1).replace(/[.\s]+$/, '').split(',').map(s => s.trim()).filter(Boolean);
+    if (items.length <= keep) return rule;
+    return `${rule.slice(0, colon + 1)} ${items.slice(0, keep).join(', ')}.`;
+}
+
+function ctxIsHeader(line) {
+    return /^\s*\[[^\]]*\]:?\s*$/.test(line);
+}
+
+// Longest prefix (preferring a word boundary) such that fits(prefix + '…') holds; '' when nothing fits.
+function ctxTruncateToFit(text, fits) {
+    if (!text) return '';
+    if (fits(text)) return text;
+    let lo = 0;
+    let hi = text.length - 1;
+    while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fits(`${text.slice(0, mid).trimEnd()}${CTX_ELLIPSIS}`)) lo = mid;
+        else hi = mid - 1;
+    }
+    if (lo <= 0) return '';
+    let cut = text.slice(0, lo);
+    const space = cut.search(/\s\S*$/);
+    if (space > 0 && lo - space <= 24) cut = cut.slice(0, space);
+    cut = cut.trimEnd();
+    return cut ? `${cut}${CTX_ELLIPSIS}` : '';
+}
+function ctxPack({ director = '', worldEvent = '', scene = '', wiki = '', slop = '', maxTokens = CTX_MAX_TOKENS } = {}) {
+    const budget = Number.isFinite(Number(maxTokens)) ? Math.max(0, Math.floor(Number(maxTokens))) : CTX_MAX_TOKENS;
+    const parts = {
+        director: ctxClean(director),
+        worldEvent: ctxClean(worldEvent),
+        scene: ctxClean(scene),
+        wiki: ctxClean(wiki),
+        slop: ctxClean(slop),
+    };
+
+    const measure = p => ctxTokens(ctxJoin(ctxJoin(p.director, p.worldEvent), p.slop)) + ctxTokens(ctxJoin(p.scene, p.wiki));
+    const fits = p => measure(p) <= budget;
+
+    // 4. Anti-slop: shrink to 3 phrases, then drop entirely.
+    if (!fits(parts) && parts.slop) {
+        parts.slop = ctxShrinkSlop(parts.slop, CTX_SLOP_MIN_PHRASES);
+        if (!fits(parts)) parts.slop = '';
+    }
+
+    // 3. Wiki: drop relevant rows from the end of the list.
+    if (!fits(parts) && parts.wiki) {
+        const lines = parts.wiki.split('\n');
+        while (lines.length && !fits({ ...parts, wiki: lines.join('\n').trim() })) lines.pop();
+        const rest = lines.filter(l => l.trim());
+        parts.wiki = rest.length && !rest.every(ctxIsHeader) ? lines.join('\n').trim() : '';
+    }
+
+    // 2. Scene: drop trailing lines (keep at least one), then truncate characters.
+    if (!fits(parts) && parts.scene) {
+        const lines = parts.scene.split('\n');
+        while (lines.length > 1 && !fits({ ...parts, scene: lines.join('\n').trim() })) lines.pop();
+        parts.scene = lines.join('\n').trim();
+        if (!fits(parts)) parts.scene = ctxTruncateToFit(parts.scene, s => fits({ ...parts, scene: s }));
+    }
+
+    // 2.5. World events are depth-0 safety rails: trim them only after the
+    // scene/wiki have yielded, and never let a long event evict the director.
+    if (!fits(parts) && parts.worldEvent) {
+        parts.worldEvent = ctxTruncateToFit(parts.worldEvent, event => fits({ ...parts, worldEvent: event }));
+        if (!fits(parts)) parts.worldEvent = '';
+    }
+
+    // 1. Director: cut only if it alone exceeds the whole budget.
+    if (!fits(parts) && parts.director) {
+        parts.director = ctxTruncateToFit(parts.director, d => fits({ ...parts, director: d }));
+    }
+
+    const depth0 = ctxJoin(ctxJoin(parts.director, parts.worldEvent), parts.slop);
+    const main = ctxJoin(parts.scene, parts.wiki);
+    const tokenStats = {
+        director: ctxTokens(parts.director),
+        scene: ctxTokens(parts.scene),
+        wiki: ctxTokens(parts.wiki),
+        slop: ctxTokens(parts.slop),
+        total: ctxTokens(depth0) + ctxTokens(main),
+    };
+    // Keep the v1.3 object shape byte-for-byte for callers that did not opt in
+    // to world events, while exposing the new diagnostic when it is used.
+    if (parts.worldEvent) tokenStats.worldEvent = ctxTokens(parts.worldEvent);
+    return {
+        depth0,
+        main,
+        tokens: tokenStats,
+    };
+}
+
+// --- src/core/underworld.js ---
+// CLODEx RP Studio v1.4 — local underworld mechanics.
+// This module is deliberately network-free. It owns chat-scoped money, debt,
+// collateral and deterministic-enough (crypto-backed) mini-game primitives.
+const UW_MAX_CASH = 999_999_999;
+const UW_MAX_COLLATERAL = 6;
+const UW_SKINS = Object.freeze(['auto', 'crime', 'tavern', 'syndicate']);
+const UW_COLLATERAL_PRESETS = Object.freeze({
+    crime: ['apartment', 'car', 'business', 'watch'],
+    tavern: ['estate', 'sword', 'artifact', 'oath'],
+    syndicate: ['habitat', 'implant', 'deck', 'license'],
+});
+const UW_PRESET_VALUES = Object.freeze({
+    apartment: 15000,
+    estate: 15000,
+    habitat: 15000,
+    business: 8000,
+    artifact: 8000,
+    implant: 8000,
+    car: 3500,
+    sword: 3500,
+    deck: 3500,
+    watch: 900,
+    oath: 900,
+    license: 900,
+});
+const UW_WORLD_EVENTS = Object.freeze({
+    crime: '[World Event: collectors confront {{user}} over unpaid debt; the apartment is inaccessible.]',
+    tavern: '[World Event: guild bailiffs seal {{user}}’s quarters over unpaid debt.]',
+    syndicate: '[World Event: syndicate agents lock {{user}}’s habitation unit over unpaid debt.]',
+});
+
+function uwClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+function uwInt(value, min, max, fallback = min) {
+    return Math.trunc(uwClamp(value, min, max, fallback));
+}
+function uwDefaultRng() {
+    if (globalThis.crypto?.getRandomValues) {
+        const bytes = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(bytes);
+        return bytes[0] / 0x1_0000_0000;
+    }
+    return Math.random();
+}
+function uwResolveSkin(value, { text = '', description = '', scenario = '' } = {}) {
+    const requested = String(value ?? '').toLowerCase();
+    if (UW_SKINS.includes(requested) && requested !== 'auto') return requested;
+    const corpus = `${text} ${description} ${scenario}`.toLowerCase();
+    if (/(cyber|сайбер|кибер|corporate|корпорат|neuro|нейро|droid|drone|дрон)/.test(corpus)) return 'syndicate';
+    if (/(fantasy|фэнтези|medieval|средневек|magic|маг|guild|гильд|tavern|таверн|dragon|дракон)/.test(corpus)) return 'tavern';
+    if (/(crime|криминал|noir|нуар|gang|банд|mafia|маф|police|полици|detective|детектив)/.test(corpus)) return 'crime';
+    return 'crime';
+}
+function uwCreateState({ skin = 'auto', currency, cash = 500 } = {}) {
+    const resolvedSkin = UW_SKINS.includes(skin) ? skin : 'auto';
+    const defaultCurrency = currency || (resolvedSkin === 'tavern' ? '🪙' : '$');
+    return {
+        skin: resolvedSkin,
+        currency: String(defaultCurrency).slice(0, 8),
+        cash: uwInt(cash, 0, UW_MAX_CASH, 500),
+        debt: 0,
+        turnsInDebt: 0,
+        collateral: [],
+        houseNet: 0,
+        heat: 0,
+        standing: 0,
+        factions: [],
+        turnsSinceEvent: 4,
+        pendingWorldEvent: '',
+        eventKind: '',
+        calmTurns: 0,
+        wagerCooldown: 0,
+        collectorNotices: 0,
+        allyTurns: 0,
+        blackjack: null,
+    };
+}
+function uwNormalizeState(raw) {
+    const out = uwCreateState();
+    if (!raw || typeof raw !== 'object') return out;
+    out.skin = UW_SKINS.includes(raw.skin) ? raw.skin : 'auto';
+    out.currency = String(raw.currency || (out.skin === 'tavern' ? '🪙' : '$')).slice(0, 8);
+    out.cash = uwInt(raw.cash, 0, UW_MAX_CASH, 500);
+    out.debt = uwInt(raw.debt, 0, UW_MAX_CASH, 0);
+    out.turnsInDebt = uwInt(raw.turnsInDebt, 0, 999, 0);
+    out.houseNet = uwInt(raw.houseNet, -UW_MAX_CASH, UW_MAX_CASH, 0);
+    out.heat = uwClamp(raw.heat, 0, 5, 0);
+    out.standing = uwInt(raw.standing, -100, 100, 0);
+    out.turnsSinceEvent = uwInt(raw.turnsSinceEvent, 0, 999, 4);
+    out.pendingWorldEvent = String(raw.pendingWorldEvent || '').replace(/[\u0000-\u001f]/g, ' ').slice(0, 320);
+    out.eventKind = ['debt', 'heat', 'faction', 'wager', 'service'].includes(raw.eventKind) ? raw.eventKind : '';
+    if (out.debt === 0) out.turnsInDebt = 0;
+    out.calmTurns = uwInt(raw.calmTurns, 0, 2, 0);
+    out.wagerCooldown = uwInt(raw.wagerCooldown, 0, 3, 0);
+    out.collectorNotices = uwInt(raw.collectorNotices, 0, 999, 0);
+    out.allyTurns = uwInt(raw.allyTurns, 0, 4, 0);
+    out.blackjack = uwNormalizeBlackjack(raw.blackjack);
+    const seen = new Set();
+    out.collateral = Array.isArray(raw.collateral) ? raw.collateral.filter(item => item && typeof item === 'object').slice(0, UW_MAX_COLLATERAL).map((item, idx) => {
+        const id = String(item.id || `pawn-${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || `pawn-${idx + 1}`;
+        if (seen.has(id)) return null;
+        seen.add(id);
+        const status = item.status === 'foreclosed' ? 'foreclosed' : 'pawned';
+        return {
+            id,
+            kind: ['preset', 'inventory', 'custom'].includes(item.kind) ? item.kind : 'custom',
+            presetKey: String(item.presetKey || '').slice(0, 40),
+            label: String(item.label || '').replace(/[<>]/g, '').slice(0, 48),
+            ...(item.kind === 'inventory' ? { inventoryLabel: String(item.inventoryLabel || item.label || '').slice(0, 80) } : {}),
+            pawnValue: uwInt(item.pawnValue, 0, UW_MAX_CASH, 0),
+            redeemCost: uwInt(item.redeemCost, 0, UW_MAX_CASH, 0),
+            dueInTurns: uwInt(item.dueInTurns, 0, 999, 0),
+            status,
+        };
+    }).filter(Boolean) : [];
+    out.factions = Array.isArray(raw.factions) ? raw.factions.slice(0, 4).map((f, idx) => ({
+        id: String(f?.id || `faction-${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `faction-${idx + 1}`,
+        name: String(f?.name || 'Faction').replace(/[<>]/g, '').slice(0, 48),
+        rep: uwInt(f?.rep, -100, 100, 0),
+    })) : [];
+    return out;
+}
+function uwSafeCollateralLabel(value, { charName = '', userName = '', companions = [] } = {}) {
+    const label = String(value ?? '').replace(/[<>()[\]{}]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!label || /https?:\/\//i.test(label)) return '';
+    const blocked = /(?:^| )(?:people|persons?|humans?|children|child|kids?|bab(?:y|ies)|npc|slaves?|familiars?|companions?|characters?|человек\w*|люди|реб[её]н\S*|дете?й|дети|сын\S*|дочь\S*|персонаж\S*|раб\S*|спутник\S*)(?: |$)/iu;
+    const lower = tnNormalize(label);
+    const names = [charName, userName, ...companions.map(c => c?.name)].map(tnNormalize).filter(Boolean);
+    if (blocked.test(lower) || names.some(name => ` ${lower} `.includes(` ${name} `))) return '';
+    return label;
+}
+const uwIsSafeCollateralLabel = uwSafeCollateralLabel;
+
+function uwWager(state, bet) {
+    const wager = Number(bet);
+    return Number.isSafeInteger(wager) && wager > 0 && wager <= state?.cash ? wager : 0;
+}
+
+function uwSettle(state, delta) {
+    const before = state.cash;
+    state.cash = uwInt(before + delta, 0, UW_MAX_CASH, 0);
+    state.houseNet = uwInt(state.houseNet + state.cash - before, -UW_MAX_CASH, UW_MAX_CASH, 0);
+}
+function uwRollDice(state, { bet = 0, side = 'over', rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!state || wager <= 0) return { ok: false, reason: 'invalid_bet', total: 0, dice: [], payout: 0 };
+    const dice = [1 + Math.floor(rng() * 6), 1 + Math.floor(rng() * 6)];
+    const total = dice[0] + dice[1];
+    const normalized = ['over', 'under', 'seven', 'double'].includes(side) ? side : 'over';
+    const win = normalized === 'over' ? total > 7 : normalized === 'under' ? total < 7 : normalized === 'seven' ? total === 7 : dice[0] === dice[1];
+    const multiplier = normalized === 'seven' ? 4.5 : normalized === 'double' ? 5 : 2;
+    const payout = win ? Math.floor(wager * multiplier) : 0;
+    uwSettle(state, payout - wager);
+    return { ok: true, dice, total, side: normalized, win, payout, net: payout - wager };
+}
+
+function uwNormalizeBlackjack(raw) {
+    if (!raw || raw.status !== 'playing') return null;
+    const lists = [raw.deck, raw.player, raw.dealer];
+    if (lists.some(list => !Array.isArray(list)) || raw.player.length < 2 || raw.dealer.length !== 2) return null;
+    const cards = lists.flat();
+    if (cards.length !== 52 || new Set(cards).size !== 52 || cards.some(n => !Number.isInteger(n) || n < 0 || n > 51)) return null;
+    if (!Number.isInteger(raw.wager) || raw.wager < 1 || raw.wager > UW_MAX_CASH) return null;
+    return { wager: raw.wager, deck: [...raw.deck], player: [...raw.player], dealer: [...raw.dealer], status: 'playing' };
+}
+function uwCardLabel(card) {
+    return `${['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'][card % 13]}${['♠', '♥', '♦', '♣'][Math.floor(card / 13)]}`;
+}
+
+function uwCardValue(cards) {
+    let total = 0;
+    let aces = 0;
+    for (const card of cards) {
+        const rank = card % 13;
+        if (rank === 0) { total += 11; aces += 1; }
+        else total += Math.min(10, rank + 1);
+    }
+    return total - 10 * Math.min(aces, Math.max(0, Math.ceil((total - 21) / 10)));
+}
+function uwHandTotal(cards) {
+    if (!Array.isArray(cards) || !cards.length) return 0;
+    return uwCardValue(cards);
+}
+
+function uwFinishBlackjack(state, session, status, payout) {
+    const before = state.cash;
+    state.cash = Math.min(UW_MAX_CASH, before + payout);
+    const net = state.cash - before - session.wager;
+    state.houseNet = uwInt(state.houseNet + net, -UW_MAX_CASH, UW_MAX_CASH, 0);
+    session.status = status;
+    state.blackjack = null;
+    return { ok: true, session, status, payout, net, playerTotal: uwCardValue(session.player), dealerTotal: uwCardValue(session.dealer) };
+}
+function uwStartBlackjack(state, { bet = 0, rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!wager || state.blackjack) return { ok: false, reason: state?.blackjack ? 'active_hand' : 'invalid_bet' };
+    const deck = Array.from({ length: 52 }, (_, index) => index);
+    for (let i = deck.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(rng() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    const session = { wager, deck, player: [deck.pop()], dealer: [deck.pop()], status: 'playing' };
+    session.player.push(deck.pop());
+    session.dealer.push(deck.pop());
+    state.cash -= wager;
+    const playerTotal = uwCardValue(session.player);
+    const dealerTotal = uwCardValue(session.dealer);
+    if (dealerTotal === 21) return uwFinishBlackjack(state, session, playerTotal === 21 ? 'push' : 'loss', playerTotal === 21 ? wager : 0);
+    if (playerTotal === 21) return uwFinishBlackjack(state, session, 'blackjack', Math.floor(wager * 2.5));
+    state.blackjack = session;
+    return { ok: true, session, playerTotal, status: 'playing', payout: 0 };
+}
+function uwBlackjackAction(state, session, action) {
+    if (!state || !session || state.blackjack !== session || session.status !== 'playing') return { ok: false, reason: 'finished' };
+    if (action === 'double' && (session.player.length !== 2 || session.wager > state.cash || session.wager * 2 > UW_MAX_CASH)) {
+        return { ok: false, reason: 'insufficient_cash' };
+    }
+    if (action === 'hit' || action === 'double') {
+        if (action === 'double') {
+            state.cash -= session.wager;
+            session.wager *= 2;
+        }
+        session.player.push(session.deck.pop());
+        const playerTotal = uwCardValue(session.player);
+        if (playerTotal > 21) return uwFinishBlackjack(state, session, 'bust', 0);
+        if (action === 'hit' && playerTotal !== 21) return { ok: true, session, status: 'playing', playerTotal, payout: 0 };
+    }
+    while (uwCardValue(session.dealer) < 17) session.dealer.push(session.deck.pop());
+    const playerTotal = uwCardValue(session.player);
+    const dealerTotal = uwCardValue(session.dealer);
+    const win = dealerTotal > 21 || playerTotal > dealerTotal;
+    const push = dealerTotal === playerTotal;
+    return uwFinishBlackjack(state, session, win ? 'win' : push ? 'push' : 'loss', win ? session.wager * 2 : push ? session.wager : 0);
+}
+
+const UW_SLOT_SYMBOLS = Object.freeze(['🍒', '🔔', '💎', '7️⃣', '🃏']);
+const UW_SLOT_TRIPLES = Object.freeze([5, 6, 6, 40, 15]);
+function uwPlaySlots(state, { bet = 0, rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!wager) return { ok: false, reason: 'invalid_bet' };
+    const draws = Array.from({ length: 3 }, () => Math.floor(rng() * UW_SLOT_SYMBOLS.length));
+    const counts = UW_SLOT_SYMBOLS.map((_, i) => draws.filter(draw => draw === i).length);
+    const triple = counts.indexOf(3);
+    const pair = counts.indexOf(2);
+    // 5³ equiprobable draws: (72 from triples + 48 from stake-returning pairs) / 125 = 96%.
+    const payout = wager * (triple >= 0 ? UW_SLOT_TRIPLES[triple] : pair >= 0 && pair !== 4 ? 1 : 0);
+    uwSettle(state, payout - wager);
+    return { ok: true, reels: draws.map(i => UW_SLOT_SYMBOLS[i]), payout, net: payout - wager, win: payout > wager };
+}
+function uwStoryWager(state, stake, rng = uwDefaultRng) {
+    const choice = { truth: 'answer one question honestly', wish: 'honor one fair wish', secret: 'reveal one guarded secret' };
+    if (!Object.hasOwn(choice, stake) || state.wagerCooldown || state.pendingWorldEvent) return { ok: false, reason: 'busy_event' };
+    const win = rng() < 0.5;
+    const loser = win ? '{{char}}' : '{{user}}';
+    const winner = win ? '{{user}}' : '{{char}}';
+    uwSetPendingWorldEvent(state, `[Stakes won: ${loser} lost to ${winner} and should ${choice[stake]}.]`, { kind: 'wager' });
+    state.wagerCooldown = 3;
+    return { ok: true, win };
+}
+function uwTakeLoan(state, amount) {
+    const value = Number(amount);
+    if (!state || !Number.isSafeInteger(value) || value <= 0 || state.debt + value > 5_000
+        || state.cash + value > UW_MAX_CASH) return { ok: false, reason: 'invalid_amount' };
+    state.cash += value;
+    state.debt += value;
+    return { ok: true, amount: value, debt: state.debt };
+}
+function uwPawnCollateral(state, item, { skin = 'crime', charName = '', userName = '', companions = [] } = {}) {
+    if (!state || state.collateral.length >= UW_MAX_COLLATERAL) return { ok: false, reason: 'limit' };
+    const label = uwSafeCollateralLabel(item?.label, { charName, userName, companions });
+    if (!label) return { ok: false, reason: 'unsafe_label' };
+    const presetKey = UW_COLLATERAL_PRESETS[skin]?.includes(item?.presetKey) ? item.presetKey : '';
+    const kind = item?.kind === 'inventory' ? 'inventory' : presetKey ? 'preset' : 'custom';
+    if (state.collateral.some(entry => entry.presetKey && entry.presetKey === presetKey
+        || entry.label.toLowerCase() === label.toLowerCase())) return { ok: false, reason: 'already_pawned' };
+    const value = item?.pawnValue === undefined && presetKey ? UW_PRESET_VALUES[presetKey] : Number(item?.pawnValue);
+    const loans = state.collateral.reduce((sum, entry) => sum + (entry.status === 'pawned' ? entry.pawnValue : 0), 0);
+    if (!Number.isSafeInteger(value) || value < 1 || loans + value > 50_000
+        || state.cash + value > UW_MAX_CASH || state.debt + value > UW_MAX_CASH) return { ok: false, reason: 'invalid_value' };
+    const entry = {
+        id: `pawn-${Date.now().toString(36)}-${Math.floor(uwDefaultRng() * 0xffffffff).toString(36)}`,
+        kind,
+        presetKey,
+        label,
+        ...(kind === 'inventory'
+            ? { inventoryLabel: String(item.inventoryLabel || item.label || label).replace(/[<>]/g, '').trim().slice(0, 80) }
+            : {}),
+        pawnValue: value,
+        redeemCost: Math.ceil(value * 1.15),
+        dueInTurns: 6,
+        status: 'pawned',
+    };
+    state.collateral.push(entry);
+    state.cash += value;
+    state.debt += value;
+    return { ok: true, collateral: entry };
+}
+function uwPawnInventoryItem(uwState, userInventory, itemLabel, pawnValue = 250, opts = {}) {
+    if (pawnValue && typeof pawnValue === 'object') {
+        opts = pawnValue;
+        pawnValue = opts.pawnValue ?? 250;
+    }
+    if (!Array.isArray(userInventory)) return { ok: false, reason: 'not_in_inventory' };
+    const needle = String(itemLabel ?? '').trim();
+    if (!needle) return { ok: false, reason: 'not_in_inventory' };
+    let invIdx = userInventory.findIndex(entry => String(entry ?? '').trim() === needle);
+    if (invIdx < 0) {
+        invIdx = userInventory.findIndex(entry => String(entry ?? '').trim().toLowerCase() === needle.toLowerCase());
+    }
+    if (invIdx < 0) return { ok: false, reason: 'not_in_inventory' };
+    const exactLabel = String(userInventory[invIdx] ?? '').trim().slice(0, 80);
+    const res = uwPawnCollateral(uwState, {
+        kind: 'inventory',
+        label: exactLabel,
+        inventoryLabel: exactLabel,
+        pawnValue,
+    }, opts);
+    if (!res.ok) return res;
+    userInventory.splice(invIdx, 1);
+    return res;
+}
+
+function uwDebtClosed(state) {
+    state.turnsInDebt = 0;
+    if (state.eventKind === 'debt') uwConsumeWorldEvent(state);
+}
+function uwRedeemCollateral(state, id, userInventory) {
+    const idx = state?.collateral.findIndex(item => item.id === String(id)) ?? -1;
+    if (idx < 0) return { ok: false, reason: 'not_found' };
+    const item = state.collateral[idx];
+    const principal = Math.min(state.debt, item.pawnValue);
+    const cost = item.redeemCost - item.pawnValue + principal;
+    if (item.status !== 'pawned' || state.cash < cost) return { ok: false, reason: 'not_redeemable' };
+    state.cash -= cost;
+    state.debt -= principal;
+    if (!state.debt) uwDebtClosed(state);
+    state.collateral.splice(idx, 1);
+    if (Array.isArray(userInventory) && item.kind === 'inventory') {
+        const restored = String(item.inventoryLabel || item.label || '').trim().slice(0, 80);
+        if (restored) userInventory.push(restored);
+    }
+    return { ok: true, item };
+}
+function uwSetPendingWorldEvent(state, event, { kind = '', maxTokens = 25 } = {}) {
+    if (!state || state.pendingWorldEvent) return false;
+    const clean = String(event ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 200);
+    const text = ctxPack({ worldEvent: clean, maxTokens }).depth0;
+    if (!text) return false;
+    state.pendingWorldEvent = text;
+    state.eventKind = kind;
+    return true;
+}
+function uwConsumeWorldEvent(state) {
+    state.pendingWorldEvent = '';
+    state.eventKind = '';
+}
+function uwOnTurnCommitted(state, { rng = uwDefaultRng, skin = 'crime', t = key => key } = {}) {
+    if (!state) return [];
+    const events = [];
+    state.wagerCooldown = Math.max(0, state.wagerCooldown - 1);
+    if (state.turnsSinceEvent < 4) state.turnsSinceEvent += 1;
+    if (state.debt > 0) {
+        const debtTurn = state.turnsInDebt + 1;
+        state.turnsInDebt = Math.min(debtTurn, 999);
+        if (debtTurn % 3 === 0) state.debt = Math.min(UW_MAX_CASH, Math.ceil(state.debt * 115 / 100));
+        if (debtTurn <= 2 || debtTurn % 3 === 0) {
+            state.collectorNotices = state.collectorNotices % 3 + 1;
+            const author = t(`uw.collector.${skin}`);
+            const text = t('uw.collectorNotice', { debt: state.debt, currency: state.currency });
+            events.push({ kind: 'dm', author, text });
+            if (state.collectorNotices === 3) events.push({
+                kind: 'voice', author, text: t('uw.collectorVoice'),
+                mediaPrompt: `Read in a stern, cold voice: ${text}`,
+            });
+        }
+    }
+    for (const item of state.collateral) {
+        if (item.status !== 'pawned') continue;
+        if (state.debt > 0) item.dueInTurns = Math.max(0, item.dueInTurns - 1);
+        if (item.dueInTurns === 0) {
+            item.status = 'foreclosed';
+            state.debt = Math.max(0, state.debt - item.pawnValue);
+            events.push({ kind: 'note', author: t('uw.pawn'), text: t('uw.foreclosure', { item: item.label }) });
+        }
+    }
+    if (!state.debt) uwDebtClosed(state);
+    if (state.debt > 0 && !state.pendingWorldEvent && state.turnsSinceEvent >= 4) {
+        const turn = state.turnsInDebt;
+        const event = turn >= 5
+            ? (rng() < 0.45 ? '[World Event: debt enforcers confront {{user}} and demand immediate payment.]' : '')
+            : turn >= 3 ? UW_WORLD_EVENTS[skin] : '';
+        if (turn >= 5 || event) state.turnsSinceEvent = 0;
+        if (event) uwSetPendingWorldEvent(state, event, { kind: 'debt' });
+    }
+    return events.slice(0, 2);
+}
+function uwPayDebt(state, amount = Infinity) {
+    const requested = amount === Infinity ? state?.debt : Number(amount);
+    const paid = Math.min(state?.cash, state?.debt, requested);
+    if (!Number.isSafeInteger(paid) || paid <= 0) return { ok: false, reason: 'invalid_amount' };
+    state.cash -= paid;
+    state.debt -= paid;
+    if (!state.debt) uwDebtClosed(state);
+    return { ok: true, paid, remaining: state.debt };
+}
+function uwContextLine(state) {
+    if (!state) return '';
+    const continuity = uwContinuityLine(state);
+    if (!continuity && !state.pendingWorldEvent) return '';
+    const packed = ctxPack({ scene: continuity, worldEvent: state.pendingWorldEvent || '', maxTokens: 25 });
+    return [packed.main, packed.depth0].filter(Boolean).join('\n');
+}
+
+// Compact single continuity line (<= 25 tokens) used by prompts/host adapters when
+// pendingWorldEvent is placed at depth 0 separately (never duplicated in scene).
+function uwContinuityLine(state) {
+    if (!state || typeof state !== 'object') return '';
+    const debt = Math.round(Number(state.debt) || 0);
+    const heat = Math.round(Math.max(0, Math.min(5, Number(state.heat) || 0)) * 4) / 4;
+    const standing = Math.round(Number(state.standing) || 0);
+    const factions = Array.isArray(state.factions) ? state.factions : [];
+    const hostileObj = factions.find(f => f && Number(f.rep) <= -50 && String(f.name || '').trim());
+    const friendly = standing >= 50 || factions.some(f => f && Number(f.rep) >= 60);
+    if (debt <= 0 && heat <= 0 && Math.abs(standing) < 25 && !hostileObj && !friendly) return '';
+
+    const cleanHostile = hostileObj
+        ? String(hostileObj.name).replace(/[\r\n[\],;]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : '';
+    const build = (prefix, sep, maxHostileChars) => {
+        const bits = [];
+        if (debt > 0) bits.push(`debt ${debt}`);
+        if (heat > 0) bits.push(`wanted ${Number(heat.toFixed(2))}★`);
+        if (Math.abs(standing) >= 25) bits.push(`standing ${standing > 0 ? '+' : ''}${standing}`);
+        if (cleanHostile) bits.push(`hostile faction ${cleanHostile.slice(0, maxHostileChars).trim()}`);
+        if (friendly) bits.push('friendly NPCs');
+        return prefix ? `[${prefix}: ${bits.join(sep)}]` : `[${bits.join(sep)}]`;
+    };
+    const layouts = [['Underworld', ', '], ['UW', ', '], ['', ',']];
+    if (!cleanHostile) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, 0);
+            if (tnEstimateTokens(line) <= 25) return line;
+        }
+        return build('', ',', 0);
+    }
+    const fullCap = Math.min(28, cleanHostile.length);
+    for (const [prefix, sep] of layouts) {
+        const fullLine = build(prefix, sep, fullCap);
+        if (tnEstimateTokens(fullLine) <= 25) return fullLine;
+    }
+    for (let cap = fullCap - 1; cap >= 3; cap -= 1) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, cap);
+            if (tnEstimateTokens(line) <= 25) return line;
+        }
+    }
+    return build('', ',', 3);
+}
+
+// --- src/core/reputation.js ---
+// U3: local wanted/standing/faction mechanics. No network calls are performed here.
+const REP_MAX_HEAT = 5;
+const REP_WORLD_EVENTS = Object.freeze({
+    crime: {
+        tail: '[World Event: plainclothes officers discreetly tailing {{user}} due to local heat]',
+        raid: '[World Event: patrol officers intercept {{user}} after a spike in local heat]',
+        faction: '[World Event: rival gang members recognize {{user}} in the current location]',
+    },
+    tavern: {
+        tail: '[World Event: city watch quietly follows {{user}} after rumors spread through the district]',
+        raid: '[World Event: the town guard blocks {{user}}\'s route and demands answers]',
+        faction: '[World Event: hostile guild agents cross paths with {{user}} in the current tavern]',
+    },
+    syndicate: {
+        tail: '[World Event: surveillance drones shadow {{user}} after a local heat spike]',
+        raid: '[World Event: corporate security intercepts {{user}} for a compliance sweep]',
+        faction: '[World Event: hostile syndicate operatives identify {{user}} in the current sector]',
+    },
+});
+const REP_SERVICES = Object.freeze({
+    clearHeat: { cost: 180, heat: -2 },
+    npcDossier: { cost: 260, heat: 0 },
+    muscle: { cost: 320, heat: 0 },
+});
+
+function repClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+function repNormalizeFactions(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const [index, item] of (Array.isArray(raw) ? raw : []).entries()) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id || `faction-${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `faction-${index + 1}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, name: String(item.name || 'Faction').replace(/[<>]/g, '').trim().slice(0, 48), rep: Math.round(repClamp(item.rep, -100, 100, 0)) });
+        if (out.length >= 4) break;
+    }
+    return out;
+}
+function repNormalizeState(state) {
+    const target = state && typeof state === 'object' ? state : {};
+    // Heat changes are quarter-star increments (services and small local
+    // consequences use ±0.25★).  Rounding to halves silently erased those
+    // changes, so keep the smallest unit promised by the tracker contract.
+    target.heat = Math.round(repClamp(target.heat, 0, REP_MAX_HEAT, 0) * 4) / 4;
+    target.standing = Math.round(repClamp(target.standing, -100, 100, 0));
+    target.factions = repNormalizeFactions(target.factions);
+    target.turnsSinceEvent = Math.max(0, Math.trunc(Number(target.turnsSinceEvent) || 0));
+    return target;
+}
+function repApplyWorldDelta(state, worldDelta) {
+    if (!state || !worldDelta || typeof worldDelta !== 'object') return state;
+    repNormalizeState(state);
+    const heatDelta = repClamp(worldDelta.heatDelta, -2, 3, 0);
+    const standingDelta = Math.round(repClamp(worldDelta.standingDelta, -25, 25, 0));
+    state.heat = Math.round(repClamp(state.heat + heatDelta, 0, REP_MAX_HEAT, 0) * 4) / 4;
+    state.standing = Math.round(repClamp(state.standing + standingDelta, -100, 100, 0));
+    const faction = worldDelta.faction;
+    if (faction && typeof faction === 'object' && String(faction.name || '').trim()) {
+        const name = String(faction.name).replace(/[<>]/g, '').trim().slice(0, 48);
+        const delta = Math.round(repClamp(faction.delta, -30, 30, 0));
+        let found = state.factions.find(item => item.name.toLowerCase() === name.toLowerCase());
+        if (!found && state.factions.length < 4) {
+            found = { id: `faction-${Date.now().toString(36)}`, name, rep: 0 };
+            state.factions.push(found);
+        }
+        if (found) found.rep = Math.round(repClamp(found.rep + delta, -100, 100, 0));
+    }
+    return state;
+}
+function repCoolHeat(state, { calmTurn = true, advanceTurn = true } = {}) {
+    if (!state) return state;
+    repNormalizeState(state);
+    // Underworld's turn hook owns the shared turnsSinceEvent counter. Callers
+    // that run both hooks pass advanceTurn:false to avoid a double tick.
+    if (advanceTurn) state.turnsSinceEvent += 1;
+    if (calmTurn && state.turnsSinceEvent % 3 === 0) state.heat = Math.max(0, Math.round((state.heat - 0.25) * 4) / 4);
+    return state;
+}
+function repRollWorldEvent(state, { rng = Math.random, skin = 'crime' } = {}) {
+    if (!state) return { event: '', kind: '' };
+    repNormalizeState(state);
+    const pack = REP_WORLD_EVENTS[skin] || REP_WORLD_EVENTS.crime;
+    if (state.turnsSinceEvent < 4) return { event: '', kind: '' };
+    if (state.heat >= 4 && rng() < 0.5) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.raid, kind: 'heat' };
+    }
+    if (state.heat >= 2 && rng() < 0.3) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.tail, kind: 'heat' };
+    }
+    if (state.factions.some(f => f.rep <= -50) && rng() < 0.3) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.faction, kind: 'faction' };
+    }
+    return { event: '', kind: '' };
+}
+function repImportFactions(state, rows, { skin = 'crime' } = {}) {
+    if (!state) return [];
+    const names = Array.isArray(rows) ? rows : [];
+    const fallback = skin === 'tavern' ? ['Городская стража', 'Гильдия', 'Культ'] : skin === 'syndicate' ? ['Корпоративная СБ', 'Синдикат', 'Сопротивление'] : ['Оперативники', 'Уличная банда', 'Решалы'];
+    const source = names.length ? names : fallback.map(name => ({ name }));
+    state.factions = repNormalizeFactions(source.map((row, idx) => ({ id: row.id || `faction-${idx + 1}`, name: row.name || row.title || row.label, rep: row.rep || 0 })));
+    return state.factions;
+}
+function repUseService(state, serviceId, { target = '', skin = 'crime' } = {}) {
+    if (!state) return { ok: false, reason: 'state_required' };
+    repNormalizeState(state);
+    const service = REP_SERVICES[serviceId];
+    if (!service) return { ok: false, reason: 'unknown_service' };
+    if (Number(state.cash) < service.cost) return { ok: false, reason: 'insufficient_cash', cost: service.cost };
+    state.cash -= service.cost;
+    if (serviceId === 'clearHeat') {
+        state.heat = Math.max(0, Math.round((state.heat + service.heat) * 4) / 4);
+        return { ok: true, serviceId, cost: service.cost, event: `[World Event: a ${skin} fixer quietly erases traces and lowers {{user}}'s wanted heat]` };
+    }
+    if (serviceId === 'npcDossier') {
+        return { ok: true, serviceId, cost: service.cost, target: String(target || 'current NPC').slice(0, 80), dossierRequested: true };
+    }
+    return { ok: true, serviceId, cost: service.cost, event: `[World Event: hired ${skin === 'tavern' ? 'mercenaries' : skin === 'syndicate' ? 'a cyber-team' : 'muscle'} move against ${String(target || 'the current target').slice(0, 70)}]` };
+}
+function repContextLine(state) {
+    if (!state || (Number(state.heat) <= 0 && Math.abs(Number(state.standing) || 0) < 25)) return '';
+    const bits = [];
+    if (Number(state.heat) > 0) bits.push(`wanted ${Number(state.heat).toFixed(1)}★`);
+    if (Number(state.standing)) bits.push(`standing ${Number(state.standing) > 0 ? '+' : ''}${Math.round(Number(state.standing))}`);
+    const hostile = Array.isArray(state.factions) ? state.factions.filter(f => Number(f.rep) <= -50).slice(0, 1) : [];
+    if (hostile.length) bits.push(`hostile faction ${String(hostile[0].name).slice(0, 28)}`);
+    return `[Reputation continuity: ${bits.join(', ')}]`.slice(0, 180);
+}
+
 // --- src/core/physiology.js ---
+// The Tavo classic-bundle compatibility test intentionally strips imports from
+// a small legacy core set. Keep a tiny, dependency-free fallback so that the
+// physiology module remains executable in that reduced bundle while ESM and Tavo
+// bundles use the real direct exports above (no `import ... as` aliases!).
+function physUwMaxCash() {
+    return typeof UW_MAX_CASH === 'number' ? UW_MAX_CASH : 999_999_999;
+}
+
+function physIsValidEggSkin(skinId) {
+    const clean = String(skinId ?? '').trim();
+    if (!clean) return false;
+    if (typeof EGG_SKINS !== 'undefined' && Array.isArray(EGG_SKINS)) {
+        return EGG_SKINS.some(skin => skin.id === clean);
+    }
+    return false;
+}
+
+function physUwCreateState(...args) {
+    if (typeof uwCreateState === 'function') return uwCreateState(...args);
+    const options = args[0] && typeof args[0] === 'object' ? args[0] : {};
+    return {
+        skin: 'auto', currency: String(options.currency || '$').slice(0, 8),
+        cash: Math.max(0, Math.trunc(Number(options.cash ?? 500) || 500)),
+        debt: 0, turnsInDebt: 0, collateral: [], houseNet: 0, heat: 0,
+        standing: 0, factions: [], turnsSinceEvent: 4, pendingWorldEvent: '',
+        eventKind: '', calmTurns: 0, wagerCooldown: 0, collectorNotices: 0,
+        allyTurns: 0, blackjack: null,
+    };
+}
+
+function physUwNormalizeState(raw) {
+    if (typeof uwNormalizeState === 'function') return uwNormalizeState(raw);
+    const base = physUwCreateState();
+    if (!raw || typeof raw !== 'object') return base;
+    return { ...base, ...raw, collateral: Array.isArray(raw.collateral) ? raw.collateral.slice(0, 6) : [], factions: Array.isArray(raw.factions) ? raw.factions.slice(0, 4) : [] };
+}
+
+function physRepNormalizeState(state) {
+    if (typeof repNormalizeState === 'function') return repNormalizeState(state);
+    return state;
+}
+
+function physRepApplyWorldDelta(state, delta) {
+    if (typeof repApplyWorldDelta === 'function') return repApplyWorldDelta(state, delta);
+    return state;
+}
 const BIO_MODES = Object.freeze(['none', 'cycle', 'omegaverse', 'oviposition']);
 const DISCLOSURE_MODES = Object.freeze(['modern', 'medieval', 'omniscient']);
 const CONTRACEPTION_TYPES = Object.freeze(['none', 'barrier', 'oral', 'iud', 'infertile']);
@@ -1563,10 +2743,84 @@ function createChatState(initialDate = '2026-09-01') {
             turnsSinceAutoImage: 0,
             lastAudioPath: '',
         },
+        // U1-U3: chat-scoped wallet, debt, wanted heat, standing and factions.
+        // Global gacha/relic entitlements are deliberately kept outside this object.
+        underworld: physUwCreateState(),
         codexHistory: [], // [{ role: 'user'|'assistant', content, preset, model, at }]
         activityLog: [],  // [{ atDate, summary }]
         checkpoints: [],  // [{ key, snapshot }]
     };
+}
+function normalizeEntity(src, role = 'char') {
+    const cleanRole = role === 'user' ? 'user' : 'char';
+    const dst = createEntityState(cleanRole);
+    if (!src || typeof src !== 'object') return dst;
+    dst.enabled = src.enabled !== false;
+    if (src.vitals && typeof src.vitals === 'object') {
+        dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
+        dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
+        dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
+            ? src.vitals.respiration : 'steady';
+        dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
+            ? src.vitals.circulation : 'normal';
+        dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
+        dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
+        dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
+        dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
+            id: String(w.id || Math.random().toString(36).slice(2, 8)),
+            label: String(w.label ?? '').slice(0, 100),
+            bleeding: Boolean(w.bleeding),
+            severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
+            daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
+        })).filter(w => w.label) : [];
+    }
+    if (src.bio && typeof src.bio === 'object') {
+        const b = src.bio;
+        dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
+        dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
+        dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
+        dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
+        dst.bio.pregnant = Boolean(b.pregnant);
+        dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
+        dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
+        dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
+        dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
+            ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
+        dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
+        dst.bio.testTaken = Boolean(b.testTaken);
+        dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
+        dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
+        dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
+        dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
+        dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
+        dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
+        dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
+        dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
+        dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
+        dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
+        dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
+        dst.bio.carryingClutch = Boolean(b.carryingClutch);
+        dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
+        dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
+        dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
+        dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
+        dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
+        dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
+        if (b.nest && typeof b.nest === 'object') {
+            dst.bio.nest.active = Boolean(b.nest.active);
+            dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
+            dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
+                id: String(egg?.id || `egg-${idx + 1}`),
+                shell: SHELL_TRAITS.includes(egg?.shell) ? egg.shell : 'healthy',
+                gender: egg?.gender === 'male' ? 'male' : 'female',
+                daysIncubated: Math.max(0, Number(egg?.daysIncubated) || 0),
+                targetDays: Math.round(clamp(Number(egg?.targetDays) || 60, 14, 120)),
+                cracked: Boolean(egg?.cracked),
+                ...(physIsValidEggSkin(egg?.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
+            })) : [];
+        }
+    }
+    return dst;
 }
 function normalizeChatState(raw) {
     const base = createChatState();
@@ -1587,6 +2841,8 @@ function normalizeChatState(raw) {
         out.world.slopRule = String(raw.world.slopRule ?? '').replace(/\s+/g, ' ').trim().slice(0, 600);
     }
     out.turnExtras = normalizeTurnExtras(raw.turnExtras);
+    out.underworld = physUwNormalizeState(raw.underworld);
+    physRepNormalizeState(out.underworld);
     if (raw.counters && typeof raw.counters === 'object') {
         out.counters.turnsSinceLastPhone = physCounter(raw.counters.turnsSinceLastPhone, PHYS_PHONE_EVERY);
         out.counters.turnsSinceWiki = physCounter(raw.counters.turnsSinceWiki, 0);
@@ -1595,71 +2851,7 @@ function normalizeChatState(raw) {
     for (const key of ['user', 'char']) {
         const src = raw.entities?.[key];
         if (!src || typeof src !== 'object') continue;
-        const dst = out.entities[key];
-        dst.enabled = src.enabled !== false;
-        if (src.vitals && typeof src.vitals === 'object') {
-            dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
-            dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
-            dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
-                ? src.vitals.respiration : 'steady';
-            dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
-                ? src.vitals.circulation : 'normal';
-            dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
-            dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
-            dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
-            dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
-                id: String(w.id || Math.random().toString(36).slice(2, 8)),
-                label: String(w.label ?? '').slice(0, 100),
-                bleeding: Boolean(w.bleeding),
-                severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
-                daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
-            })).filter(w => w.label) : [];
-        }
-        if (src.bio && typeof src.bio === 'object') {
-            const b = src.bio;
-            dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
-            dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
-            dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
-            dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
-            dst.bio.pregnant = Boolean(b.pregnant);
-            dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
-            dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
-            dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
-            dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
-                ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
-            dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
-            dst.bio.testTaken = Boolean(b.testTaken);
-            dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
-            dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
-            dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
-            dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
-            dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
-            dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
-            dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
-            dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
-            dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
-            dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
-            dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
-            dst.bio.carryingClutch = Boolean(b.carryingClutch);
-            dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
-            dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
-            dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
-            dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
-            dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
-            dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
-            if (b.nest && typeof b.nest === 'object') {
-                dst.bio.nest.active = Boolean(b.nest.active);
-                dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
-                dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
-                    id: String(egg.id || `egg-${idx + 1}`),
-                    shell: SHELL_TRAITS.includes(egg.shell) ? egg.shell : 'healthy',
-                    gender: egg.gender === 'male' ? 'male' : 'female',
-                    daysIncubated: Math.max(0, Number(egg.daysIncubated) || 0),
-                    targetDays: Math.round(clamp(Number(egg.targetDays) || 60, 14, 120)),
-                    cracked: Boolean(egg.cracked),
-                })) : [];
-            }
-        }
+        out.entities[key] = normalizeEntity(src, key);
     }
     if (Array.isArray(raw.offspring)) {
         out.offspring = raw.offspring.slice(0, 40).map((child, idx) => ({
@@ -1670,6 +2862,7 @@ function normalizeChatState(raw) {
             gender: child.gender === 'male' ? 'male' : 'female',
             bornDate: String(child.bornDate || out.world.rpDate),
             notes: String(child.notes ?? '').slice(0, 140),
+            ...(physIsValidEggSkin(child?.eggSkin) ? { eggSkin: child.eggSkin } : {}),
         }));
     }
     if (Array.isArray(raw.companions)) {
@@ -1918,6 +3111,30 @@ function layEggs(entity, state, count = null) {
     logEvent(state, `${entity.role}: laid ${toLay} egg(s)`);
     return toLay;
 }
+function equipNestEggSkin(bio, eggIndex, skinId, unlockedEggSkins = []) {
+    const targetBio = bio?.nest && Array.isArray(bio.nest.eggs)
+        ? bio
+        : (bio?.bio?.nest && Array.isArray(bio.bio.nest.eggs) ? bio.bio : null);
+    if (!targetBio) return { ok: false, reason: 'egg_not_found', egg: null };
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!physIsValidEggSkin(cleanSkin)) return { ok: false, reason: 'invalid_skin', egg: null };
+    const unlocked = Array.isArray(unlockedEggSkins)
+        ? unlockedEggSkins
+        : unlockedEggSkins instanceof Set
+            ? [...unlockedEggSkins]
+            : Array.isArray(unlockedEggSkins?.unlockedEggSkins)
+                ? unlockedEggSkins.unlockedEggSkins
+                : [];
+    if (!unlocked.map(String).includes(cleanSkin)) return { ok: false, reason: 'skin_locked', egg: null };
+    const eggs = targetBio.nest.eggs;
+    const idx = typeof eggIndex === 'number' || /^\d+$/.test(String(eggIndex ?? ''))
+        ? Math.trunc(Number(eggIndex))
+        : eggs.findIndex(item => item && item.id === String(eggIndex));
+    const egg = idx >= 0 && idx < eggs.length ? eggs[idx] : null;
+    if (!egg) return { ok: false, reason: 'egg_not_found', egg: null };
+    egg.eggSkin = cleanSkin;
+    return { ok: true, egg };
+}
 function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
     const { bio } = entity;
     if (!bio.nest.active || !bio.nest.eggs.length) return [];
@@ -1933,6 +3150,7 @@ function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
                 gender: egg.gender,
                 bornDate: state.world.rpDate,
                 notes: `Hatched (${egg.shell})`,
+                ...(physIsValidEggSkin(egg.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
             };
             state.offspring.push(hatchling);
             hatched.push(hatchling);
@@ -2344,8 +3562,10 @@ function physApplyTurnExtras(state, delta, turnKey) {
         state.counters.turnsSinceLastPhone = 0;
     }
 }
-function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng } = {}) {
+function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng, saveCheckpoint: persistCheckpoint = true } = {}) {
     if (!delta || typeof delta !== 'object') return state;
+    if (!state.underworld || typeof state.underworld !== 'object') state.underworld = physUwCreateState();
+    state.underworld = physUwNormalizeState(state.underworld);
 
     let forwardDays = Math.max(0, Math.trunc(Number(delta.daysElapsed) || 0));
     if (delta.newRpDate) {
@@ -2467,6 +3687,19 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
         }
     }
 
+    // U3 world delta is optional and lives in the same tracker response; it is
+    // clamped by repApplyWorldDelta so a malformed/overly enthusiastic model
+    // cannot mint money or jump the wanted meter in one turn.
+    if (delta.worldDelta && typeof delta.worldDelta === 'object') {
+        if (Number.isFinite(Number(delta.worldDelta.cashDelta))) {
+            const maxCash = physUwMaxCash();
+            const cashDelta = Math.trunc(Math.min(50_000, Math.max(-50_000, Number(delta.worldDelta.cashDelta))));
+            state.underworld.cash = Math.min(maxCash, Math.max(0, state.underworld.cash + cashDelta));
+            state.underworld.houseNet = Math.min(maxCash, Math.max(-maxCash, state.underworld.houseNet + cashDelta));
+        }
+        physRepApplyWorldDelta(state.underworld, delta.worldDelta);
+    }
+
     // Companion mood reaction to explicit delta or scene combat / stress atmosphere
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const hasExplicitMood = delta.companionMoodDelta !== undefined
@@ -2510,7 +3743,7 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
     // M3/M4/M5 bookkeeping: turnExtras (only when present) and counters. Phone/wiki stores are not touched here.
     physApplyTurnExtras(state, delta, String(checkpointKey || ''));
 
-    if (checkpointKey) saveCheckpoint(state, checkpointKey);
+    if (checkpointKey && persistCheckpoint) saveCheckpoint(state, checkpointKey);
     return state;
 }
 function getVisibleBiologySummary(entity, disclosureMode = 'modern') {
@@ -2691,7 +3924,88 @@ function extractCharacterCardFromPng(pngBytes) {
     return null;
 }
 
+// CCv2 helpers kept separate from the generic PNG chunk reader so existing
+// forge exports remain unchanged. The relic payload contains no account data.
+function embedRelicInCharacterCard(cardObject, certPayload, certSignature) {
+    const card = cardObject && typeof cardObject === 'object' ? structuredClone(cardObject) : {};
+    if (!card.data || typeof card.data !== 'object') card.data = {};
+    if (!card.data.extensions || typeof card.data.extensions !== 'object') card.data.extensions = {};
+    card.data.extensions.clodex_rp_relic = {
+        payload: typeof certPayload === 'string' ? certPayload : JSON.stringify(certPayload),
+        sig: String(certSignature ?? ''),
+    };
+    return card;
+}
+function extractRelicFromCharacterCard(cardObject) {
+    const relic = cardObject?.data?.extensions?.clodex_rp_relic;
+    if (!relic || typeof relic !== 'object' || !relic.payload || !relic.sig) return null;
+    return { payload: String(relic.payload), sig: String(relic.sig) };
+}
+
 // --- src/core/prompts.js ---
+function promptsEstimateTokens(text) {
+    const s = String(text ?? '');
+    if (!s) return 0;
+    let latin = 0;
+    let cyrillic = 0;
+    let other = 0;
+    for (let i = 0; i < s.length; i += 1) {
+        const c = s.charCodeAt(i);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7)) latin += 1;
+        else if (c >= 0x400 && c <= 0x4ff) cyrillic += 1;
+        else other += 1;
+    }
+    return Math.ceil(latin / 4 + cyrillic / 2.2 + other / 3);
+}
+
+// Keep the compact legacy bundle test (which strips underworld/reputation imports)
+// executable while using direct exported identifiers in full ESM & Tavo bundles.
+function promptsWorldContinuityLine(state) {
+    if (typeof uwContinuityLine === 'function') return uwContinuityLine(state);
+    if (!state || typeof state !== 'object') return '';
+    const debt = Math.round(Number(state.debt) || 0);
+    const heat = Math.round(Math.max(0, Math.min(5, Number(state.heat) || 0)) * 4) / 4;
+    const standing = Math.round(Number(state.standing) || 0);
+    const factions = Array.isArray(state.factions) ? state.factions : [];
+    const hostileObj = factions.find(f => f && Number(f.rep) <= -50 && String(f.name || '').trim());
+    const friendly = standing >= 50 || factions.some(f => f && Number(f.rep) >= 60);
+    if (debt <= 0 && heat <= 0 && Math.abs(standing) < 25 && !hostileObj && !friendly) {
+        return typeof repContextLine === 'function' ? '' : '';
+    }
+    const cleanHostile = hostileObj
+        ? String(hostileObj.name).replace(/[\r\n[\],;]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : '';
+    const build = (prefix, sep, maxHostileChars) => {
+        const bits = [];
+        if (debt > 0) bits.push(`debt ${debt}`);
+        if (heat > 0) bits.push(`wanted ${Number(heat.toFixed(2))}★`);
+        if (Math.abs(standing) >= 25) bits.push(`standing ${standing > 0 ? '+' : ''}${standing}`);
+        if (cleanHostile) bits.push(`hostile faction ${cleanHostile.slice(0, maxHostileChars).trim()}`);
+        if (friendly) bits.push('friendly NPCs');
+        return prefix ? `[${prefix}: ${bits.join(sep)}]` : `[${bits.join(sep)}]`;
+    };
+    const layouts = [['Underworld', ', '], ['UW', ', '], ['', ',']];
+    if (!cleanHostile) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, 0);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+        return build('', ',', 0);
+    }
+    const fullCap = Math.min(28, cleanHostile.length);
+    for (const [prefix, sep] of layouts) {
+        const fullLine = build(prefix, sep, fullCap);
+        if (promptsEstimateTokens(fullLine) <= 25) return fullLine;
+    }
+    for (let cap = fullCap - 1; cap >= 3; cap -= 1) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, cap);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+    }
+    return build('', ',', 3);
+}
+
 // Background turn-analysis response budget (v1.3, spec 10.4): critical tracker fields first,
 // then innerThought / suggestedActions, phoneEvents last, so truncation never hits the tracker core.
 const TRACKER_MAX_TOKENS = 1100;
@@ -2812,6 +4126,9 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
         lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
     }
 
+    const continuityLine = promptsWorldContinuityLine(state.underworld);
+    if (continuityLine) lines.push(continuityLine);
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -2878,7 +4195,8 @@ function buildTrackerExtractionMessages(state, recentMessages, {
         '    "char": { /* same fields as user */ }',
         '  },',
         `  "innerThought": "", // 1-2 sentences (max 160 chars) of what ${charName} privately thinks but did not say this turn; in the chat language; "" if unclear`,
-        `  "suggestedActions": ["", "", ""]${includePhone ? ',' : ''} // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "suggestedActions": ["", "", ""], // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "worldDelta": { "cashDelta": 0, "heatDelta": 0, "standingDelta": 0, "faction": { "name": "", "delta": 0 } }${includePhone ? ',' : ''} // optional explicit present-turn changes; clamp in client`,
         ...(includePhone ? [
             `  "phoneEvents": [] // 0-2 items ONLY if the story gives a natural reason (usually []): { "kind": "note" | "dm" | "feed" | "photo" | "voice", "author": "who wrote it", "text": "max 280 chars, in the chat language", "mediaPrompt": "short English visual/voice brief for photo/voice, else empty" } — ${charName}'s secret notes, messages to other NPCs, or how the world/forum/social feed reacts to ${userName}`,
         ] : []),
@@ -3082,149 +4400,6 @@ function extractSpokenDialogue(rawMessage, { dialogueOnly = true, maxLength = 40
         .replace(/\s+/g, ' ')
         .trim();
     return withoutActions.slice(0, maxLength);
-}
-
-// --- src/core/textnorm.js ---
-// Shared text normalisation helpers (RU/EN) for CLODEx RP Studio v1.3.
-// Pure functions, no dependencies. Flat-bundler safe: every top-level name is tn*-prefixed.
-// Unicode property escapes are avoided on purpose (older embedded JS runtimes).
-
-// Apostrophes are glued (don't → dont); every other punctuation/symbol becomes a space.
-const tnApostropheRe = /['\u2019\u02bc`\u00b4]/g;
-const tnSeparatorRe = /[\u0000-\u002f\u003a-\u0040\u005b-\u0060\u007b-\u00bf\u00d7\u00f7\u02b9-\u02ff\u2000-\u2bff\u2e00-\u2e7f\u3000-\u303f\ufe00-\ufe6f\uff00-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65\ud800-\udfff]+/g;
-const tnCyrillicRe = /[\u0400-\u04ff]/;
-function tnNormalize(text) {
-    const raw = String(text ?? '');
-    return (typeof raw.normalize === 'function' ? raw.normalize('NFC') : raw)
-        .toLowerCase()
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/ё/g, 'е')
-        .replace(tnApostropheRe, '')
-        .replace(tnSeparatorRe, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-function tnWords(text) {
-    const norm = tnNormalize(text);
-    return norm ? norm.split(' ') : [];
-}
-
-// Reflexive suffixes are removed first, then the longest matching ending.
-// Past-tense "-л" is intentionally kept so ухмыльнулся / ухмыльнулась / ухмыльнулись → ухмыльнул.
-const TN_RU_REFLEXIVE = Object.freeze(['ся', 'сь']);
-const TN_RU_ENDINGS = Object.freeze([
-    'иями', 'ями', 'ами', 'ого', 'его', 'ому', 'ему', 'ыми', 'ими', 'ешь', 'ишь', 'ете', 'ите', 'ией', 'иям', 'иях',
-    'ая', 'яя', 'ое', 'ее', 'ые', 'ие', 'ую', 'юю', 'ой', 'ей', 'ий', 'ый', 'ым', 'им', 'ых', 'их',
-    'ах', 'ях', 'ов', 'ев', 'ом', 'ем', 'ам', 'ям', 'ия', 'ье', 'ья', 'ью', 'ьи',
-    'ет', 'ут', 'ют', 'ит', 'ат', 'ят', 'ть', 'ти',
-    'а', 'я', 'о', 'е', 'ы', 'и', 'у', 'ю', 'ь', 'й',
-]);
-const TN_RU_MIN_STEM = 3;
-const TN_EN_MIN_STEM = 3;
-
-function tnStemRu(word) {
-    let w = word;
-    for (const suf of TN_RU_REFLEXIVE) {
-        if (w.length - suf.length >= TN_RU_MIN_STEM && w.endsWith(suf)) {
-            w = w.slice(0, -suf.length);
-            break;
-        }
-    }
-    for (const suf of TN_RU_ENDINGS) {
-        if (w.length - suf.length >= TN_RU_MIN_STEM && w.endsWith(suf)) {
-            return w.slice(0, -suf.length);
-        }
-    }
-    return w;
-}
-
-function tnUndouble(w) {
-    const n = w.length;
-    if (n >= 4 && w[n - 1] === w[n - 2] && !'aeioulsz'.includes(w[n - 1])) return w.slice(0, -1);
-    return w;
-}
-
-function tnStemEn(word) {
-    let w = word;
-    if (w.length > 4 && w.endsWith('ies')) return `${w.slice(0, -3)}y`;
-    if (w.length > 4 && w.endsWith('ied')) return `${w.slice(0, -3)}y`;
-    for (const suf of ['ingly', 'edly', 'ing', 'ed']) {
-        if (w.length - suf.length >= TN_EN_MIN_STEM && w.endsWith(suf)) {
-            w = tnUndouble(w.slice(0, -suf.length));
-            return w.length > TN_EN_MIN_STEM && w.endsWith('e') ? w.slice(0, -1) : w;
-        }
-    }
-    if (w.length - 2 >= TN_EN_MIN_STEM && w.endsWith('ly')) return w.slice(0, -2);
-    if (w.length - 2 >= TN_EN_MIN_STEM && /(?:ss|x|z|ch|sh)es$/.test(w)) return w.slice(0, -2);
-    if (w.length - 1 >= TN_EN_MIN_STEM && w.endsWith('s') && !/(?:ss|us|is)$/.test(w)) w = w.slice(0, -1);
-    if (w.length > TN_EN_MIN_STEM && w.endsWith('e')) w = w.slice(0, -1);
-    return w;
-}
-function tnStem(word) {
-    const w = tnNormalize(word).replace(/ /g, '');
-    if (!w) return '';
-    if (/^[0-9]+$/.test(w)) return w;
-    if (tnCyrillicRe.test(w)) return tnStemRu(w);
-    if (/^[a-z]+$/.test(w)) return tnStemEn(w);
-    return w;
-}
-
-const TN_STOP_WORDS = new Set([
-    // RU: pronouns
-    'я', 'ты', 'он', 'она', 'оно', 'мы', 'вы', 'они', 'меня', 'тебя', 'его', 'ее', 'нас', 'вас', 'их', 'мне', 'тебе',
-    'ему', 'ей', 'нам', 'вам', 'им', 'мной', 'мною', 'тобой', 'тобою', 'ним', 'ней', 'нею', 'нами', 'вами', 'ими', 'ними',
-    'него', 'нее', 'нему', 'них', 'себя', 'себе', 'собой', 'собою', 'свой', 'своя', 'свое', 'свои', 'своего', 'своей',
-    'своему', 'своим', 'своих', 'своими', 'свою', 'мой', 'моя', 'мое', 'мои', 'моего', 'моей', 'моему', 'моим', 'моих',
-    'мою', 'твой', 'твоя', 'твое', 'твои', 'твоего', 'твоей', 'твоим', 'твоих', 'твою', 'наш', 'наша', 'наше', 'наши',
-    'ваш', 'ваша', 'ваше', 'ваши', 'этот', 'эта', 'это', 'эти', 'этого', 'этой', 'этому', 'этим', 'этих', 'эту', 'тот',
-    'та', 'то', 'те', 'того', 'той', 'тому', 'тем', 'тех', 'ту', 'кто', 'что', 'кого', 'чего', 'кому', 'чему', 'кем',
-    'чем', 'ком', 'чём', 'весь', 'вся', 'все', 'всё', 'всего', 'всей', 'всем', 'всех', 'всю', 'сам', 'сама', 'само',
-    'сами', 'самой', 'самого', 'который', 'которая', 'которое', 'которые', 'которого', 'которой', 'которых', 'какой',
-    'какая', 'какое', 'какие', 'такой', 'такая', 'такое', 'такие', 'чей', 'чья',
-    // RU: prepositions
-    'в', 'во', 'на', 'с', 'со', 'к', 'ко', 'по', 'за', 'из', 'изо', 'от', 'ото', 'до', 'о', 'об', 'обо', 'у', 'над',
-    'под', 'подо', 'при', 'про', 'для', 'без', 'через', 'между', 'перед', 'передо', 'около', 'вокруг', 'после', 'среди',
-    'сквозь', 'вдоль', 'возле', 'против', 'ради', 'кроме',
-    // RU: conjunctions & particles
-    'и', 'а', 'но', 'или', 'либо', 'да', 'нет', 'не', 'ни', 'же', 'ли', 'бы', 'б', 'ведь', 'вот', 'вон', 'уж', 'уже',
-    'еще', 'ещё', 'лишь', 'только', 'даже', 'тоже', 'также', 'если', 'когда', 'чтобы', 'чтоб', 'как', 'так', 'будто',
-    'словно', 'точно', 'хотя', 'пока', 'потому', 'поэтому', 'зато', 'однако', 'тогда', 'затем', 'потом', 'где', 'куда',
-    'откуда', 'там', 'тут', 'здесь', 'туда', 'сюда', 'ну', 'ох', 'ах', 'эх', 'ой', 'разве', 'неужели', 'пусть', 'дескать',
-    'мол', 'чуть', 'очень', 'всего', 'был', 'была', 'было', 'были', 'быть', 'есть', 'будет', 'будут',
-    // EN
-    'a', 'an', 'the', 'and', 'or', 'but', 'nor', 'so', 'yet', 'if', 'then', 'than', 'as', 'of', 'in', 'on', 'at', 'to',
-    'for', 'from', 'by', 'with', 'without', 'into', 'onto', 'over', 'under', 'up', 'down', 'out', 'off', 'about',
-    'above', 'below', 'across', 'after', 'before', 'behind', 'between', 'through', 'toward', 'towards', 'upon', 'against',
-    'along', 'around', 'among', 'within', 'i', 'me', 'my', 'mine', 'myself', 'you', 'your', 'yours', 'yourself', 'he',
-    'him', 'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'we', 'us', 'our', 'ours', 'they',
-    'them', 'their', 'theirs', 'themselves', 'this', 'that', 'these', 'those', 'who', 'whom', 'whose', 'which', 'what',
-    'is', 'am', 'are', 'was', 'were', 'be', 'been', 'being', 'do', 'does', 'did', 'have', 'has', 'had', 'will', 'would',
-    'shall', 'should', 'can', 'could', 'may', 'might', 'must', 'not', 'no', 'just', 'very', 'too', 'also', 'only',
-    'even', 'still', 'there', 'here', 'when', 'where', 'while', 'how', 'why', 'all', 'any', 'each', 'some', 'such',
-    'own', 'same', 'other', 'again', 'once', 'dont', 'didnt', 'doesnt', 'cant', 'wont', 'im', 'youre', 'hes', 'shes',
-    'its', 'theyre', 'oh', 'ah',
-]);
-function tnIsStopWord(word) {
-    const w = tnNormalize(word);
-    if (!w) return true;
-    return TN_STOP_WORDS.has(w) || /^[0-9]+$/.test(w);
-}
-
-// Unified token estimate (spec 10.3): ceil(latin/4 + cyrillic/2.2 + other/3).
-// "latin" = ASCII letters and Latin-1/Extended-A/B letters; "cyrillic" = U+0400..U+04FF; "other" = every other code unit.
-function tnEstimateTokens(text) {
-    const s = String(text ?? '');
-    if (!s) return 0;
-    let latin = 0;
-    let cyrillic = 0;
-    let other = 0;
-    for (let i = 0; i < s.length; i += 1) {
-        const c = s.charCodeAt(i);
-        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7)) latin += 1;
-        else if (c >= 0x400 && c <= 0x4ff) cyrillic += 1;
-        else other += 1;
-    }
-    return Math.ceil(latin / 4 + cyrillic / 2.2 + other / 3);
 }
 
 // --- src/core/director.js ---
@@ -4134,7 +5309,7 @@ function jrClonePayload(payload) {
 }
 
 // Mutates `journal` (push) and returns the appended operation.
-function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
+function jrAppend(journal, { kind, turnKey = '', payload = null, source = '' } = {}) {
     if (!Array.isArray(journal)) throw new TypeError('jrAppend: journal must be an array');
     const cleanKind = String(kind ?? '').trim().slice(0, JR_KIND_MAX);
     if (!cleanKind) throw new TypeError('jrAppend: kind is required');
@@ -4145,6 +5320,8 @@ function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
         payload: jrClonePayload(payload),
         at: Date.now(),
     };
+    const cleanSource = String(source ?? '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 32);
+    if (cleanSource) op.source = cleanSource;
     journal.push(op);
     return op;
 }
@@ -4262,7 +5439,7 @@ const PHONE_MAX_BYTES = 48000;
 const PHONE_MIN_TURNS_BETWEEN = 3;
 const PHONE_OP_ADD = 'phone.add';
 const PHONE_OP_REVEAL = 'phone.reveal';
-const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160 });
+const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160, source: 32 });
 
 const PHONE_MAX_SEEN = 480;
 const PHONE_HARD_MAX_OPS = 720;
@@ -4295,6 +5472,11 @@ function phoneSafeId(value) {
 
 function phoneSafeTurnKey(value) {
     return phoneSanitizeText(value, PHONE_LIMITS.turnKey);
+}
+
+function phoneSafeSource(value) {
+    const source = String(value ?? 'tracker').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, PHONE_LIMITS.source);
+    return source || 'tracker';
 }
 
 function phoneSafeMediaPath(value) {
@@ -4345,7 +5527,7 @@ function phoneNormalizeStore(raw) {
             if (!op || typeof op !== 'object') continue;
             const turnKey = phoneSafeTurnKey(op.turnKey);
             if (!turnKey) continue;
-            const base = { id: op.id, kind: op.kind, turnKey, at: Number.isFinite(op.at) ? op.at : 0 };
+            const base = { id: op.id, kind: op.kind, turnKey, source: phoneSafeSource(op.source), at: Number.isFinite(op.at) ? op.at : 0 };
             if (op.kind === PHONE_OP_ADD) {
                 const entry = phoneSanitizeEntry(op.payload, { turnKey });
                 if (!entry || !entry.id) continue;
@@ -4372,24 +5554,25 @@ function phoneShouldInclude(state) {
 
 // Appends up to 2 sanitized events created by `turnKey`. Idempotent per turnKey:
 // a repeated sync of the same turn does not duplicate entries. Mutates and returns the store.
-function phoneIngestEvents(store, events, turnKey) {
+function phoneIngestEvents(store, events, turnKey, { source = 'tracker' } = {}) {
     if (!store || typeof store !== 'object') return store;
     if (!Array.isArray(store.journal)) store.journal = [];
     const key = phoneSafeTurnKey(turnKey);
+    const origin = phoneSafeSource(source);
     if (!key || !Array.isArray(events) || events.length === 0) return store;
-    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key)) return store;
+    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key && phoneSafeSource(op.source) === origin)) return store;
     const usedIds = new Set(store.journal.filter((op) => op?.kind === PHONE_OP_ADD).map((op) => op.payload?.id));
     let added = 0;
     for (let i = 0; i < events.length && added < PHONE_MAX_EVENTS_PER_TURN; i += 1) {
         const entry = phoneSanitizeEntry({ ...(events[i] && typeof events[i] === 'object' ? events[i] : {}), id: '', mediaPath: '' }, { turnKey: key });
         if (!entry) continue;
-        let id = `ph-${phoneHash(`${key}|${i}|${entry.kind}|${entry.text}`)}`;
+        let id = `ph-${phoneHash(`${key}|${origin}|${i}|${entry.kind}|${entry.text}`)}`;
         let n = 1;
         while (usedIds.has(id)) id = `ph-${phoneHash(`${key}|${i}|${entry.text}|${n++}`)}`;
         usedIds.add(id);
         entry.id = id;
         entry.turnKey = key;
-        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, payload: entry });
+        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, source: origin, payload: entry });
         added += 1;
     }
     if (store.journal.length > PHONE_HARD_MAX_OPS) store.journal = store.journal.slice(-PHONE_HARD_MAX_OPS);
@@ -5926,6 +7109,1046 @@ function vPackRender(doc, t, model = {}, actions = {}) {
     return container;
 }
 
+// --- src/core/views/underworld.js ---
+// CLODEx RP Studio v1.4 — Underworld, Casino, Pawn Shop & Reputation view.
+// Flat-bundler rules: only `export function` / `export const`, unique top-level names (vUw*, VUW_*).
+// All strings are rendered strictly as safe DOM text nodes.
+const VUW_WAGER_STAKES = Object.freeze(['truth', 'wish', 'secret']);
+const VUW_PRESET_ICONS = Object.freeze({
+    apartment: '🏠',
+    car: '🚗',
+    business: '🏢',
+    watch: '⌚',
+    estate: '🏰',
+    sword: '⚔️',
+    artifact: '🔮',
+    oath: '📜',
+    habitat: '🏙',
+    implant: '🦾',
+    deck: '💻',
+    license: '🪪',
+});
+
+const VUW_FALLBACK_PRESET_VALUES = Object.freeze({
+    apartment: 15000,
+    estate: 15000,
+    habitat: 15000,
+    business: 8000,
+    artifact: 8000,
+    implant: 8000,
+    car: 3500,
+    sword: 3500,
+    deck: 3500,
+    watch: 900,
+    oath: 900,
+    license: 900,
+});
+
+function vUwPresetValue(presetKey) {
+    if (typeof UW_PRESET_VALUES === 'object' && UW_PRESET_VALUES && Number.isFinite(UW_PRESET_VALUES[presetKey])) {
+        return UW_PRESET_VALUES[presetKey];
+    }
+    return VUW_FALLBACK_PRESET_VALUES[presetKey] ?? 1000;
+}
+
+function vUwSafeHandTotal(cards) {
+    if (typeof uwHandTotal === 'function') return uwHandTotal(cards);
+    let total = 0;
+    let aces = 0;
+    for (const card of Array.isArray(cards) ? cards : []) {
+        const rank = card % 13;
+        if (rank === 0) {
+            total += 11;
+            aces += 1;
+        } else {
+            total += Math.min(10, rank + 1);
+        }
+    }
+    return total - 10 * Math.min(aces, Math.max(0, Math.ceil((total - 21) / 10)));
+}
+
+function vUwFormatSigned(currency, amount) {
+    const num = Math.trunc(Number(amount) || 0);
+    if (num > 0) return `+${currency}${num.toLocaleString()}`;
+    if (num < 0) return `-${currency}${Math.abs(num).toLocaleString()}`;
+    return `${currency}0`;
+}
+
+function vUwFormatHeat(heat) {
+    const val = Math.max(0, Math.min(REP_MAX_HEAT, Number(heat) || 0));
+    return Number.isInteger(val) ? String(val) : val.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function vUwRenderStars(doc, heat) {
+    const val = Math.max(0, Math.min(REP_MAX_HEAT, Number(heat) || 0));
+    const wrap = vEl(doc, 'span', {
+        className: 'clodex-rp-uw-stars',
+        dataset: { rpView: 'uw-wanted-stars', heat: vUwFormatHeat(val) },
+    });
+    for (let i = 1; i <= REP_MAX_HEAT; i += 1) {
+        const full = val >= i;
+        const partial = !full && val > i - 1;
+        wrap.append(vEl(doc, 'span', {
+            className: `clodex-rp-uw-star${full ? ' is-full' : partial ? ' is-half' : ' is-empty'}`,
+        }, full || partial ? '★' : '☆'));
+    }
+    return wrap;
+}
+
+function vUwRenderCasinoOutcome(doc, t, outcome, currency, charName) {
+    if (!outcome || typeof outcome !== 'object') return null;
+    const net = Number(outcome.net) || 0;
+    const tone = outcome.game === 'wager'
+        ? (outcome.win ? 'is-win' : 'is-loss')
+        : net > 0
+            ? 'is-win'
+            : net < 0
+                ? 'is-loss'
+                : 'is-push';
+
+    const box = vEl(doc, 'div', {
+        className: `clodex-rp-uw-outcome ${tone}`,
+        role: 'status',
+        dataset: { rpView: 'casino-outcome', game: String(outcome.game || '') },
+    });
+
+    if (outcome.game === 'dice') {
+        const d0 = outcome.dice?.[0] ?? 1;
+        const d1 = outcome.dice?.[1] ?? 1;
+        const tag = outcome.win ? t('uw.winTag') : t('uw.lossTag');
+        box.append(
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                vEl(doc, 'strong', {}, `🎲 [${d0}] + [${d1}] = ${outcome.total}`),
+                vEl(doc, 'strong', {}, `${tag} · ${vUwFormatSigned(currency, net)}`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-muted' },
+                `${t(`uw.dice.${['over', 'under', 'seven', 'double'].includes(outcome.side) ? outcome.side : 'over'}`)} · ${t('uw.payout')}: ${currency}${Number(outcome.payout || 0).toLocaleString()}`),
+        );
+        return box;
+    }
+
+    if (outcome.game === 'slots') {
+        const reels = Array.isArray(outcome.reels) && outcome.reels.length === 3 ? outcome.reels : ['🍒', '🔔', '💎'];
+        const tag = net > 0 ? t('uw.winTag') : net < 0 ? t('uw.lossTag') : t('uw.pushTag');
+        box.append(
+            vEl(doc, 'div', {
+                className: 'clodex-rp-uw-reels',
+                dataset: { rpView: 'slots-reels' },
+            }, `[ ${reels[0]} | ${reels[1]} | ${reels[2]} ]`),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                vEl(doc, 'span', {}, `${t('uw.payout')}: ${currency}${Number(outcome.payout || 0).toLocaleString()}`),
+                vEl(doc, 'strong', {}, `${tag} · ${t('uw.net')}: ${vUwFormatSigned(currency, net)}`),
+            ),
+        );
+        return box;
+    }
+
+    if (outcome.game === 'blackjack') {
+        const statusKey = ['win', 'loss', 'push', 'blackjack', 'bust'].includes(outcome.status) ? outcome.status : 'loss';
+        const playerCards = (Array.isArray(outcome.player) ? outcome.player : []).map(uwCardLabel).join(' ');
+        const dealerCards = (Array.isArray(outcome.dealer) ? outcome.dealer : []).map(uwCardLabel).join(' ');
+        box.append(
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                vEl(doc, 'strong', {}, `🃏 ${t(`uw.bj.status.${statusKey}`)}`),
+                vEl(doc, 'strong', {}, `${t('uw.net')}: ${vUwFormatSigned(currency, net)}`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row clodex-rp-mt' },
+                vEl(doc, 'span', {}, `${t('uw.bj.player')}: `),
+                vEl(doc, 'span', { className: 'clodex-rp-uw-cards' }, `${playerCards} (${outcome.playerTotal})`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                vEl(doc, 'span', {}, `${t('uw.bj.dealer')}: `),
+                vEl(doc, 'span', { className: 'clodex-rp-uw-cards' }, `${dealerCards} (${outcome.dealerTotal})`),
+            ),
+        );
+        return box;
+    }
+
+    if (outcome.game === 'wager') {
+        const stakeKey = VUW_WAGER_STAKES.includes(outcome.stake) ? outcome.stake : 'truth';
+        box.append(vEl(doc, 'div', {},
+            `🗝️ ${t(outcome.win ? 'uw.wagerWin' : 'uw.wagerLoss', {
+                char: charName || '{{char}}',
+                stake: t(`uw.stake.${stakeKey}`),
+            })}`));
+        return box;
+    }
+
+    return null;
+}
+
+function vUwRenderBlackjackActive(doc, t, bj, cash, currency, actions) {
+    if (!bj || bj.status !== 'playing') return null;
+    const playerCards = (Array.isArray(bj.player) ? bj.player : []).map(uwCardLabel).join(' ');
+    const playerTotal = vUwSafeHandTotal(bj.player);
+    const dealerUpcard = Array.isArray(bj.dealer) && bj.dealer.length ? uwCardLabel(bj.dealer[0]) : '?';
+    const canDouble = Array.isArray(bj.player) && bj.player.length === 2 && Number(cash) >= Number(bj.wager);
+
+    return vEl(doc, 'div', {
+        className: 'clodex-rp-uw-bj',
+        dataset: { rpView: 'blackjack-active' },
+    },
+    vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+        vEl(doc, 'span', {}, `🃏 ${t('uw.bj.player')}: `),
+        vEl(doc, 'span', { className: 'clodex-rp-uw-cards', dataset: { rpView: 'bj-player-hand' } }, `${playerCards} (${playerTotal})`),
+        vEl(doc, 'span', { className: 'clodex-rp-muted' }, `${t('uw.bj.wager')}: ${currency}${Number(bj.wager || 0).toLocaleString()}`),
+    ),
+    vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+        vEl(doc, 'span', {}, `🎩 ${t('uw.bj.dealer')}: `),
+        vEl(doc, 'span', { className: 'clodex-rp-uw-cards', dataset: { rpView: 'bj-dealer-hand' } }, `${dealerUpcard} [🂠]`),
+    ),
+    vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+        vEl(doc, 'button', {
+            type: 'button',
+            className: 'clodex-rp-btn clodex-rp-btn-primary',
+            dataset: { rpAction: 'uw-bj-hit' },
+            onClick: () => actions.onBjAction?.('hit'),
+        }, `🃏 ${t('uw.bj.hit')}`),
+        vEl(doc, 'button', {
+            type: 'button',
+            className: 'clodex-rp-btn',
+            dataset: { rpAction: 'uw-bj-stand' },
+            onClick: () => actions.onBjAction?.('stand'),
+        }, `✋ ${t('uw.bj.stand')}`),
+        vEl(doc, 'button', {
+            type: 'button',
+            className: 'clodex-rp-btn',
+            disabled: !canDouble,
+            dataset: { rpAction: 'uw-bj-double' },
+            onClick: () => actions.onBjAction?.('double'),
+        }, `⏫ ${t('uw.bj.double')}`),
+    ));
+}
+function vUwRender(doc, t, model = {}, actions = {}) {
+    const uw = model.uw && typeof model.uw === 'object' ? model.uw : {};
+    const selectedSkin = UW_SKINS.includes(uw.skin) ? uw.skin : 'auto';
+    const resolvedSkin = ['crime', 'tavern', 'syndicate'].includes(model.resolvedSkin) ? model.resolvedSkin : 'crime';
+    const currency = String(uw.currency || (resolvedSkin === 'tavern' ? '🪙' : '$'));
+    const cash = Math.max(0, Math.trunc(Number(uw.cash) || 0));
+    const debt = Math.max(0, Math.trunc(Number(uw.debt) || 0));
+    const turnsInDebt = Math.max(0, Math.trunc(Number(uw.turnsInDebt) || 0));
+    const heat = Math.max(0, Math.min(REP_MAX_HEAT, Number(uw.heat) || 0));
+    const standing = Math.trunc(Number(uw.standing) || 0);
+    const betDraft = Math.max(1, Math.trunc(Number(model.betDraft) || 25));
+    const pawnValueDraft = Math.max(1, Math.trunc(Number(model.pawnValueDraft) || 500));
+    const collateralDraft = String(model.collateralDraft ?? '');
+    const targetDraft = String(model.targetDraft ?? '');
+    const wagerStake = VUW_WAGER_STAKES.includes(model.wagerStake) ? model.wagerStake : 'truth';
+    const charName = String(model.charName || '{{char}}');
+    const userInventory = Array.isArray(model.userInventory) ? model.userInventory : [];
+    const collateral = Array.isArray(uw.collateral) ? uw.collateral : [];
+    const factions = Array.isArray(uw.factions) ? uw.factions : [];
+    const presetKeys = UW_COLLATERAL_PRESETS[resolvedSkin] || UW_COLLATERAL_PRESETS.crime;
+
+    const root = vEl(doc, 'div', {
+        className: `clodex-rp-underworld is-${resolvedSkin}`,
+        dataset: { rpView: 'underworld', skin: resolvedSkin },
+    });
+
+    // Overview & Skin Selector Card
+    const overviewCard = vEl(doc, 'div', { className: 'clodex-rp-card' },
+        vEl(doc, 'div', { className: 'clodex-rp-uw-top' },
+            vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🎲 ${t('uw.title')}`),
+            vEl(doc, 'label', { className: 'clodex-rp-uw-skin' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, t('uw.skinLabel')),
+                vEl(doc, 'select', {
+                    className: 'clodex-rp-input',
+                    dataset: { rpAction: 'uw-skin' },
+                    onChange: e => actions.onSkin?.(String(e?.target?.value ?? 'auto')),
+                }, ...UW_SKINS.map(s => vEl(doc, 'option', { value: s, selected: s === selectedSkin }, t(`uw.skin.${s}`)))),
+            ),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-uw-stats clodex-rp-mt' },
+            vEl(doc, 'div', { className: 'clodex-rp-uw-stat' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `💰 ${t('uw.cash')}`),
+                vEl(doc, 'strong', {}, `${currency}${cash.toLocaleString()}`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-stat' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `💸 ${t('uw.debt')}`),
+                vEl(doc, 'strong', {}, `${currency}${debt.toLocaleString()}${turnsInDebt > 0 ? ` (${t('uw.turnsInDebt', { turns: turnsInDebt })})` : ''}`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-stat' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `🚔 ${t('uw.wanted')}`),
+                vEl(doc, 'strong', {}, `${vUwFormatHeat(heat)}★`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-uw-stat' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `⚖️ ${t('uw.standing')}`),
+                vEl(doc, 'strong', {}, standing > 0 ? `+${standing}` : String(standing)),
+            ),
+        ),
+        uw.pendingWorldEvent ? vEl(doc, 'div', {
+            className: 'clodex-rp-uw-event clodex-rp-mt',
+            dataset: { rpView: 'uw-world-event' },
+        }, `⚡ ${t('uw.pendingEventBadge')}: `, vEl(doc, 'span', { textContent: String(uw.pendingWorldEvent) })) : null,
+    );
+    root.append(overviewCard);
+
+    // 1. Casino & Story Wager Card
+    const casinoCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'uw-casino' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🎰 ${t(`uw.casinoTitle.${resolvedSkin}`)}`),
+        vEl(doc, 'label', { className: 'clodex-rp-field' },
+            vEl(doc, 'span', {}, `${t('uw.bet')} (${currency})`),
+            vEl(doc, 'input', {
+                type: 'number',
+                min: 1,
+                className: 'clodex-rp-input',
+                value: String(betDraft),
+                dataset: { rpAction: 'uw-bet' },
+                onInput: e => actions.onBetInput?.(Math.max(1, Math.trunc(Number(e?.target?.value) || 1))),
+            }),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, `🎲 ${t('uw.diceLabel')}`),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            ...[
+                ['over', '⬆️'],
+                ['under', '⬇️'],
+                ['seven', '7️⃣'],
+                ['double', '🎯'],
+            ].map(([side, icon]) => vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn',
+                dataset: { rpAction: 'uw-dice', side },
+                onClick: () => actions.onDice?.(side),
+            }, `${icon} ${t(`uw.dice.${side}`)}`)),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                dataset: { rpAction: 'uw-slots' },
+                onClick: () => actions.onSlots?.(),
+            }, `🎰 ${t('uw.slots.spin')}`),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                disabled: Boolean(uw.blackjack),
+                dataset: { rpAction: 'uw-bj-deal' },
+                onClick: () => actions.onBjDeal?.(),
+            }, `🃏 ${t('uw.bj.deal')}`),
+        ),
+        vUwRenderBlackjackActive(doc, t, uw.blackjack, cash, currency, actions),
+        vUwRenderCasinoOutcome(doc, t, model.lastOutcome, currency, charName),
+        vEl(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt', dataset: { rpView: 'uw-wager-box' } },
+            vEl(doc, 'strong', {}, `🗝️ ${t('uw.wagerTitle', { char: charName })}`),
+            vEl(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                ...VUW_WAGER_STAKES.map(stake => vEl(doc, 'button', {
+                    type: 'button',
+                    className: `clodex-rp-chip-btn${wagerStake === stake ? ' active' : ''}`,
+                    dataset: { rpAction: 'uw-wager-stake', stake },
+                    onClick: () => actions.onWagerStake?.(stake),
+                }, t(`uw.stake.${stake}`))),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    disabled: Number(uw.wagerCooldown) > 0 || Boolean(uw.pendingWorldEvent),
+                    dataset: { rpAction: 'uw-wager' },
+                    onClick: () => actions.onStoryWager?.(),
+                }, `🎲 ${t('uw.wagerBtn', { char: charName })}`),
+                Number(uw.wagerCooldown) > 0
+                    ? vEl(doc, 'span', { className: 'clodex-rp-muted', dataset: { rpView: 'uw-wager-cooldown' } },
+                        `⏳ ${t('uw.wagerCooldown', { turns: uw.wagerCooldown })}`)
+                    : null,
+            ),
+        ),
+    );
+    root.append(casinoCard);
+
+    // 2. Pawn Shop & Debt Card
+    const pawnCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'uw-pawn' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🏦 ${t(`uw.pawnTitle.${resolvedSkin}`)}`),
+        vEl(doc, 'label', { className: 'clodex-rp-field' },
+            vEl(doc, 'span', {}, `${t('uw.pawnValueLabel')} (${currency})`),
+            vEl(doc, 'input', {
+                type: 'number',
+                min: 1,
+                max: 50000,
+                className: 'clodex-rp-input',
+                value: String(pawnValueDraft),
+                dataset: { rpAction: 'uw-pawn-value' },
+                onInput: e => actions.onPawnValueInput?.(Math.max(1, Math.min(50000, Math.trunc(Number(e?.target?.value) || 500)))),
+            }),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn',
+                dataset: { rpAction: 'uw-take-loan' },
+                onClick: () => actions.onTakeLoan?.(),
+            }, `💸 ${t('uw.takeLoan')}`),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                disabled: debt <= 0 || cash <= 0,
+                dataset: { rpAction: 'uw-pay-debt' },
+                onClick: () => actions.onPayDebt?.(),
+            }, `✅ ${t('uw.payDebt')}`),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+            vEl(doc, 'strong', {}, `🏷️ ${t('uw.presetsLabel')}`),
+            vEl(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                ...presetKeys.map(presetKey => {
+                    const icon = VUW_PRESET_ICONS[presetKey] || '🏷️';
+                    const val = vUwPresetValue(presetKey);
+                    const label = t(`uw.preset.${presetKey}`);
+                    const already = collateral.some(item => item.presetKey === presetKey);
+                    return vEl(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-chip-btn${already ? ' active' : ''}`,
+                        disabled: already,
+                        dataset: { rpAction: 'uw-pawn-preset', preset: presetKey },
+                        onClick: () => actions.onPawnPreset?.(presetKey, label, val),
+                    }, `${icon} ${label} (+${currency}${val.toLocaleString()})`);
+                }),
+            ),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt', dataset: { rpView: 'uw-inventory' } },
+            vEl(doc, 'strong', {}, `🎒 ${t('uw.inventoryPawnLabel')}`),
+            userInventory.length === 0
+                ? vEl(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('uw.inventoryEmpty'))
+                : vEl(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
+                    ...userInventory.map((itemLabel, idx) => vEl(doc, 'div', { className: 'clodex-rp-list-item' },
+                        vEl(doc, 'span', { textContent: String(itemLabel) }),
+                        vEl(doc, 'button', {
+                            type: 'button',
+                            className: 'clodex-rp-btn-mini',
+                            dataset: { rpAction: 'uw-pawn-inv', index: String(idx), item: String(itemLabel) },
+                            onClick: () => actions.onPawnInventory?.(String(itemLabel), idx),
+                        }, `🏷️ ${t('uw.pawnAction')} (+${currency}${pawnValueDraft.toLocaleString()})`),
+                    ))),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'input', {
+                type: 'text',
+                className: 'clodex-rp-input',
+                maxLength: 48,
+                placeholder: t('uw.collateralPlaceholder'),
+                value: collateralDraft,
+                dataset: { rpAction: 'uw-collateral-label' },
+                onInput: e => actions.onCollateralInput?.(String(e?.target?.value ?? '')),
+            }),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn',
+                dataset: { rpAction: 'uw-pawn-custom' },
+                onClick: () => actions.onPawnCustom?.(),
+            }, `🏷️ ${t('uw.pawnAction')}`),
+        ),
+        collateral.length === 0
+            ? vEl(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('uw.collateralEmpty'))
+            : vEl(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt', dataset: { rpView: 'uw-collateral-list' } },
+                ...collateral.map(item => {
+                    const statusKey = item.status === 'foreclosed' ? 'foreclosed' : 'pawned';
+                    return vEl(doc, 'div', {
+                        className: 'clodex-rp-list-item clodex-rp-collateral-row',
+                        dataset: { rpView: 'uw-collateral-row', collateralId: String(item.id) },
+                    },
+                    vEl(doc, 'div', { className: 'clodex-rp-collateral-meta' },
+                        vEl(doc, 'strong', { textContent: String(item.label) }),
+                        vEl(doc, 'span', { className: 'clodex-rp-muted' },
+                            `${t(`uw.collateralStatus.${statusKey}`)} · ${t('uw.redeemCostLabel', { cost: `${currency}${Number(item.redeemCost || 0).toLocaleString()}` })} · ${t('uw.dueInTurnsLabel', { turns: Number(item.dueInTurns) || 0 })}`),
+                    ),
+                    vEl(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn-mini',
+                        disabled: statusKey !== 'pawned',
+                        dataset: { rpAction: 'uw-redeem', collateralId: String(item.id) },
+                        onClick: () => actions.onRedeem?.(item.id),
+                    }, t('uw.redeem')));
+                })),
+    );
+    root.append(pawnCard);
+
+    // 3. Wanted, Factions & Shadow Services Card
+    const repCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'uw-reputation' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🚔 ${t(`uw.repTitle.${resolvedSkin}`)}`),
+        vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `${t('uw.wanted')}:`),
+                vUwRenderStars(doc, heat),
+                vEl(doc, 'strong', {}, `${vUwFormatHeat(heat)} / ${REP_MAX_HEAT}★`),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+                vEl(doc, 'span', { className: 'clodex-rp-muted' }, `${t('uw.standing')}:`),
+                vEl(doc, 'strong', {}, `${standing > 0 ? `+${standing}` : String(standing)} / 100`),
+            ),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+            vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                vEl(doc, 'strong', {}, `🏴 ${t('uw.factionsTitle')}`),
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini',
+                    dataset: { rpAction: 'uw-import-factions' },
+                    onClick: () => actions.onImportFactions?.(),
+                }, `📚 ${t('uw.importFactions')}`),
+            ),
+            factions.length === 0
+                ? vEl(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('uw.factionsEmpty'))
+                : vEl(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt', dataset: { rpView: 'uw-factions' } },
+                    ...factions.map(f => {
+                        const repVal = Math.trunc(Number(f.rep) || 0);
+                        const repClass = repVal <= -50 ? ' is-hostile' : repVal >= 60 ? ' is-friendly' : '';
+                        return vEl(doc, 'div', { className: 'clodex-rp-list-item' },
+                            vEl(doc, 'span', { textContent: String(f.name) }),
+                            vEl(doc, 'span', { className: `clodex-rp-uw-faction-rep${repClass}` },
+                                repVal > 0 ? `+${repVal}` : String(repVal)),
+                        );
+                    })),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt', dataset: { rpView: 'uw-services' } },
+            vEl(doc, 'strong', {}, `🕶️ ${t('uw.servicesTitle')}`),
+            vEl(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                vEl(doc, 'span', {}, t('uw.targetLabel')),
+                vEl(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input',
+                    maxLength: 70,
+                    placeholder: t('uw.targetPlaceholder', { char: charName }),
+                    value: targetDraft,
+                    dataset: { rpAction: 'uw-target' },
+                    onInput: e => actions.onTargetInput?.(String(e?.target?.value ?? '')),
+                }),
+            ),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    dataset: { rpAction: 'uw-service', service: 'clearHeat' },
+                    onClick: () => actions.onService?.('clearHeat'),
+                }, `🧹 ${t(`uw.service.clearHeat.${resolvedSkin}`)} (${currency}${REP_SERVICES.clearHeat.cost})`),
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    disabled: Boolean(model.dossierBusy),
+                    dataset: { rpAction: 'uw-service', service: 'npcDossier' },
+                    onClick: () => actions.onService?.('npcDossier'),
+                }, model.dossierBusy
+                    ? `⏳ ${t('uw.dossierBusy')}`
+                    : `🕵️ ${t(`uw.service.npcDossier.${resolvedSkin}`)} (${currency}${REP_SERVICES.npcDossier.cost})`),
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    dataset: { rpAction: 'uw-service', service: 'muscle' },
+                    onClick: () => actions.onService?.('muscle'),
+                }, `${resolvedSkin === 'tavern' ? '⚔️' : resolvedSkin === 'syndicate' ? '🤖' : '🥊'} ${t(`uw.service.muscle.${resolvedSkin}`)} (${currency}${REP_SERVICES.muscle.cost})`),
+            ),
+        ),
+    );
+    root.append(repCard);
+
+    return root;
+}
+
+// --- src/core/relic.js ---
+// R1: offline ES256 verification and read-only relic sync helpers.
+const REL_CERT_VERSION = 1;
+// Replaced by the packager only from the operator-provided public key. Neither
+// a downloaded catalogue nor a card/prefs file can appoint its own verifier.
+const REL_PUBLIC_JWK = null;
+
+function relBase64UrlToBytes(value) {
+    const raw = String(value ?? '');
+    if (!raw || !/^[A-Za-z0-9_-]+$/.test(raw)) throw new Error('Invalid base64url value.');
+    const text = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = text + '='.repeat((4 - (text.length % 4)) % 4);
+    if (typeof atob === 'function') {
+        const binary = atob(padded);
+        const out = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+        return out;
+    }
+    if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(padded, 'base64'));
+    throw new Error('Base64 decoder unavailable.');
+}
+function relBytesToBase64Url(bytes) {
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    const b64 = typeof btoa === 'function' ? btoa(binary) : Buffer.from(bytes).toString('base64');
+    return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function relDecodeFixedBase64Url(value, expectedLength) {
+    const bytes = relBase64UrlToBytes(value);
+    if (bytes.length !== expectedLength) throw new Error('Invalid fixed-length base64url value.');
+    return bytes;
+}
+
+/** Return a safe, immutable-ish ES256 JWK or null for any malformed input. */
+function relNormalizePublicJwk(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    if (Object.hasOwn(value, 'd')) return null;
+    const kty = String(value.kty ?? '').trim();
+    const crv = String(value.crv ?? '').trim();
+    const x = String(value.x ?? '').trim();
+    const y = String(value.y ?? '').trim();
+    if (kty !== 'EC' || crv !== 'P-256') return null;
+    if (value.alg !== undefined && String(value.alg).trim() !== 'ES256') return null;
+    if (value.use !== undefined && String(value.use).trim() !== 'sig') return null;
+    try {
+        relDecodeFixedBase64Url(x, 32);
+        relDecodeFixedBase64Url(y, 32);
+    } catch {
+        return null;
+    }
+    return Object.freeze({
+        kty,
+        crv,
+        x,
+        y,
+        alg: 'ES256',
+        use: 'sig',
+        ext: true,
+    });
+}
+
+function relCleanText(value, max = 256) {
+    return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, max);
+}
+
+function relStableValue(value) {
+    if (Array.isArray(value)) return value.map(relStableValue);
+    if (!value || typeof value !== 'object') return value;
+    const out = Object.create(null);
+    for (const key of Object.keys(value).sort()) out[key] = relStableValue(value[key]);
+    return out;
+}
+function relParseSignedPayload(payload) {
+    if (typeof payload !== 'string' || payload.length > 16_384) throw new Error('Invalid certificate payload.');
+    const fields = JSON.parse(payload);
+    if (!fields || fields.v !== REL_CERT_VERSION || fields.iss !== 'clodex.xyz'
+        || typeof fields.relicUid !== 'string' || !/^rpr_[A-Za-z0-9]{1,44}$/.test(fields.relicUid)
+        || typeof fields.edition !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(fields.edition)
+        || !Number.isSafeInteger(fields.serial) || fields.serial < 1
+        || !Number.isSafeInteger(fields.maxSupply) || fields.maxSupply < fields.serial
+        || !['ssr', 'mythic'].includes(fields.rarity)
+        || typeof fields.eggSkin !== 'string' || !/^[a-z0-9_]{1,48}$/.test(fields.eggSkin)
+        || typeof fields.archetype !== 'string' || !/^[a-z0-9_]{1,48}$/.test(fields.archetype)
+        || !fields.genes || typeof fields.genes !== 'object' || Array.isArray(fields.genes)
+        || !Number.isSafeInteger(fields.issuedAt) || fields.issuedAt <= 0) {
+        throw new Error('Invalid certificate payload fields.');
+    }
+    return fields;
+}
+function relCanonicalPayload(payload) {
+    if (typeof payload === 'string') {
+        // Verify and preserve the exact UTF-8 bytes signed by Go. JS and Go can
+        // serialize the same JSON differently (escaping, integer-like gene keys).
+        relParseSignedPayload(payload);
+        return payload;
+    }
+    const source = payload;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) throw new Error('Invalid certificate payload.');
+    const read = (camel, snake = camel) => source[camel] ?? source[snake];
+    let genes = read('genes');
+    if (typeof genes === 'string') {
+        try { genes = JSON.parse(genes); } catch { throw new Error('Invalid certificate genes.'); }
+    }
+    if (!genes || typeof genes !== 'object' || Array.isArray(genes)) throw new Error('Invalid certificate genes.');
+    const ordered = {
+        v: Number(read('v') ?? REL_CERT_VERSION),
+        iss: relCleanText(read('iss') || 'clodex.xyz', 64),
+        relicUid: relCleanText(read('relicUid', 'relic_uid'), 48),
+        edition: relCleanText(read('edition', 'edition_key'), 64),
+        serial: Number(read('serial', 'serial_number') || 0),
+        maxSupply: Number(read('maxSupply', 'max_supply') || 0),
+        rarity: relCleanText(read('rarity'), 24),
+        eggSkin: relCleanText(read('eggSkin', 'egg_skin'), 48),
+        archetype: relCleanText(read('archetype'), 48),
+        genes: relStableValue(genes),
+        issuedAt: Number(read('issuedAt', 'issued_at') || 0),
+    };
+    const canonical = JSON.stringify(ordered);
+    relParseSignedPayload(canonical);
+    return canonical;
+}
+function relDecodeSignature(signature) {
+    const bytes = relBase64UrlToBytes(signature);
+    if (bytes.length !== 64) throw new Error('Invalid ES256 signature length.');
+    return bytes;
+}
+async function relVerifyCert(certPayload, certSignature, { publicJwk = REL_PUBLIC_JWK, cryptoImpl = globalThis.crypto } = {}) {
+    try {
+        relParseSignedPayload(certPayload);
+        const sig = relDecodeSignature(certSignature);
+        const normalizedJwk = relNormalizePublicJwk(publicJwk);
+        if (!normalizedJwk || !cryptoImpl?.subtle) return false;
+        const key = await cryptoImpl.subtle.importKey('jwk', normalizedJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+        return await cryptoImpl.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, sig, new TextEncoder().encode(certPayload));
+    } catch {
+        return false;
+    }
+}
+function relAttachToCard(cardObject, certPayload, certSignature) {
+    const card = cardObject && typeof cardObject === 'object' ? cardObject : {};
+    if (!card.data || typeof card.data !== 'object') card.data = {};
+    if (!card.data.extensions || typeof card.data.extensions !== 'object') card.data.extensions = {};
+    card.data.extensions.clodex_rp_relic = {
+        payload: relCanonicalPayload(certPayload),
+        sig: relCleanText(certSignature, 256),
+    };
+    return card;
+}
+function relReadFromCard(cardObject) {
+    const value = cardObject?.data?.extensions?.clodex_rp_relic;
+    if (!value || typeof value !== 'object') return null;
+    if (!value.payload || !value.sig) return null;
+    return { payload: String(value.payload), sig: String(value.sig) };
+}
+async function relVerifyCard(cardObject, options = {}) {
+    const relic = relReadFromCard(cardObject);
+    if (!relic) return { verified: false, relic: null };
+    return { verified: await relVerifyCert(relic.payload, relic.sig, options), relic };
+}
+function relPublicBadge(certPayload, verified) {
+    if (verified !== true) return 'Unverified custom pet';
+    try {
+        const payload = JSON.parse(relCanonicalPayload(certPayload));
+        return `✦ Verified Relic #${String(payload.serial).padStart(4, '0')} / ${payload.maxSupply}`;
+    } catch {
+        return 'Unverified custom pet';
+    }
+}
+async function relSyncCatalog(api, signal) {
+    if (!api?.rpRelicCatalog) return { editions: [], publicKeyJwk: null, unavailable: true };
+    try {
+        const payload = await api.rpRelicCatalog(signal);
+        const publicKeyJwk = relNormalizePublicJwk(payload?.publicKeyJwk || payload?.public_key_jwk);
+        return { editions: Array.isArray(payload?.editions) ? payload.editions : Array.isArray(payload?.data) ? payload.data : [], publicKeyJwk, unavailable: false };
+    } catch {
+        return { editions: [], publicKeyJwk: null, unavailable: true };
+    }
+}
+async function relSyncInventory(api, signal, { publicJwk = REL_PUBLIC_JWK } = {}) {
+    if (!api?.rpRelicInventory) return { relics: [], unavailable: true };
+    try {
+        const payload = await api.rpRelicInventory(signal);
+        const source = Array.isArray(payload?.relics) ? payload.relics : Array.isArray(payload?.data) ? payload.data : [];
+        const relics = await Promise.all(source.map(async (raw) => {
+            const item = raw && typeof raw === 'object' ? { ...raw } : {};
+            const certPayload = item.certPayload ?? item.cert_payload ?? item.payload;
+            const certSignature = item.certSignature ?? item.cert_signature ?? item.sig;
+            item.payload = typeof certPayload === 'string' ? certPayload : '';
+            item.sig = typeof certSignature === 'string' ? certSignature : '';
+            const verified = await relVerifyCert(item.payload, item.sig, { publicJwk });
+            return { payload: item.payload, sig: item.sig, verified };
+        }));
+        return { relics, unavailable: false };
+    } catch {
+        return { relics: [], unavailable: true };
+    }
+}
+async function relVerifyInventory(relics, options = {}) {
+    const results = await Promise.all(relics.map(async ({ payload, sig }) => {
+        if (!await relVerifyCert(payload, sig, options)) return null;
+        const claims = relParseSignedPayload(payload);
+        return [claims.relicUid, { payload, sig, claims }];
+    }));
+    return new Map(results.filter(Boolean));
+}
+function relMintUrl(editionKey) {
+    const edition = encodeURIComponent(String(editionKey || '').slice(0, 64));
+    return `https://clodex.xyz/console/rp-relics?edition=${edition}`;
+}
+
+// --- src/core/views/cradle-gacha.js ---
+// CLODEx RP Studio v1.4 — Summoning Altar, Egg Skin Collection & Verified Relics view.
+// Flat-bundler rules: only `export function` / `export const`, unique top-level names (vGa*, VGA_*).
+// All strings are rendered strictly as safe DOM text nodes.
+function vGaRarityLabel(t, rarity) {
+    const clean = GA_RARITIES.includes(rarity) ? rarity : 'common';
+    return t(`gacha.rarity.${clean}`);
+}
+function vGaSkinName(t, skinId) {
+    const id = String(skinId || '');
+    if (EGG_SKINS.some(item => item.id === id)) {
+        return t(`gacha.skin.${id}`);
+    }
+    return id || t('gacha.skinDefault');
+}
+function vGaRenderAltar(doc, t, model = {}, actions = {}) {
+    const prefs = model.prefs && typeof model.prefs === 'object' ? model.prefs : {};
+    const unlockedIds = Array.isArray(prefs.unlockedEggSkins) ? prefs.unlockedEggSkins : [];
+    const unlockedSet = new Set(unlockedIds);
+    const eggs = Array.isArray(prefs.pendingEggs) ? prefs.pendingEggs.filter(egg => egg && !egg.hatched) : [];
+    const currency = String(model.currency || '$');
+    const cash = Math.max(0, Math.trunc(Number(model.cash) || 0));
+    const summonBusy = Boolean(model.summonBusy);
+
+    const root = vEl(doc, 'div', {
+        className: 'clodex-rp-gacha',
+        dataset: { rpView: 'gacha' },
+    });
+
+    const summonCard = vEl(doc, 'div', { className: 'clodex-rp-card' },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🥚 ${t('gacha.title')}`),
+        vEl(doc, 'p', { className: 'clodex-rp-muted' }, t('gacha.subtitle')),
+        vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row clodex-rp-mt' },
+            vEl(doc, 'span', { className: 'clodex-rp-muted' },
+                `${t('gacha.pity')}: ${vGaRarityLabel(t, 'epic')} ${Number(prefs.epicPity) || 0}/${GA_PITY_EPIC} · ${vGaRarityLabel(t, 'ssr')} ${Number(prefs.ssrPity) || 0}/${GA_PITY_SSR}`),
+            vEl(doc, 'strong', {}, t('gacha.cashAvail', { cash: `${currency}${cash.toLocaleString()}` })),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                disabled: summonBusy,
+                dataset: { rpAction: 'gacha-summon' },
+                onClick: () => actions.onSummon?.(),
+            }, summonBusy ? '⏳' : `✨ ${t('gacha.summon')} (${currency}50)`),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn',
+                disabled: summonBusy,
+                dataset: { rpAction: 'paid-ritual' },
+                onClick: () => actions.onPaidRitual?.(),
+            }, `💠 ${t('gacha.paidSummon')}`),
+        ),
+    );
+    root.append(summonCard);
+
+    const pendingCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'gacha-pending' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔥 ${t('gacha.pendingTitle')} (${eggs.length})`),
+    );
+    if (eggs.length === 0) {
+        pendingCard.append(vEl(doc, 'div', { className: 'clodex-rp-muted' }, t('gacha.emptyEggs')));
+    } else {
+        const list = vEl(doc, 'div', { className: 'clodex-rp-list' });
+        for (const egg of eggs) {
+            const skinObj = EGG_SKINS.find(item => item.id === egg.eggSkin) || EGG_SKINS[0];
+            const rarity = GA_RARITIES.includes(egg.rarity) ? egg.rarity : 'common';
+            const warmth = Math.max(0, Math.min(100, Math.trunc(Number(egg.warmth) || 0)));
+            const artSrc = egg.artPath ? (model.resolveSrc?.(egg.artPath) || egg.artPath) : '';
+
+            let mediaNode;
+            if (artSrc) {
+                mediaNode = vEl(doc, 'img', {
+                    className: 'clodex-rp-egg-art',
+                    src: artSrc,
+                    alt: egg.name || vGaSkinName(t, egg.eggSkin),
+                    dataset: { rpView: 'gacha-egg-art' },
+                });
+            } else {
+                mediaNode = vEl(doc, 'div', { className: 'clodex-rp-egg-orb' }, '🥚');
+                mediaNode.style.background = skinObj.theme;
+                mediaNode.setAttribute?.('style', `background:${skinObj.theme}`);
+            }
+
+            const warmthFill = vEl(doc, 'div', { className: 'clodex-rp-stat-fill is-mood' });
+            warmthFill.style.width = `${warmth}%`;
+            warmthFill.setAttribute?.('style', `width:${warmth}%`);
+
+            const skinOptionIds = unlockedSet.has(egg.eggSkin)
+                ? [...unlockedIds]
+                : [egg.eggSkin, ...unlockedIds].filter(Boolean);
+
+            const body = vEl(doc, 'div', { className: 'clodex-rp-egg-body' },
+                vEl(doc, 'div', { className: 'clodex-rp-uw-bj-row' },
+                    vEl(doc, 'strong', { textContent: String(egg.name || vGaSkinName(t, egg.eggSkin)) }),
+                    vEl(doc, 'span', { className: `clodex-rp-rarity is-${rarity}` }, vGaRarityLabel(t, rarity)),
+                ),
+                vEl(doc, 'div', { className: 'clodex-rp-chips' },
+                    vEl(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-cradle' }, `🥚 ${vGaSkinName(t, egg.eggSkin)}`),
+                    egg.archetype ? vEl(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, t(`cradle.archetype.${egg.archetype}`)) : null,
+                ),
+                egg.mutationTrait ? vEl(doc, 'div', { className: 'clodex-rp-muted' },
+                    `🧬 ${t('gacha.traitLabel')}: `,
+                    vEl(doc, 'span', { textContent: String(egg.mutationTrait) })) : null,
+                egg.personality ? vEl(doc, 'div', { className: 'clodex-rp-muted' },
+                    `💫 ${t('gacha.personalityLabel')}: `,
+                    vEl(doc, 'span', { textContent: String(egg.personality) })) : null,
+                egg.prophecy ? vEl(doc, 'div', { className: 'clodex-rp-muted' },
+                    `🔮 ${t('gacha.prophecyLabel')}: `,
+                    vEl(doc, 'span', { textContent: String(egg.prophecy) })) : null,
+                vEl(doc, 'div', { className: 'clodex-rp-stat-head clodex-rp-mt' },
+                    vEl(doc, 'span', {}, t('gacha.warmthLabel', { warmth })),
+                    vEl(doc, 'strong', {}, `${warmth}%`),
+                ),
+                vEl(doc, 'div', { className: 'clodex-rp-stat-bar' }, warmthFill),
+                unlockedIds.length > 0 ? vEl(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    vEl(doc, 'span', {}, t('gacha.equipSkinLabel')),
+                    vEl(doc, 'select', {
+                        className: 'clodex-rp-input',
+                        dataset: { rpAction: 'gacha-egg-skin', eggId: String(egg.id) },
+                        onChange: e => actions.onEquipEggSkin?.(egg.id, String(e?.target?.value ?? '')),
+                    }, ...skinOptionIds.map(skinId => vEl(doc, 'option', {
+                        value: skinId,
+                        selected: skinId === egg.eggSkin,
+                        disabled: !unlockedSet.has(skinId),
+                    }, vGaSkinName(t, skinId)))),
+                ) : null,
+                vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    vEl(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn-mini',
+                        dataset: { rpAction: 'gacha-warm', eggId: String(egg.id) },
+                        onClick: () => actions.onWarm?.(egg.id),
+                    }, `🔥 ${t('gacha.warmBtn')}`),
+                    vEl(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn-mini active',
+                        disabled: warmth < 100,
+                        dataset: { rpAction: 'gacha-hatch', eggId: String(egg.id) },
+                        onClick: () => actions.onHatch?.(egg.id),
+                    }, `🐣 ${t('gacha.hatch')}`),
+                ),
+            );
+
+            list.append(vEl(doc, 'article', {
+                className: `clodex-rp-egg-card${egg.relicUid ? ' clodex-rp-relic-certified' : ''}`,
+                dataset: { rpView: 'gacha-egg', eggId: String(egg.id) },
+            }, mediaNode, body));
+        }
+        pendingCard.append(list);
+    }
+    root.append(pendingCard);
+
+    const galleryChips = EGG_SKINS.map(skin => {
+        const isUnlocked = unlockedSet.has(skin.id);
+        const chip = vEl(doc, 'span', {
+            className: `clodex-rp-chip clodex-rp-skin-chip${isUnlocked ? '' : ' is-locked'}`,
+            dataset: { skinId: skin.id, unlocked: isUnlocked ? 'true' : 'false' },
+        }, `${isUnlocked ? '✦' : '🔒'} ${vGaSkinName(t, skin.id)} · ${vGaRarityLabel(t, skin.rarity)}`);
+        chip.style.background = skin.theme;
+        chip.setAttribute?.('style', `background:${skin.theme}`);
+        return chip;
+    });
+
+    root.append(vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'gacha-skins' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' },
+            `🎨 ${t('gacha.skinsGalleryTitle', { unlocked: unlockedIds.length, total: EGG_SKINS.length })}`),
+        vEl(doc, 'div', { className: 'clodex-rp-chips' }, ...galleryChips),
+    ));
+
+    return root;
+}
+function vGaRenderRelics(doc, t, model = {}, actions = {}) {
+    const catalog = Array.isArray(model.catalog) ? model.catalog : [];
+    const relics = Array.isArray(model.relics) ? model.relics : [];
+    const verifiedRelics = model.verifiedRelics instanceof Map ? model.verifiedRelics : new Map();
+    const hatchedUids = Array.isArray(model.hatchedRelicUids) ? model.hatchedRelicUids : [];
+    const pendingEggs = Array.isArray(model.pendingEggs) ? model.pendingEggs : [];
+    const locale = model.locale === 'ru' ? 'ru' : 'en';
+
+    const root = vEl(doc, 'div', {
+        className: 'clodex-rp-relics',
+        dataset: { rpView: 'relics' },
+    });
+
+    const syncCard = vEl(doc, 'div', { className: 'clodex-rp-card' },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `💎 ${t('relic.title')}`),
+        vEl(doc, 'div', { className: 'clodex-rp-muted' }, String(model.syncStatus || t('relic.readOnly'))),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                disabled: Boolean(model.checking),
+                dataset: { rpAction: 'relic-sync' },
+                onClick: () => actions.onSync?.(),
+            }, `🔄 ${t('relic.sync')}`),
+        ),
+        vEl(doc, 'label', { className: 'clodex-rp-subbox clodex-rp-mt clodex-rp-field' },
+            vEl(doc, 'span', {}, `🛡️ ${t('relic.verifyPng')}`),
+            vEl(doc, 'input', {
+                type: 'file',
+                accept: 'image/png,.png',
+                dataset: { rpAction: 'relic-verify-png' },
+                onChange: e => actions.onVerifyPng?.(e?.target?.files?.[0]),
+            }),
+        ),
+        model.cardStatus ? vEl(doc, 'div', {
+            role: 'status',
+            className: `clodex-rp-badge-line clodex-rp-mt${model.cardVerified ? ' clodex-rp-relic-certified' : ''}`,
+            textContent: String(model.cardStatus),
+        }) : null,
+    );
+    root.append(syncCard);
+
+    const editionsCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'relic-editions' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `✦ ${t('relic.editionsTitle')}`),
+    );
+    if (catalog.length === 0) {
+        editionsCard.append(vEl(doc, 'div', { className: 'clodex-rp-muted' }, t('relic.editionsEmpty')));
+    } else {
+        const list = vEl(doc, 'div', { className: 'clodex-rp-list' });
+        for (const edition of catalog) {
+            const editionKey = String(edition?.editionKey || edition?.edition_key || '');
+            const title = (locale === 'ru' ? edition?.titleRu : edition?.titleEn)
+                || edition?.title || editionKey || 'Relic';
+            const minted = Number(edition?.mintedCount ?? edition?.minted_count ?? 0);
+            const maxSupply = Number(edition?.maxSupply ?? edition?.max_supply ?? 0);
+            const mintUrl = relMintUrl(editionKey);
+
+            const mintLink = vEl(doc, 'a', {
+                className: 'clodex-rp-btn-mini clodex-rp-link-btn',
+                href: mintUrl,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                dataset: { rpAction: 'relic-mint-link', edition: editionKey },
+            }, `↗ ${t('relic.mint')}`);
+            mintLink.setAttribute?.('href', mintUrl);
+            mintLink.setAttribute?.('target', '_blank');
+            mintLink.setAttribute?.('rel', 'noopener noreferrer');
+
+            list.append(vEl(doc, 'div', {
+                className: 'clodex-rp-list-item clodex-rp-collateral-row',
+                dataset: { rpView: 'relic-edition', edition: editionKey },
+            },
+            vEl(doc, 'span', { textContent: `${title} · ${minted}/${maxSupply}` }),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+                mintLink,
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini',
+                    dataset: { rpAction: 'relic-copy-link', edition: editionKey },
+                    onClick: () => actions.onCopyLink?.(mintUrl),
+                }, `📋 ${t('relic.copyLink')}`),
+            )));
+        }
+        editionsCard.append(list);
+    }
+    root.append(editionsCard);
+
+    const invCard = vEl(doc, 'div', { className: 'clodex-rp-card', dataset: { rpView: 'relic-inventory' } },
+        vEl(doc, 'h4', { className: 'clodex-rp-card-title' }, `📜 ${t('relic.inventoryTitle')}`),
+    );
+    if (relics.length === 0) {
+        invCard.append(vEl(doc, 'div', { className: 'clodex-rp-muted' }, t('relic.inventoryEmpty')));
+    } else {
+        const list = vEl(doc, 'div', { className: 'clodex-rp-list' });
+        for (const relic of relics) {
+            const entry = [...verifiedRelics.values()].find(item => item.payload === relic.payload && item.sig === relic.sig);
+            if (!entry) {
+                list.append(vEl(doc, 'div', { className: 'clodex-rp-list-item' }, t('relic.unverified')));
+                continue;
+            }
+            const uid = entry.claims.relicUid;
+            const added = hatchedUids.includes(uid) || pendingEggs.some(egg => egg && egg.relicUid === uid);
+            list.append(vEl(doc, 'div', {
+                className: 'clodex-rp-list-item clodex-rp-relic-certified clodex-rp-collateral-row',
+                dataset: { rpView: 'relic-item', relicUid: uid },
+            },
+            vEl(doc, 'div', { className: 'clodex-rp-collateral-meta' },
+                vEl(doc, 'strong', { textContent: relPublicBadge(relic.payload, true) }),
+                vEl(doc, 'span', { className: 'clodex-rp-muted' },
+                    `🥚 ${vGaSkinName(t, entry.claims.eggSkin)} · ${vGaRarityLabel(t, entry.claims.rarity)}`),
+            ),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn-mini',
+                disabled: added || Boolean(model.summonBusy),
+                dataset: { rpAction: 'relic-queue-egg', relicUid: uid },
+                onClick: () => actions.onQueueEgg?.(entry.claims),
+            }, t(added ? 'relic.added' : 'relic.addEgg'))));
+        }
+        invCard.append(list);
+    }
+    root.append(invCard);
+
+    return root;
+}
+
 // --- src/core/hud.js ---
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -5934,6 +8157,7 @@ function el(doc, tag, props = {}, ...children) {
     for (const [k, v] of Object.entries(props)) {
         if (v === undefined || v === null) continue;
         if (k === 'className') node.className = v;
+        else if (k === 'style' && typeof v === 'string') node.setAttribute('style', v);
         else if (k === 'dataset') Object.assign(node.dataset, v);
         else if (k.startsWith('on') && typeof v === 'function') {
             node.addEventListener(k.slice(2).toLowerCase(), v);
@@ -5993,6 +8217,7 @@ function createRpStudioController(bridge) {
     let sessionAutoSpendUsd = 0;
 
     let forgeConcept = '';
+    let forgeRelic = null;
     let forgeLang = bridge.getLocale() === 'ru' ? 'ru' : 'en';
     let forgeLoreCount = 5;
     let forgeStatusText = '';
@@ -6030,6 +8255,27 @@ function createRpStudioController(bridge) {
     let packPreview = null; // { pack, errors }
     let packStatusText = '';
     let currentCharDescription = '';
+    let currentUserName = '';
+    let rpPrefs = gaNormalizePrefs({});
+    let trackerSub = 'physiology'; // physiology | underworld
+    let cradleSub = 'companions'; // companions | gacha | relics
+    let underworldBetDraft = 25;
+    let pawnValueDraft = 500;
+    let underworldTargetDraft = '';
+    let collateralDraft = '';
+    let wagerStakeDraft = 'truth';
+    let lastCasinoOutcome = null;
+    let dossierBusy = false;
+    let summonBusy = false;
+    let relicCatalog = [];
+    let relicSyncStatus = '';
+    let relicChecking = false;
+    let relicCardStatus = '';
+    let relicCardVerified = false;
+    let verifiedRelics = new Map();
+    // A host may emit both MESSAGE_RECEIVED and its own assistant-turn event.
+    // Keep turn consequences idempotent for the lifetime of this controller.
+    const committedTurnKeys = new Set();
 
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
@@ -6080,7 +8326,11 @@ function createRpStudioController(bridge) {
                 currentCharName = rp.charName;
                 changed = true;
             }
-            if (changed && drawerOpen && (activeTab === 'scene' || activeTab === 'phone')) renderDrawer();
+            if (rp?.userName && rp.userName !== currentUserName) {
+                currentUserName = rp.userName;
+                changed = true;
+            }
+            if (changed && drawerOpen && (activeTab === 'scene' || activeTab === 'phone' || (activeTab === 'tracker' && trackerSub === 'underworld'))) renderDrawer();
         }).catch(() => {});
     }
 
@@ -6342,6 +8592,22 @@ function createRpStudioController(bridge) {
             }, parts.join(' · ')));
         }
 
+        const uwHud = state.underworld;
+        if (uwHud && (Number(uwHud.heat) >= 1 || Number(uwHud.turnsInDebt) >= 1)) {
+            const uwParts = [];
+            if (Number(uwHud.heat) >= 1) {
+                const heatVal = Math.round(Number(uwHud.heat) * 100) / 100;
+                uwParts.push(`🚔 ${heatVal}★`);
+            }
+            if (Number(uwHud.turnsInDebt) >= 1) {
+                uwParts.push(`💸 ${uwHud.currency || '$'}${Math.trunc(Number(uwHud.debt) || 0)}`);
+            }
+            secondary.push(el(doc, 'span', {
+                className: 'clodex-rp-chip clodex-rp-chip-uw',
+                dataset: { rpChip: 'underworld' },
+            }, uwParts.join(' · ')));
+        }
+
         if (state.world.enableAdultBiology && entity?.bio?.mode !== 'none') {
             const b = entity.bio;
             const vis = getVisibleBiologySummary(entity, state.world.disclosureMode);
@@ -6481,6 +8747,47 @@ function createRpStudioController(bridge) {
         return String(fallback || '');
     }
 
+    // Local U2/U3 consequences run after a reply is committed, regardless of
+    // whether an API key/tracker model is configured.  The previous pending
+    // event belongs to the reply just completed; consume it before scheduling
+    // the next one so a newly-created event survives into the next prompt.
+    async function applyLocalTurnConsequences(checkpointKey = '') {
+        const key = String(checkpointKey || '');
+        if (key && committedTurnKeys.has(key)) return false;
+        if (key) {
+            const activeKey = await getLatestTurnKeySafe(key);
+            if (activeKey && activeKey !== key) return false;
+        }
+        const state = bridge.getChatState();
+        if (!state || !state.underworld) return false;
+        if (key) committedTurnKeys.add(key);
+
+        const hadPending = Boolean(state.underworld.pendingWorldEvent);
+        if (hadPending) uwConsumeWorldEvent(state.underworld);
+        const skin = uwResolveSkin(state.underworld.skin, {
+            text: `${state.world?.location || ''} ${state.world?.weather || ''}`,
+            description: currentCharDescription,
+        });
+        const localPhoneEvents = uwOnTurnCommitted(state.underworld, {
+            skin,
+            t: (token, params) => bridge.t?.(token, params) || token,
+        });
+        repCoolHeat(state.underworld, { calmTurn: true, advanceTurn: false });
+        const repEvent = repRollWorldEvent(state.underworld, { skin });
+        if (repEvent?.event && !state.underworld.pendingWorldEvent) {
+            uwSetPendingWorldEvent(state.underworld, repEvent.event, { kind: repEvent.kind });
+        }
+        if (localPhoneEvents.length && typeof bridge.saveStore === 'function') {
+            await loadLivingWorld();
+            if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+            phoneStore = asStore(phoneIngestEvents(phoneStore, localPhoneEvents, key, { source: 'underworld' }), phoneStore);
+            await savePhoneStore();
+        }
+        if (key) saveCheckpoint(state, key);
+        await bridge.saveChatState(state);
+        return true;
+    }
+
     // Loads clodex_rp_phone / clodex_rp_wiki + active branch keys. Returns true when visible data changed.
     async function loadLivingWorld() {
         if (typeof bridge.loadStore !== 'function') return false;
@@ -6504,6 +8811,105 @@ function createRpStudioController(bridge) {
             livingPromise = null;
         });
         return livingPromise;
+    }
+
+    async function loadRpEntitlements() {
+        if (typeof bridge.loadRpPrefs !== 'function') return rpPrefs;
+        try { rpPrefs = gaNormalizePrefs(await bridge.loadRpPrefs()); } catch { rpPrefs = gaNormalizePrefs({}); }
+        verifiedRelics = await relVerifyInventory(rpPrefs.relics);
+        return rpPrefs;
+    }
+
+    async function runPaidGachaRitual() {
+        if (summonBusy) return null;
+        const settings = bridge.getSettings();
+        const key = bridge.getEffectiveKey();
+        if (!key) { activeTab = 'account'; toggleDrawer(true); return null; }
+        const textModel = settings.codexModel || settings.trackerModel;
+        const imageModel = settings.imageModel;
+        if (!textModel || !imageModel) { errorBanner = t('gacha.needModels'); renderAll(); return null; }
+        summonBusy = true;
+        errorBanner = '';
+        renderAll();
+        try {
+            if (settings.confirmPaid !== false) {
+                const textPrice = priceView(catalog.find(model => model.id === textModel)?.price);
+                const imagePrice = priceView(catalog.find(model => model.id === imageModel)?.price);
+                const textCost = textPrice?.unit === 'request' ? textPrice.input
+                    : textPrice?.unit === 'per_1m_total_tokens' ? textPrice.input * 600 / 1e6
+                    : textPrice?.unit === 'per_1m_tokens' && Number.isFinite(textPrice.output)
+                        ? (textPrice.input + textPrice.output) * 300 / 1e6 : null;
+                const imageCost = imagePrice?.unit === 'request' ? imagePrice.input : null;
+                const cost = Number.isFinite(textCost) && Number.isFinite(imageCost)
+                    ? formatUsd(textCost + imageCost) : t('gacha.estimateUnavailable');
+                const confirmed = await bridge.confirm(t('gacha.confirmPaid', { model: `${textModel} + ${imageModel}`, cost }));
+                if (!gaCanStartPaid({ confirmed })) return null;
+            }
+            const local = gaCreateSummon(rpPrefs, { cost: 0 });
+            if (!local.ok) { errorBanner = t('relic.cradleFull'); return null; }
+            const skin = EGG_SKINS.find(item => item.id === local.egg.eggSkin) || EGG_SKINS[0];
+            const rp = await bridge.getRpContext?.() || {};
+            const raw = await api.chat({ model: textModel, messages: [{ role: 'user', content: gaBuildPaidPrompt({ rarity: local.egg.rarity, skinId: local.egg.eggSkin, locale: bridge.getLocale(), charName: rp.charName || '{{char}}' }) }], maxTokens: 300, temperature: 0.5, jsonMode: true });
+            let lore = {};
+            try { lore = JSON.parse(raw); } catch { lore = { name: `${skin.name} companion`, mutationTrait: local.egg.mutationTrait, personality: '', prophecy: '' }; }
+            const art = await api.image({ model: imageModel, prompt: `${skin.descriptor} Render a collectible companion egg, ${local.egg.rarity} rarity, no text.` });
+            const blob = art.b64_json ? base64ToBlob(art.b64_json, 'image/png') : await api.downloadImage(art.url);
+            const base64 = art.b64_json || await blobToBase64(blob);
+            const egg = {
+                ...local.egg,
+                name: lore?.name || `${skin.name} companion`,
+                mutationTrait: lore?.mutationTrait || local.egg.mutationTrait,
+                personality: lore?.personality,
+                prophecy: lore?.prophecy,
+                artPath: await saveCompanionAsset(local.egg.id, 'image', blob, base64),
+            };
+            // gaCreateSummon already placed the egg in local.prefs. Persist that
+            // state rather than appending to the stale global snapshot a second
+            // time (paid rituals must be idempotent at the UI state boundary).
+            local.prefs.pendingEggs = local.prefs.pendingEggs.map(item => item.id === egg.id ? egg : item);
+            await saveRpEntitlements(local.prefs);
+            bridge.notify?.(t('gacha.ritualDone'));
+            return egg;
+        } catch (err) { errorBanner = redact(err?.message ?? err, key); return null; }
+        finally { summonBusy = false; renderAll(); }
+    }
+
+    async function hatchPendingEgg(eggId, state) {
+        const result = gaHatchEgg(rpPrefs, eggId);
+        if (!result.ok) { errorBanner = t(`gacha.error.${result.reason}`); renderAll(); return null; }
+        const egg = result.egg;
+        if ((state.companions || []).length >= 6) { errorBanner = t('cradle.maxReached'); return null; }
+        const claims = verifiedRelics.get(egg.relicUid)?.claims;
+        if (egg.relicUid && !claims) { errorBanner = t('relic.unverified'); renderAll(); return null; }
+        const base = createCompanionFromArchetype(claims?.archetype ?? egg.archetype, { locale: bridge.getLocale(), customName: egg.name });
+        const companion = normalizeCompanion({
+            ...base,
+            rarity: claims?.rarity ?? egg.rarity, eggSkin: claims?.eggSkin ?? egg.eggSkin,
+            mutationTrait: claims ? claims.genes.trait : egg.mutationTrait,
+            portraitPath: egg.artPath || base.portraitPath, relicUid: egg.relicUid,
+        });
+        state.companions.push(companion);
+        await bridge.saveChatState(state);
+        await saveRpEntitlements(result.prefs);
+        renderAll();
+        return companion;
+    }
+
+    async function saveRpEntitlements(next) {
+        rpPrefs = gaNormalizePrefs(next || rpPrefs);
+        await bridge.saveRpPrefs?.(rpPrefs);
+        return rpPrefs;
+    }
+
+    async function syncRpRelics() {
+        const [catalogResult, inventoryResult] = await Promise.all([
+            relSyncCatalog(api), relSyncInventory(api),
+        ]);
+        if (!inventoryResult.unavailable) {
+            await saveRpEntitlements({ ...rpPrefs, relics: inventoryResult.relics });
+            verifiedRelics = await relVerifyInventory(rpPrefs.relics);
+        }
+        return { editions: catalogResult.editions, catalogueUnavailable: catalogResult.unavailable, inventoryUnavailable: inventoryResult.unavailable };
     }
 
     function scheduleLivingRefresh() {
@@ -6931,6 +9337,9 @@ function createRpStudioController(bridge) {
             });
             // 3. one background request per turn, budget TRACKER_MAX_TOKENS (spec 10.4)
             const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: TRACKER_MAX_TOKENS, jsonMode: true });
+            // Do not apply a late response to a swiped/deleted branch.
+            const currentTurnKey = await getLatestTurnKeySafe(turnKey);
+            if (turnKey && currentTurnKey && turnKey !== currentTurnKey) return false;
             let delta = {};
             try {
                 delta = parseTrackerExtraction(raw) || {};
@@ -6942,19 +9351,18 @@ function createRpStudioController(bridge) {
             const phoneEvents = includePhone && Array.isArray(delta.phoneEvents) ? delta.phoneEvents.slice(0, 2) : [];
             if (!includePhone && 'phoneEvents' in delta) delete delta.phoneEvents;
             // 4. compact state + checkpoint for this exact variant
-            applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey });
+            applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey, saveCheckpoint: false });
             // 6. Anti-Slop rule is recomputed locally after every reply (0 requests)
             try {
                 await recomputeSlop({ state, save: false });
             } catch {
                 // radar failures must never block the tracker
             }
-            await bridge.saveChatState(state);
             // 5. phone journal (separate store, append-only, bound to turnKey)
             if (phoneEvents.length && typeof bridge.saveStore === 'function') {
                 await loadLivingWorld();
                 if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
-                phoneStore = asStore(phoneIngestEvents(phoneStore, phoneEvents, turnKey || checkpointKey), phoneStore);
+                phoneStore = asStore(phoneIngestEvents(phoneStore, phoneEvents, turnKey || checkpointKey, { source: 'tracker' }), phoneStore);
                 await savePhoneStore();
             }
             // 7. periodic wiki refresh in the background, bound to targetTurnKey
@@ -7502,6 +9910,7 @@ function createRpStudioController(bridge) {
         const rp = await bridge.getRpContext?.().catch(() => ({}));
         if (rp?.charName) currentCharName = rp.charName;
         const locale = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+        forgeRelic = verifiedRelics.get(comp.relicUid) || null;
         forgeConcept = buildCompanionForgeConcept(comp, {
             charName: rp?.charName || '',
             userName: rp?.userName || '',
@@ -7539,6 +9948,7 @@ function createRpStudioController(bridge) {
         }
 
         busyState = 'forge';
+        const relic = forgeRelic;
         forgeStatusText = t('forge.generatingCard');
         errorBanner = '';
         renderAll();
@@ -7550,6 +9960,7 @@ function createRpStudioController(bridge) {
             });
             const cardJsonRaw = await api.chat({ model: textModel, messages: msgs, temperature: 0.7, maxTokens: 2800, jsonMode: true });
             const { card, avatarPrompt } = parseForgedCardV2(cardJsonRaw);
+            if (relic) relAttachToCard(card, relic.payload, relic.sig);
 
             forgeStatusText = t('forge.generatingAvatar');
             renderAll();
@@ -7625,6 +10036,23 @@ function createRpStudioController(bridge) {
 
     function renderTrackerTab(state) {
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+        const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-2 clodex-rp-subtabs', dataset: { rpView: 'tracker-subtabs' } },
+            ...[['physiology', `🩺 ${t('tracker.physiology')}`], ['underworld', `🎲 ${t('tracker.underworld')}`]].map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${trackerSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'tracker-sub', sub: id },
+                onClick: () => {
+                    trackerSub = id;
+                    if (id === 'underworld') syncCachedCharName();
+                    renderDrawer();
+                },
+            }, label)),
+        );
+        container.append(subNav);
+        if (trackerSub === 'underworld') {
+            container.append(renderUnderworldTab(state));
+            return container;
+        }
 
         // Action row
         container.append(el(doc, 'div', { className: 'clodex-rp-btn-row' },
@@ -8164,15 +10592,50 @@ function createRpStudioController(bridge) {
                                 ),
                             ),
                             el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
-                                ...b.nest.eggs.map((egg, i) => el(doc, 'div', { className: 'clodex-rp-list-item' },
-                                    t('bio.nestEggItem', {
-                                        idx: i + 1,
-                                        shell: egg.shell,
-                                        days: Math.floor(egg.daysIncubated),
-                                        target: egg.targetDays,
-                                        cracked: egg.cracked ? t('bio.crackedBadge') : '',
-                                    }),
-                                )),
+                                ...b.nest.eggs.map((egg, i) => {
+                                    const unlockedSkins = Array.isArray(rpPrefs.unlockedEggSkins) ? rpPrefs.unlockedEggSkins : [];
+                                    const skinSelectOptions = [
+                                        el(doc, 'option', { value: '', selected: !egg.eggSkin }, t('gacha.skinDefault')),
+                                        ...(egg.eggSkin && !unlockedSkins.includes(egg.eggSkin)
+                                            ? [el(doc, 'option', { value: egg.eggSkin, selected: true, disabled: true }, vGaSkinName(t, egg.eggSkin))]
+                                            : []),
+                                        ...unlockedSkins.map(skinId => el(doc, 'option', {
+                                            value: skinId,
+                                            selected: egg.eggSkin === skinId,
+                                        }, vGaSkinName(t, skinId))),
+                                    ];
+                                    return el(doc, 'div', {
+                                        className: 'clodex-rp-list-item clodex-rp-nest-item',
+                                        dataset: { rpView: 'nest-egg', eggIndex: String(i) },
+                                    },
+                                    el(doc, 'span', {},
+                                        t('bio.nestEggItem', {
+                                            idx: i + 1,
+                                            shell: egg.shell,
+                                            days: Math.floor(egg.daysIncubated),
+                                            target: egg.targetDays,
+                                            cracked: egg.cracked ? t('bio.crackedBadge') : '',
+                                        }),
+                                        egg.eggSkin ? ` · 🥚 ${vGaSkinName(t, egg.eggSkin)}` : ''),
+                                    unlockedSkins.length > 0 ? el(doc, 'select', {
+                                        className: 'clodex-rp-input clodex-rp-nest-skin-select',
+                                        'aria-label': t('gacha.equipSkinLabel'),
+                                        dataset: { rpAction: 'nest-egg-skin', eggIndex: String(i) },
+                                        onChange: async e => {
+                                            const chosen = String(e.target.value || '');
+                                            if (!chosen) return;
+                                            const eq = equipNestEggSkin(b, i, chosen, unlockedSkins);
+                                            if (!eq.ok) {
+                                                errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                                                renderAll();
+                                                return;
+                                            }
+                                            errorBanner = '';
+                                            await bridge.saveChatState(state);
+                                            renderAll();
+                                        },
+                                    }, ...skinSelectOptions) : null);
+                                }),
                             ),
                             el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
                                 el(doc, 'button', {
@@ -8468,8 +10931,29 @@ function createRpStudioController(bridge) {
     }
 
     function renderCradleTab(state) {
-        if (!Array.isArray(state.companions)) state.companions = [];
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+        const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-3 clodex-rp-subtabs', dataset: { rpView: 'cradle-subtabs' } },
+            ...[['companions', `🐾 ${t('cradle.companions')}`], ['gacha', `🥚 ${t('cradle.gacha')}`], ['relics', `💎 ${t('cradle.relics')}`]].map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${cradleSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'cradle-sub', sub: id },
+                onClick: () => {
+                    cradleSub = id;
+                    if (id === 'relics' && !relicCatalog.length) loadRelicCatalog();
+                    else renderDrawer();
+                },
+            }, label)),
+        );
+        container.append(subNav);
+        if (cradleSub === 'gacha') {
+            container.append(renderGachaSub(state));
+            return container;
+        }
+        if (cradleSub === 'relics') {
+            container.append(renderRelicsSub());
+            return container;
+        }
+        if (!Array.isArray(state.companions)) state.companions = [];
 
         if (state.world.pendingMemoryHint) {
             container.append(el(doc, 'div', { className: 'clodex-rp-banner' },
@@ -8621,7 +11105,20 @@ function createRpStudioController(bridge) {
         const rawCompAudio = companionAudioMap.get(activeComp.id) || '';
         const compAudioSrc = bridge.resolveMediaSrc?.(rawCompAudio) || rawCompAudio;
 
-        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+        const verifiedCompanion = activeComp.relicUid ? verifiedRelics.get(activeComp.relicUid) : null;
+        const compRarity = GA_RARITIES.includes(activeComp.rarity) ? activeComp.rarity : 'common';
+        const unlockedCompSkins = Array.isArray(rpPrefs.unlockedEggSkins) ? rpPrefs.unlockedEggSkins : [];
+        const compSkinOptions = [
+            el(doc, 'option', { value: '', selected: !activeComp.eggSkin }, t('gacha.skinDefault')),
+            ...(activeComp.eggSkin && !unlockedCompSkins.includes(activeComp.eggSkin)
+                ? [el(doc, 'option', { value: activeComp.eggSkin, selected: true, disabled: true }, vGaSkinName(t, activeComp.eggSkin))]
+                : []),
+            ...unlockedCompSkins.map(skinId => el(doc, 'option', {
+                value: skinId,
+                selected: activeComp.eggSkin === skinId,
+            }, vGaSkinName(t, skinId))),
+        ];
+        container.append(el(doc, 'div', { className: `clodex-rp-card${verifiedCompanion ? ' clodex-rp-relic-certified' : ''}` },
             el(doc, 'div', { className: 'clodex-rp-comp-hero' },
                 mediaNode,
                 el(doc, 'div', { style: 'flex:1;min-width:0' },
@@ -8642,6 +11139,13 @@ function createRpStudioController(bridge) {
                             }, '✕'),
                         ),
                     ),
+                    el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                        el(doc, 'span', { className: `clodex-rp-rarity is-${compRarity}` }, vGaRarityLabel(t, compRarity)),
+                        activeComp.eggSkin ? el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-cradle' }, `🥚 ${vGaSkinName(t, activeComp.eggSkin)}`) : null,
+                    ),
+                    activeComp.relicUid ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt', dataset: { rpView: 'companion-relic-badge' } },
+                        verifiedCompanion ? relPublicBadge(verifiedCompanion.payload, true) : t('relic.unverified'),
+                    ) : null,
                     el(doc, 'div', { className: 'clodex-rp-stage-steps' },
                         ...COMPANION_STAGES.map(st => el(doc, 'span', {
                             className: `clodex-rp-stage-pill ${safeStage === st ? 'active' : ''}`,
@@ -8657,6 +11161,28 @@ function createRpStudioController(bridge) {
                             : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
                                 ...traits.map(tr => el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, String(tr)))),
                     ),
+                    unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                        el(doc, 'span', {}, t('gacha.equipSkinLabel')),
+                        el(doc, 'select', {
+                            className: 'clodex-rp-input',
+                            dataset: { rpAction: 'companion-egg-skin', companionId: String(activeComp.id) },
+                            onChange: async e => {
+                                const chosen = String(e.target.value || '');
+                                if (!chosen) return;
+                                const eq = equipCompanionEggSkin(activeComp, chosen, unlockedCompSkins);
+                                if (!eq.ok) {
+                                    errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                                    renderAll();
+                                    return;
+                                }
+                                const idx = state.companions.findIndex(c => c.id === activeComp.id);
+                                if (idx >= 0) state.companions[idx] = eq.companion;
+                                errorBanner = '';
+                                await bridge.saveChatState(state);
+                                renderAll();
+                            },
+                        }, ...compSkinOptions),
+                    ) : null,
                 ),
             ),
             el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
@@ -9144,6 +11670,7 @@ function createRpStudioController(bridge) {
                     type: 'button',
                     className: 'clodex-rp-chip-btn',
                     onClick: () => {
+                        forgeRelic = null;
                         forgeConcept = locale === 'ru' ? chip.ru : chip.en;
                         forgeLang = locale;
                         renderDrawer();
@@ -9590,6 +12117,462 @@ function createRpStudioController(bridge) {
         return container;
     }
 
+    function resolveUnderworldSkin(state) {
+        return uwResolveSkin(state?.underworld?.skin, {
+            text: `${state?.world?.location || ''} ${state?.world?.weather || ''}`,
+            description: currentCharDescription,
+        });
+    }
+
+    async function ensureIdentityCached() {
+        if (currentCharName && currentUserName) return;
+        const rp = await bridge.getRpContext?.().catch(() => null);
+        if (rp?.charName) currentCharName = rp.charName;
+        if (rp?.userName) currentUserName = rp.userName;
+        if (rp?.charDescription !== undefined && !currentCharDescription) {
+            currentCharDescription = String(rp.charDescription || '');
+        }
+    }
+
+    async function saveUnderworld(state) {
+        await bridge.saveChatState(state);
+        renderAll();
+    }
+
+    async function runNpcDossierService(state) {
+        if (dossierBusy) return false;
+        const uw = state.underworld;
+        const resolvedSkin = resolveUnderworldSkin(state);
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return false;
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.codexModel || settings.trackerModel;
+        if (!model) {
+            errorBanner = t('wiki.needModel');
+            renderAll();
+            return false;
+        }
+        const rp = await bridge.getRpContext?.().catch(() => ({})) || {};
+        if (rp?.charName) currentCharName = rp.charName;
+        if (rp?.userName) currentUserName = rp.userName;
+        const target = underworldTargetDraft.trim() || rp.charName || currentCharName || '{{char}}';
+        const charge = repUseService(uw, 'npcDossier', { target, skin: resolvedSkin });
+        if (!charge.ok) {
+            errorBanner = t(`uw.error.${charge.reason || 'insufficient_cash'}`);
+            renderAll();
+            return false;
+        }
+        const refund = () => {
+            uw.cash = Math.min(UW_MAX_CASH, Math.max(0, Math.trunc(Number(uw.cash) || 0) + charge.cost));
+        };
+        if (settings.confirmPaid !== false) {
+            const ok = await bridge.confirm(t('uw.dossierConfirm', {
+                target,
+                model,
+                cost: `${uw.currency || '$'}${charge.cost}`,
+            }));
+            if (!ok) {
+                refund();
+                renderAll();
+                return false;
+            }
+        }
+        dossierBusy = true;
+        errorBanner = '';
+        renderAll();
+        try {
+            const recentText = (rp.recentMessages ?? []).map(m => String(m?.content ?? '')).join(' ');
+            const chatLocale = recentText
+                ? (/[а-яё]/i.test(recentText) ? 'ru' : 'en')
+                : (bridge.getLocale() === 'ru' ? 'ru' : 'en');
+            const langLabel = chatLocale === 'ru' ? 'Russian' : 'English';
+            const promptMessages = [
+                {
+                    role: 'system',
+                    content: `You are an underground information broker in a ${resolvedSkin} roleplay setting. Write a compact 2-3 sentence leaked dossier or guarded secret about "${target}" in ${langLabel}. Plain text only, no HTML, no markdown headers.`,
+                },
+                {
+                    role: 'user',
+                    content: [
+                        `Target: ${target}`,
+                        rp.charDescription ? `Character context: ${String(rp.charDescription).slice(0, 500)}` : '',
+                        rp.scenario ? `Scenario: ${String(rp.scenario).slice(0, 300)}` : '',
+                        recentText ? `Recent scene: ${recentText.slice(-800)}` : '',
+                    ].filter(Boolean).join('\n'),
+                },
+            ];
+            const raw = await api.chat({ model, messages: promptMessages, temperature: 0.55, maxTokens: 240 });
+            const dossierText = String(raw ?? '').trim();
+            if (!dossierText) throw new Error('Empty dossier response.');
+            await loadLivingWorld();
+            if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+            const turnKey = await getLatestTurnKeySafe();
+            phoneStore = asStore(phoneIngestEvents(phoneStore, [{
+                kind: 'dm',
+                author: t(`uw.dossierAuthor.${resolvedSkin}`),
+                text: dossierText,
+            }], turnKey, { source: 'underworld' }), phoneStore);
+            await savePhoneStore();
+            underworldTargetDraft = '';
+            await bridge.saveChatState(state);
+            bridge.notify?.(t('uw.dossierDone', { target }));
+            return true;
+        } catch (err) {
+            refund();
+            await bridge.saveChatState(state).catch(() => {});
+            errorBanner = redact(err?.message ?? err, key);
+            return false;
+        } finally {
+            dossierBusy = false;
+            renderAll();
+        }
+    }
+
+    function renderUnderworldTab(state) {
+        const uw = state.underworld;
+        const resolvedSkin = resolveUnderworldSkin(state);
+        if (!state.inventory || typeof state.inventory !== 'object') {
+            state.inventory = { char: [], user: [] };
+        }
+        if (!Array.isArray(state.inventory.user)) state.inventory.user = [];
+
+        const handleResult = res => {
+            if (!res?.ok) {
+                errorBanner = t(`uw.error.${res?.reason || 'invalid_amount'}`);
+                return false;
+            }
+            errorBanner = '';
+            return true;
+        };
+
+        return vUwRender(doc, t, {
+            uw,
+            resolvedSkin,
+            betDraft: underworldBetDraft,
+            pawnValueDraft,
+            collateralDraft,
+            targetDraft: underworldTargetDraft,
+            wagerStake: wagerStakeDraft,
+            lastOutcome: lastCasinoOutcome,
+            userInventory: state.inventory.user,
+            charName: currentCharName || '{{char}}',
+            dossierBusy,
+        }, {
+            onSkin: async nextSkin => {
+                const clean = UW_SKINS.includes(nextSkin) ? nextSkin : 'auto';
+                uw.skin = clean;
+                const nextResolved = resolveUnderworldSkin(state);
+                if (nextResolved === 'tavern' && uw.currency === '$') uw.currency = '🪙';
+                else if (nextResolved !== 'tavern' && uw.currency === '🪙') uw.currency = '$';
+                await saveUnderworld(state);
+            },
+            onBetInput: val => { underworldBetDraft = Math.max(1, Math.trunc(Number(val) || 1)); },
+            onDice: async side => {
+                const res = uwRollDice(uw, { bet: underworldBetDraft, side });
+                if (handleResult(res)) {
+                    lastCasinoOutcome = {
+                        game: 'dice',
+                        dice: res.dice,
+                        total: res.total,
+                        side: res.side,
+                        win: res.win,
+                        payout: res.payout,
+                        net: res.net,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onSlots: async () => {
+                const res = uwPlaySlots(uw, { bet: underworldBetDraft });
+                if (handleResult(res)) {
+                    lastCasinoOutcome = {
+                        game: 'slots',
+                        reels: res.reels,
+                        payout: res.payout,
+                        net: res.net,
+                        win: res.win,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onBjDeal: async () => {
+                const res = uwStartBlackjack(uw, { bet: underworldBetDraft });
+                if (handleResult(res)) {
+                    if (res.status !== 'playing' && res.session) {
+                        lastCasinoOutcome = {
+                            game: 'blackjack',
+                            status: res.status,
+                            player: [...res.session.player],
+                            dealer: [...res.session.dealer],
+                            playerTotal: res.playerTotal,
+                            dealerTotal: res.dealerTotal,
+                            payout: res.payout,
+                            net: res.net,
+                        };
+                    } else {
+                        lastCasinoOutcome = null;
+                    }
+                }
+                await saveUnderworld(state);
+            },
+            onBjAction: async action => {
+                const res = uwBlackjackAction(uw, uw.blackjack, action);
+                if (handleResult(res) && res.status !== 'playing' && res.session) {
+                    lastCasinoOutcome = {
+                        game: 'blackjack',
+                        status: res.status,
+                        player: [...res.session.player],
+                        dealer: [...res.session.dealer],
+                        playerTotal: res.playerTotal,
+                        dealerTotal: res.dealerTotal,
+                        payout: res.payout,
+                        net: res.net,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onWagerStake: stake => {
+                if (VUW_WAGER_STAKES.includes(stake)) {
+                    wagerStakeDraft = stake;
+                    renderDrawer();
+                }
+            },
+            onStoryWager: async () => {
+                const res = uwStoryWager(uw, wagerStakeDraft);
+                if (handleResult(res)) {
+                    lastCasinoOutcome = { game: 'wager', stake: wagerStakeDraft, win: res.win };
+                }
+                await saveUnderworld(state);
+            },
+            onPawnValueInput: val => {
+                pawnValueDraft = Math.max(1, Math.min(50000, Math.trunc(Number(val) || 500)));
+            },
+            onTakeLoan: async () => {
+                handleResult(uwTakeLoan(uw, Math.min(5000, Math.max(1, pawnValueDraft))));
+                await saveUnderworld(state);
+            },
+            onPayDebt: async () => {
+                handleResult(uwPayDebt(uw));
+                await saveUnderworld(state);
+            },
+            onPawnPreset: async (presetKey, label, val) => {
+                await ensureIdentityCached();
+                const res = uwPawnCollateral(uw, {
+                    kind: 'preset',
+                    presetKey,
+                    label,
+                    pawnValue: val,
+                }, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                handleResult(res);
+                await saveUnderworld(state);
+            },
+            onCollateralInput: val => { collateralDraft = String(val ?? ''); },
+            onPawnCustom: async () => {
+                await ensureIdentityCached();
+                const res = uwPawnCollateral(uw, {
+                    kind: 'custom',
+                    label: collateralDraft,
+                    pawnValue: pawnValueDraft,
+                }, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                if (handleResult(res)) collateralDraft = '';
+                await saveUnderworld(state);
+            },
+            onPawnInventory: async itemLabel => {
+                await ensureIdentityCached();
+                const res = uwPawnInventoryItem(uw, state.inventory.user, itemLabel, pawnValueDraft, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                handleResult(res);
+                await saveUnderworld(state);
+            },
+            onRedeem: async collateralId => {
+                handleResult(uwRedeemCollateral(uw, collateralId, state.inventory.user));
+                await saveUnderworld(state);
+            },
+            onImportFactions: async () => {
+                await loadLivingWorld();
+                repImportFactions(uw, wikiCache.npcs, { skin: resolvedSkin });
+                errorBanner = '';
+                await saveUnderworld(state);
+            },
+            onTargetInput: val => { underworldTargetDraft = String(val ?? ''); },
+            onService: async serviceId => {
+                if (serviceId === 'npcDossier') {
+                    await runNpcDossierService(state);
+                    return;
+                }
+                if (serviceId === 'muscle') {
+                    if (uw.pendingWorldEvent) {
+                        errorBanner = t('uw.error.busy_event');
+                        renderAll();
+                        return;
+                    }
+                    await ensureIdentityCached();
+                    const target = underworldTargetDraft.trim() || currentCharName || 'the current target';
+                    const res = repUseService(uw, 'muscle', { target, skin: resolvedSkin });
+                    if (handleResult(res)) {
+                        uwSetPendingWorldEvent(uw, res.event, { kind: 'service' });
+                        underworldTargetDraft = '';
+                        bridge.notify?.(t('uw.muscleArmed'));
+                    }
+                    await saveUnderworld(state);
+                    return;
+                }
+                handleResult(repUseService(uw, 'clearHeat', { skin: resolvedSkin }));
+                await saveUnderworld(state);
+            },
+        });
+    }
+
+    function renderGachaSub(state) {
+        return vGaRenderAltar(doc, t, {
+            prefs: rpPrefs,
+            currency: state.underworld?.currency || '$',
+            cash: state.underworld?.cash ?? 0,
+            summonBusy,
+            resolveSrc: path => bridge.resolveMediaSrc?.(path) || path,
+        }, {
+            onSummon: async () => {
+                const result = gaCreateSummon(rpPrefs, { cash: state.underworld.cash, cost: 50 });
+                if (!result.ok) {
+                    errorBanner = t(result.reason === 'cradle_full' ? 'relic.cradleFull' : 'uw.error.insufficient_cash');
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                state.underworld.cash = result.cash;
+                await saveRpEntitlements(result.prefs);
+                await bridge.saveChatState(state);
+                bridge.notify?.(`${t('gacha.summoned')} ${vGaRarityLabel(t, result.egg.rarity)}`);
+                renderAll();
+            },
+            onPaidRitual: () => runPaidGachaRitual(),
+            onWarm: async eggId => {
+                const warmed = gaWarmEgg(rpPrefs, eggId, 20);
+                if (!warmed.ok) {
+                    errorBanner = t(`gacha.error.${warmed.reason || 'egg_not_found'}`);
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(warmed.prefs);
+                renderAll();
+            },
+            onHatch: eggId => hatchPendingEgg(eggId, state),
+            onEquipEggSkin: async (eggId, skinId) => {
+                const eq = gaEquipSkinOnEgg(rpPrefs, eggId, skinId);
+                if (!eq.ok) {
+                    errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(eq.prefs);
+                renderAll();
+            },
+        });
+    }
+
+    async function loadRelicCatalog() {
+        if (relicChecking) return;
+        relicChecking = true;
+        renderAll();
+        try {
+            const synced = await syncRpRelics();
+            relicCatalog = synced.editions;
+            relicSyncStatus = synced.catalogueUnavailable ? t('relic.unavailable')
+                : synced.inventoryUnavailable ? t('relic.inventoryUnavailable') : t('relic.synced');
+        } catch {
+            relicSyncStatus = t('relic.inventoryUnavailable');
+        } finally {
+            relicChecking = false;
+            renderAll();
+        }
+    }
+
+    async function verifyRelicPng(file) {
+        if (!file) return;
+        relicCardVerified = false;
+        relicCardStatus = t('relic.unverified');
+        try {
+            if (file.size > 16 * 1024 * 1024) throw new Error('PNG too large.');
+            const card = extractCharacterCardFromPng(await file.arrayBuffer());
+            const result = await relVerifyCard(card);
+            if (result.verified) {
+                relicCardVerified = true;
+                relicCardStatus = relPublicBadge(result.relic.payload, true);
+            }
+        } catch { /* Invalid, oversized or unsigned images do not get a badge. */ }
+        renderAll();
+    }
+
+    async function copyRelicMintLink(url) {
+        const cleanUrl = String(url || '');
+        if (!cleanUrl) return;
+        try {
+            if (typeof bridge.copyText === 'function') {
+                await bridge.copyText(cleanUrl);
+            } else if (win.navigator?.clipboard?.writeText) {
+                await win.navigator.clipboard.writeText(cleanUrl);
+            } else if (globalThis.navigator?.clipboard?.writeText) {
+                await globalThis.navigator.clipboard.writeText(cleanUrl);
+            }
+            bridge.notify?.(t('relic.linkCopied'));
+        } catch {
+            // Clipboard permission may be restricted in sandboxed WebViews; anchor link remains directly tappable.
+        }
+    }
+
+    function renderRelicsSub() {
+        return vGaRenderRelics(doc, t, {
+            catalog: relicCatalog,
+            relics: rpPrefs.relics,
+            verifiedRelics,
+            hatchedRelicUids: rpPrefs.hatchedRelicUids,
+            pendingEggs: rpPrefs.pendingEggs,
+            syncStatus: relicSyncStatus,
+            checking: relicChecking,
+            cardStatus: relicCardStatus,
+            cardVerified: relicCardVerified,
+            summonBusy,
+            locale: bridge.getLocale(),
+        }, {
+            onSync: () => loadRelicCatalog(),
+            onVerifyPng: file => verifyRelicPng(file),
+            onCopyLink: url => copyRelicMintLink(url),
+            onQueueEgg: async claims => {
+                const queued = gaQueueVerifiedRelicEgg(rpPrefs, claims);
+                if (!queued.ok) {
+                    errorBanner = t(queued.reason === 'cradle_full' ? 'relic.cradleFull' : 'relic.added');
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(queued.prefs);
+                cradleSub = 'gacha';
+                renderAll();
+            },
+        });
+    }
+
     function renderPacksSub() {
         return vPackRender(doc, t, {
             name: packNameDraft,
@@ -9766,6 +12749,10 @@ function createRpStudioController(bridge) {
         if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
             tracked = await syncTrackerFromChat({ checkpointKey, silent: true });
         }
+        // Apply deterministic underworld/reputation ticks even in offline
+        // mode. This also writes the checkpoint only after tracker extraction
+        // and local consequences have both completed.
+        await applyLocalTurnConsequences(checkpointKey);
         if (!tracked) {
             // Anti-Slop is local: keep the radar fresh even without a key / with auto-track disabled.
             await recomputeSlop().catch(() => {});
@@ -9809,12 +12796,26 @@ function createRpStudioController(bridge) {
     applyPillPosition(bridge.loadHudPosition?.());
     syncCachedCharName();
     loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
+    loadRpEntitlements().then(renderAll).catch(() => {});
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }
 
     function openTab(tabId = 'tracker') {
-        const id = String(tabId || 'tracker');
+        const requested = String(tabId || 'tracker');
+        const id = requested === 'underworld' || requested === 'casino' ? 'tracker'
+            : requested === 'gacha' || requested === 'relics' ? 'cradle' : requested;
+        if (requested === 'tracker') trackerSub = 'physiology';
+        else if (requested === 'underworld' || requested === 'casino') {
+            trackerSub = 'underworld';
+            syncCachedCharName();
+        }
+        if (requested === 'cradle') cradleSub = 'companions';
+        else if (requested === 'gacha') cradleSub = 'gacha';
+        else if (requested === 'relics') {
+            cradleSub = 'relics';
+            if (!relicCatalog.length) loadRelicCatalog();
+        }
         if (id === 'wiki' || id === 'style' || id === 'questions') {
             activeTab = 'codex';
             codexSub = id;
@@ -9861,6 +12862,9 @@ function createRpStudioController(bridge) {
         onAssistantMessageCommitted,
         refreshAccount,
         reloadLivingWorld,
+        loadRpEntitlements,
+        saveRpEntitlements,
+        syncRpRelics,
         runWikiUpdate,
         recomputeSlop,
         revealPhoneEntry,
@@ -10045,6 +13049,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
         injectContext: tavo.plugin.config.get('injectContext') !== false,
         confirmPaid: tavo.plugin.config.get('confirmPaid') !== false,
         maxAutoSpendUsd: 0.25,
+        rpPrefs: {},
         autoImageEvery: 0,
         bgDim: Number(tavo.plugin.config.get('bgDim') ?? 35),
         hudPos: null,
@@ -10150,6 +13155,14 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
             if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
             const raw = await tavo.variable.get(name).catch(() => null);
             return raw && typeof raw === 'object' ? raw : null;
+        },
+        async loadRpPrefs() {
+            return cachedPrefs.rpPrefs && typeof cachedPrefs.rpPrefs === 'object'
+                ? structuredClone(cachedPrefs.rpPrefs) : null;
+        },
+        async saveRpPrefs(value) {
+            cachedPrefs.rpPrefs = value && typeof value === 'object' ? structuredClone(value) : {};
+            await tavo.variable.set(GLOBAL_PREFS_KEY, cachedPrefs, 'global');
         },
         async saveStore(name, value) {
             if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
@@ -10337,6 +13350,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
         const action = payload?.action;
         if (action === 'open-tracker') controller.openTab('tracker');
         else if (action === 'open-cradle') controller.openTab('cradle');
+        else if (action === 'open-underworld') controller.openTab('underworld');
         else if (action === 'open-codex') controller.openTab('codex');
         else if (action === 'open-forge') controller.openTab('forge');
         else if (action === 'open-phone') controller.openTab('phone');

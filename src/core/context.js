@@ -1,7 +1,7 @@
 // Single context assembler for the roleplay model (v1.3, spec 10.3 / 11).
 // Modules hand over RAW strings; only ctxPack trims them, by priority (first = cut last):
-//   1. director  2. scene & physiology  3. wiki (cut from the end of the list)  4. anti-slop (3 phrases, then dropped)
-// Output: `depth0` (director + anti-slop, very end of context) and `main` (scene + wiki, after the main prompt),
+//   slop -> wiki -> scene -> worldEvent -> director.
+// Output: `depth0` (director + world event + anti-slop, very end of context) and `main` (scene + wiki, after the main prompt),
 // sharing one budget (default 250 tokens estimated with tnEstimateTokens).
 //
 // Flat-bundler safe: every top-level name is ctx*-prefixed; only `export function` / `export const`.
@@ -62,16 +62,17 @@ function ctxTruncateToFit(text, fits) {
     return cut ? `${cut}${CTX_ELLIPSIS}` : '';
 }
 
-export function ctxPack({ director = '', scene = '', wiki = '', slop = '', maxTokens = CTX_MAX_TOKENS } = {}) {
+export function ctxPack({ director = '', worldEvent = '', scene = '', wiki = '', slop = '', maxTokens = CTX_MAX_TOKENS } = {}) {
     const budget = Number.isFinite(Number(maxTokens)) ? Math.max(0, Math.floor(Number(maxTokens))) : CTX_MAX_TOKENS;
     const parts = {
         director: ctxClean(director),
+        worldEvent: ctxClean(worldEvent),
         scene: ctxClean(scene),
         wiki: ctxClean(wiki),
         slop: ctxClean(slop),
     };
 
-    const measure = p => ctxTokens(ctxJoin(p.director, p.slop)) + ctxTokens(ctxJoin(p.scene, p.wiki));
+    const measure = p => ctxTokens(ctxJoin(ctxJoin(p.director, p.worldEvent), p.slop)) + ctxTokens(ctxJoin(p.scene, p.wiki));
     const fits = p => measure(p) <= budget;
 
     // 4. Anti-slop: shrink to 3 phrases, then drop entirely.
@@ -96,22 +97,33 @@ export function ctxPack({ director = '', scene = '', wiki = '', slop = '', maxTo
         if (!fits(parts)) parts.scene = ctxTruncateToFit(parts.scene, s => fits({ ...parts, scene: s }));
     }
 
+    // 2.5. World events are depth-0 safety rails: trim them only after the
+    // scene/wiki have yielded, and never let a long event evict the director.
+    if (!fits(parts) && parts.worldEvent) {
+        parts.worldEvent = ctxTruncateToFit(parts.worldEvent, event => fits({ ...parts, worldEvent: event }));
+        if (!fits(parts)) parts.worldEvent = '';
+    }
+
     // 1. Director: cut only if it alone exceeds the whole budget.
     if (!fits(parts) && parts.director) {
         parts.director = ctxTruncateToFit(parts.director, d => fits({ ...parts, director: d }));
     }
 
-    const depth0 = ctxJoin(parts.director, parts.slop);
+    const depth0 = ctxJoin(ctxJoin(parts.director, parts.worldEvent), parts.slop);
     const main = ctxJoin(parts.scene, parts.wiki);
+    const tokenStats = {
+        director: ctxTokens(parts.director),
+        scene: ctxTokens(parts.scene),
+        wiki: ctxTokens(parts.wiki),
+        slop: ctxTokens(parts.slop),
+        total: ctxTokens(depth0) + ctxTokens(main),
+    };
+    // Keep the v1.3 object shape byte-for-byte for callers that did not opt in
+    // to world events, while exposing the new diagnostic when it is used.
+    if (parts.worldEvent) tokenStats.worldEvent = ctxTokens(parts.worldEvent);
     return {
         depth0,
         main,
-        tokens: {
-            director: ctxTokens(parts.director),
-            scene: ctxTokens(parts.scene),
-            wiki: ctxTokens(parts.wiki),
-            slop: ctxTokens(parts.slop),
-            total: ctxTokens(depth0) + ctxTokens(main),
-        },
+        tokens: tokenStats,
     };
 }

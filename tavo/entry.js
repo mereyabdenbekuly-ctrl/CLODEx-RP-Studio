@@ -148,8 +148,8 @@ function tnEstimateTokens(text) {
 // --- src/core/context.js ---
 // Single context assembler for the roleplay model (v1.3, spec 10.3 / 11).
 // Modules hand over RAW strings; only ctxPack trims them, by priority (first = cut last):
-//   1. director  2. scene & physiology  3. wiki (cut from the end of the list)  4. anti-slop (3 phrases, then dropped)
-// Output: `depth0` (director + anti-slop, very end of context) and `main` (scene + wiki, after the main prompt),
+//   slop -> wiki -> scene -> worldEvent -> director.
+// Output: `depth0` (director + world event + anti-slop, very end of context) and `main` (scene + wiki, after the main prompt),
 // sharing one budget (default 250 tokens estimated with tnEstimateTokens).
 //
 // Flat-bundler safe: every top-level name is ctx*-prefixed; only `export function` / `export const`.
@@ -207,16 +207,17 @@ function ctxTruncateToFit(text, fits) {
     cut = cut.trimEnd();
     return cut ? `${cut}${CTX_ELLIPSIS}` : '';
 }
-function ctxPack({ director = '', scene = '', wiki = '', slop = '', maxTokens = CTX_MAX_TOKENS } = {}) {
+function ctxPack({ director = '', worldEvent = '', scene = '', wiki = '', slop = '', maxTokens = CTX_MAX_TOKENS } = {}) {
     const budget = Number.isFinite(Number(maxTokens)) ? Math.max(0, Math.floor(Number(maxTokens))) : CTX_MAX_TOKENS;
     const parts = {
         director: ctxClean(director),
+        worldEvent: ctxClean(worldEvent),
         scene: ctxClean(scene),
         wiki: ctxClean(wiki),
         slop: ctxClean(slop),
     };
 
-    const measure = p => ctxTokens(ctxJoin(p.director, p.slop)) + ctxTokens(ctxJoin(p.scene, p.wiki));
+    const measure = p => ctxTokens(ctxJoin(ctxJoin(p.director, p.worldEvent), p.slop)) + ctxTokens(ctxJoin(p.scene, p.wiki));
     const fits = p => measure(p) <= budget;
 
     // 4. Anti-slop: shrink to 3 phrases, then drop entirely.
@@ -241,23 +242,34 @@ function ctxPack({ director = '', scene = '', wiki = '', slop = '', maxTokens = 
         if (!fits(parts)) parts.scene = ctxTruncateToFit(parts.scene, s => fits({ ...parts, scene: s }));
     }
 
+    // 2.5. World events are depth-0 safety rails: trim them only after the
+    // scene/wiki have yielded, and never let a long event evict the director.
+    if (!fits(parts) && parts.worldEvent) {
+        parts.worldEvent = ctxTruncateToFit(parts.worldEvent, event => fits({ ...parts, worldEvent: event }));
+        if (!fits(parts)) parts.worldEvent = '';
+    }
+
     // 1. Director: cut only if it alone exceeds the whole budget.
     if (!fits(parts) && parts.director) {
         parts.director = ctxTruncateToFit(parts.director, d => fits({ ...parts, director: d }));
     }
 
-    const depth0 = ctxJoin(parts.director, parts.slop);
+    const depth0 = ctxJoin(ctxJoin(parts.director, parts.worldEvent), parts.slop);
     const main = ctxJoin(parts.scene, parts.wiki);
+    const tokenStats = {
+        director: ctxTokens(parts.director),
+        scene: ctxTokens(parts.scene),
+        wiki: ctxTokens(parts.wiki),
+        slop: ctxTokens(parts.slop),
+        total: ctxTokens(depth0) + ctxTokens(main),
+    };
+    // Keep the v1.3 object shape byte-for-byte for callers that did not opt in
+    // to world events, while exposing the new diagnostic when it is used.
+    if (parts.worldEvent) tokenStats.worldEvent = ctxTokens(parts.worldEvent);
     return {
         depth0,
         main,
-        tokens: {
-            director: ctxTokens(parts.director),
-            scene: ctxTokens(parts.scene),
-            wiki: ctxTokens(parts.wiki),
-            slop: ctxTokens(parts.slop),
-            total: ctxTokens(depth0) + ctxTokens(main),
-        },
+        tokens: tokenStats,
     };
 }
 
@@ -457,7 +469,7 @@ function jrClonePayload(payload) {
 }
 
 // Mutates `journal` (push) and returns the appended operation.
-function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
+function jrAppend(journal, { kind, turnKey = '', payload = null, source = '' } = {}) {
     if (!Array.isArray(journal)) throw new TypeError('jrAppend: journal must be an array');
     const cleanKind = String(kind ?? '').trim().slice(0, JR_KIND_MAX);
     if (!cleanKind) throw new TypeError('jrAppend: kind is required');
@@ -468,6 +480,8 @@ function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
         payload: jrClonePayload(payload),
         at: Date.now(),
     };
+    const cleanSource = String(source ?? '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 32);
+    if (cleanSource) op.source = cleanSource;
     journal.push(op);
     return op;
 }
@@ -585,7 +599,7 @@ const PHONE_MAX_BYTES = 48000;
 const PHONE_MIN_TURNS_BETWEEN = 3;
 const PHONE_OP_ADD = 'phone.add';
 const PHONE_OP_REVEAL = 'phone.reveal';
-const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160 });
+const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160, source: 32 });
 
 const PHONE_MAX_SEEN = 480;
 const PHONE_HARD_MAX_OPS = 720;
@@ -618,6 +632,11 @@ function phoneSafeId(value) {
 
 function phoneSafeTurnKey(value) {
     return phoneSanitizeText(value, PHONE_LIMITS.turnKey);
+}
+
+function phoneSafeSource(value) {
+    const source = String(value ?? 'tracker').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, PHONE_LIMITS.source);
+    return source || 'tracker';
 }
 
 function phoneSafeMediaPath(value) {
@@ -668,7 +687,7 @@ function phoneNormalizeStore(raw) {
             if (!op || typeof op !== 'object') continue;
             const turnKey = phoneSafeTurnKey(op.turnKey);
             if (!turnKey) continue;
-            const base = { id: op.id, kind: op.kind, turnKey, at: Number.isFinite(op.at) ? op.at : 0 };
+            const base = { id: op.id, kind: op.kind, turnKey, source: phoneSafeSource(op.source), at: Number.isFinite(op.at) ? op.at : 0 };
             if (op.kind === PHONE_OP_ADD) {
                 const entry = phoneSanitizeEntry(op.payload, { turnKey });
                 if (!entry || !entry.id) continue;
@@ -695,24 +714,25 @@ function phoneShouldInclude(state) {
 
 // Appends up to 2 sanitized events created by `turnKey`. Idempotent per turnKey:
 // a repeated sync of the same turn does not duplicate entries. Mutates and returns the store.
-function phoneIngestEvents(store, events, turnKey) {
+function phoneIngestEvents(store, events, turnKey, { source = 'tracker' } = {}) {
     if (!store || typeof store !== 'object') return store;
     if (!Array.isArray(store.journal)) store.journal = [];
     const key = phoneSafeTurnKey(turnKey);
+    const origin = phoneSafeSource(source);
     if (!key || !Array.isArray(events) || events.length === 0) return store;
-    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key)) return store;
+    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key && phoneSafeSource(op.source) === origin)) return store;
     const usedIds = new Set(store.journal.filter((op) => op?.kind === PHONE_OP_ADD).map((op) => op.payload?.id));
     let added = 0;
     for (let i = 0; i < events.length && added < PHONE_MAX_EVENTS_PER_TURN; i += 1) {
         const entry = phoneSanitizeEntry({ ...(events[i] && typeof events[i] === 'object' ? events[i] : {}), id: '', mediaPath: '' }, { turnKey: key });
         if (!entry) continue;
-        let id = `ph-${phoneHash(`${key}|${i}|${entry.kind}|${entry.text}`)}`;
+        let id = `ph-${phoneHash(`${key}|${origin}|${i}|${entry.kind}|${entry.text}`)}`;
         let n = 1;
         while (usedIds.has(id)) id = `ph-${phoneHash(`${key}|${i}|${entry.text}|${n++}`)}`;
         usedIds.add(id);
         entry.id = id;
         entry.turnKey = key;
-        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, payload: entry });
+        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, source: origin, payload: entry });
         added += 1;
     }
     if (store.journal.length > PHONE_HARD_MAX_OPS) store.journal = store.journal.slice(-PHONE_HARD_MAX_OPS);
@@ -971,6 +991,202 @@ function formatShortDate(isoDate, locale = 'ru') {
     } catch {
         return isoDate;
     }
+}
+
+// --- src/core/gacha.js ---
+// U4: autonomous altar/gacha. Only the paid summon path is allowed to call
+// the host API, and callers must explicitly confirm before doing so.
+const GA_RARITIES = Object.freeze(['common', 'rare', 'epic', 'ssr', 'mythic']);
+const GA_RARITY_WEIGHTS = Object.freeze({ common: 0.52, rare: 0.30, epic: 0.13, ssr: 0.042, mythic: 0.008 });
+const GA_PITY_EPIC = 10;
+const GA_PITY_SSR = 30;
+const EGG_SKINS = Object.freeze([
+    { id: 'obsidian_kintsugi', name: 'Obsidian Kintsugi', rarity: 'epic', theme: 'linear-gradient(145deg,#0b1020,#c9933d)', descriptor: 'Obsidian egg with luminous golden kintsugi seams, velvet-black reflections, solemn shrine lighting, ornate cracks like repaired constellations.' },
+    { id: 'abyssal_crystal', name: 'Abyssal Crystal', rarity: 'ssr', theme: 'linear-gradient(145deg,#07152c,#3c83d8)', descriptor: 'Deep-blue crystal egg with translucent facets, tiny stars suspended inside, cold abyssal glow, prismatic edges, mysterious underwater silence.' },
+    { id: 'seraph_porcelain', name: 'Seraph Porcelain', rarity: 'mythic', theme: 'linear-gradient(145deg,#fff6dc,#d9b6ff)', descriptor: 'Ivory porcelain egg with six subtle halo rings, rose-gold filigree, soft celestial radiance, sacred calm, immaculate museum-quality finish.' },
+    { id: 'cyber_pod', name: 'Cyber Pod', rarity: 'rare', theme: 'linear-gradient(145deg,#071b24,#22d3ee)', descriptor: 'Sleek cybernetic egg pod with cyan status lights, graphite shell panels, tiny holographic glyphs, rain-slick neon reflections, sci-fi lab mood.' },
+    { id: 'dragon_amber', name: 'Dragon Amber', rarity: 'epic', theme: 'linear-gradient(145deg,#34140b,#f59e0b)', descriptor: 'Warm amber egg with a tiny dragon silhouette inside, smoky inclusions, ember sparks, carved scale motifs, dramatic volcanic sunset light.' },
+    { id: 'crimson_reliquary', name: 'Crimson Reliquary', rarity: 'ssr', theme: 'linear-gradient(145deg,#24080f,#e11d48)', descriptor: 'Crimson reliquary egg with dark ruby glass, silver lockwork, candlelit gothic altar, restrained occult elegance, faint red inner pulse.' },
+    { id: 'lunar_jade', name: 'Lunar Jade', rarity: 'rare', theme: 'linear-gradient(145deg,#072620,#8dd3b8)', descriptor: 'Moonlit jade egg with soft green translucence, silver crescent engravings, misty garden shadows, serene nocturnal atmosphere, polished stone texture.' },
+    { id: 'astral_nebula', name: 'Astral Nebula', rarity: 'mythic', theme: 'linear-gradient(145deg,#110b30,#a855f7)', descriptor: 'Cosmic egg containing a swirling nebula, violet and indigo clouds, distant galaxies, tiny comet trails, impossible depth, elegant astral glow.' },
+    { id: 'frost_rune', name: 'Frost Rune', rarity: 'epic', theme: 'linear-gradient(145deg,#10243a,#bae6fd)', descriptor: 'Frosted blue egg etched with luminous runes, crystalline snow dust, pale winter light, clean geometric facets, quiet enchanted cold.' },
+    { id: 'clockwork_brass', name: 'Clockwork Brass', rarity: 'rare', theme: 'linear-gradient(145deg,#2b1d0e,#fbbf24)', descriptor: 'Brass clockwork egg with visible gears, tiny springs, warm workshop light, engraved numerals, whimsical precision, richly aged metal patina.' },
+    { id: 'velvet_thorn', name: 'Velvet Thorn', rarity: 'ssr', theme: 'linear-gradient(145deg,#220c22,#ec4899)', descriptor: 'Deep velvet egg wrapped in delicate silver thorns, magenta bloom highlights, romantic gothic still life, soft theatrical shadows, luxurious texture.' },
+    { id: 'solar_halo', name: 'Solar Halo', rarity: 'mythic', theme: 'linear-gradient(145deg,#51200b,#fde047)', descriptor: 'Radiant solar egg with layered golden halo rings, sunlit enamel, tiny phoenix silhouette, warm bloom, triumphant mythic fantasy presentation.' },
+]);
+const GA_ARCHETYPES = Object.freeze(['familiar_fox', 'shadow_raven', 'dragon_whelp', 'homunculus', 'celestial_wisp']);
+
+function gaClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+function gaRng() {
+    if (globalThis.crypto?.getRandomValues) {
+        const data = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(data);
+        return data[0] / 0x1_0000_0000;
+    }
+    return Math.random();
+}
+function gaNormalizePrefs(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const unlocked = [...new Set((Array.isArray(source.unlockedEggSkins) ? source.unlockedEggSkins : []).map(String).filter(id => EGG_SKINS.some(skin => skin.id === id)))];
+    return {
+        version: 1,
+        unlockedEggSkins: unlocked.slice(0, EGG_SKINS.length),
+        epicPity: Math.trunc(gaClamp(source.epicPity, 0, GA_PITY_EPIC - 1, 0)),
+        ssrPity: Math.trunc(gaClamp(source.ssrPity, 0, GA_PITY_SSR - 1, 0)),
+        relics: Array.isArray(source.relics) ? source.relics.filter(x =>
+            typeof x?.payload === 'string' && x.payload.length <= 16_384
+            && typeof x?.sig === 'string' && x.sig.length <= 256
+        ).map(({ payload, sig }) => ({ payload, sig })) : [],
+        hatchedRelicUids: [...new Set((Array.isArray(source.hatchedRelicUids) ? source.hatchedRelicUids : [])
+            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(value)))],
+        pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
+    };
+}
+function gaNormalizeEgg(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const skin = EGG_SKINS.some(item => item.id === raw.eggSkin) ? raw.eggSkin : EGG_SKINS[0].id;
+    const rarity = GA_RARITIES.includes(raw.rarity) ? raw.rarity : 'common';
+    const archetype = GA_ARCHETYPES.includes(raw.archetype) ? raw.archetype : GA_ARCHETYPES[0];
+    return {
+        id: String(raw.id || `egg-${Date.now().toString(36)}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80),
+        rarity,
+        eggSkin: skin,
+        archetype,
+        mutationTrait: String(raw.mutationTrait || 'stable lineage').replace(/[<>]/g, '').slice(0, 120),
+        warmth: Math.max(0, Math.min(100, Math.trunc(Number(raw.warmth) || 0))),
+        hatched: raw.hatched === true,
+        name: String(raw.name || '').replace(/[<>]/g, '').slice(0, 80),
+        personality: String(raw.personality || '').replace(/[<>]/g, '').slice(0, 240),
+        prophecy: String(raw.prophecy || '').replace(/[<>]/g, '').slice(0, 240),
+        artPath: String(raw.artPath || '').slice(0, 512),
+        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
+    };
+}
+function gaWarmEgg(prefs, eggId, amount = 20) {
+    const next = gaNormalizePrefs(prefs);
+    const egg = next.pendingEggs.find(item => item.id === String(eggId) && !item.hatched);
+    if (!egg) return { ok: false, reason: 'egg_not_found', prefs: next };
+    egg.warmth = Math.min(100, egg.warmth + Math.max(1, Math.trunc(Number(amount) || 0)));
+    return { ok: true, ready: egg.warmth >= 100, egg, prefs: next };
+}
+function gaEquipSkinOnEgg(prefs, eggId, skinId) {
+    const next = gaNormalizePrefs(prefs);
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!EGG_SKINS.some(item => item.id === cleanSkin)) {
+        return { ok: false, reason: 'invalid_skin', egg: null, prefs: next };
+    }
+    if (!next.unlockedEggSkins.includes(cleanSkin)) {
+        return { ok: false, reason: 'skin_locked', egg: null, prefs: next };
+    }
+    const egg = next.pendingEggs.find(item => item.id === String(eggId) && !item.hatched);
+    if (!egg) return { ok: false, reason: 'egg_not_found', egg: null, prefs: next };
+    egg.eggSkin = cleanSkin;
+    if (prefs && typeof prefs === 'object' && Array.isArray(prefs.pendingEggs)) {
+        const rawEgg = prefs.pendingEggs.find(item => item && String(item.id) === String(eggId) && !item.hatched);
+        if (rawEgg) rawEgg.eggSkin = cleanSkin;
+    }
+    return { ok: true, egg, prefs: next };
+}
+function gaHatchEgg(prefs, eggId) {
+    const next = gaNormalizePrefs(prefs);
+    const egg = next.pendingEggs.find(item => item.id === String(eggId));
+    if (!egg) return { ok: false, reason: 'egg_not_found', prefs: next };
+    if (egg.hatched || egg.warmth < 100) return { ok: false, reason: 'not_ready', egg, prefs: next };
+    next.pendingEggs = next.pendingEggs.filter(item => item !== egg);
+    if (egg.relicUid && !next.hatchedRelicUids.includes(egg.relicUid)) next.hatchedRelicUids.push(egg.relicUid);
+    egg.hatched = true;
+    return { ok: true, egg, prefs: next };
+}
+
+// Only call with claims from relVerifyInventory (not the unsigned inventory wrapper).
+function gaQueueVerifiedRelicEgg(prefs, claims) {
+    const next = gaNormalizePrefs(prefs);
+    if (next.hatchedRelicUids.includes(claims.relicUid) || next.pendingEggs.some(egg => egg.relicUid === claims.relicUid)) {
+        return { ok: false, reason: 'already_added', prefs: next };
+    }
+    if (next.pendingEggs.length >= 24) return { ok: false, reason: 'cradle_full', prefs: next };
+    const egg = gaNormalizeEgg({
+        ...claims, id: claims.relicUid, name: claims.edition, mutationTrait: claims.genes.trait,
+    });
+    next.pendingEggs.push(egg);
+    return { ok: true, egg, prefs: next };
+}
+function gaRollRarity(prefs = {}, { rng = gaRng } = {}) {
+    const state = gaNormalizePrefs(prefs);
+    const nextEpic = state.epicPity + 1;
+    const nextSsr = state.ssrPity + 1;
+    if (nextSsr >= GA_PITY_SSR) return rng() < 0.2 ? 'mythic' : 'ssr';
+    if (nextEpic >= GA_PITY_EPIC) {
+        const roll = rng();
+        if (roll < GA_RARITY_WEIGHTS.mythic / (GA_RARITY_WEIGHTS.ssr + GA_RARITY_WEIGHTS.mythic)) return 'mythic';
+        return 'epic';
+    }
+    const roll = rng();
+    let cursor = 0;
+    for (const rarity of GA_RARITIES) {
+        cursor += GA_RARITY_WEIGHTS[rarity];
+        if (roll < cursor) return rarity;
+    }
+    return 'common';
+}
+function gaApplyPity(prefs, rarity) {
+    const state = gaNormalizePrefs(prefs);
+    const high = rarity === 'ssr' || rarity === 'mythic';
+    const epic = high || rarity === 'epic';
+    state.epicPity = epic ? 0 : Math.min(GA_PITY_EPIC - 1, state.epicPity + 1);
+    state.ssrPity = high ? 0 : Math.min(GA_PITY_SSR - 1, state.ssrPity + 1);
+    return state;
+}
+function gaPickSkin(rarity, prefs = {}, { rng = gaRng } = {}) {
+    const unlocked = gaNormalizePrefs(prefs).unlockedEggSkins;
+    const eligible = EGG_SKINS.filter(skin => skin.rarity === rarity || (rarity === 'mythic' && skin.rarity === 'ssr'));
+    const pool = eligible.length ? eligible : EGG_SKINS;
+    const skin = pool[Math.floor(rng() * pool.length)];
+    return skin || EGG_SKINS[0];
+}
+function gaCreateSummon(prefs = {}, { cash = 0, cost = 50, rng = gaRng, archetypes = GA_ARCHETYPES } = {}) {
+    if (Number(cash) < Number(cost)) return { ok: false, reason: 'insufficient_cash', cost: Number(cost) };
+    if (gaNormalizePrefs(prefs).pendingEggs.filter(egg => !egg.hatched).length >= 24) {
+        return { ok: false, reason: 'cradle_full' };
+    }
+    const rarity = gaRollRarity(prefs, { rng });
+    const skin = gaPickSkin(rarity, prefs, { rng });
+    const nextPrefs = gaApplyPity(prefs, rarity);
+    if (!nextPrefs.unlockedEggSkins.includes(skin.id)) nextPrefs.unlockedEggSkins.push(skin.id);
+    const archetypePool = Array.isArray(archetypes) && archetypes.length ? archetypes : GA_ARCHETYPES;
+    const egg = {
+        id: `egg-${Date.now().toString(36)}-${Math.floor(rng() * 1e6).toString(36)}`,
+        rarity,
+        eggSkin: skin.id,
+        archetype: archetypePool[Math.floor(rng() * archetypePool.length)],
+        mutationTrait: rarity === 'mythic' ? 'mythic resonance' : rarity === 'ssr' ? 'rare mutation' : 'stable lineage',
+        warmth: 0,
+        hatched: false,
+    };
+    nextPrefs.pendingEggs = nextPrefs.pendingEggs.filter(item => !item.hatched);
+    nextPrefs.pendingEggs.push(egg);
+    return { ok: true, egg, prefs: nextPrefs, cash: Number(cash) - Number(cost), cost: Number(cost) };
+}
+function gaBuildPaidPrompt({ rarity, skinId, locale = 'ru', charName = '{{char}}' } = {}) {
+    const skin = EGG_SKINS.find(item => item.id === skinId) || EGG_SKINS[0];
+    const language = locale === 'ru' ? 'Russian and English' : 'English';
+    return [
+        'Return one compact JSON object only.',
+        `Create a ${rarity} companion egg in the ${skin.name} skin for ${charName}.`,
+        `Visual descriptor: ${skin.descriptor}`,
+        `Include name, mutationTrait, personality, prophecy in ${language}; keep the JSON under 300 tokens.`,
+    ].join(' ');
+}
+function gaCanStartPaid({ confirmPaid = true, confirmed = false } = {}) {
+    return !confirmPaid || confirmed === true;
+}
+function gaRegisterHatch(prefs, egg) {
+    const next = gaNormalizePrefs(prefs);
+    if (egg?.eggSkin && !next.unlockedEggSkins.includes(egg.eggSkin)) next.unlockedEggSkins.push(egg.eggSkin);
+    return next;
 }
 
 // --- src/core/companion.js ---
@@ -1233,6 +1449,11 @@ function normalizeCompanion(raw, idx = 0) {
         videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
         needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
         lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
+        ...(GA_RARITIES.includes(src.rarity) ? { rarity: src.rarity } : {}),
+        ...(EGG_SKINS.some(skin => skin.id === src.eggSkin) ? { eggSkin: src.eggSkin } : {}),
+        ...(typeof src.mutationTrait === 'string' && src.mutationTrait
+            ? { mutationTrait: src.mutationTrait.replace(/[<>]/g, '').slice(0, 120) } : {}),
+        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
     };
 }
 function createCompanionFromArchetype(archetypeId, { customName = '', locale = 'ru' } = {}) {
@@ -1350,7 +1571,12 @@ function createCompanionFromOffspring(child, state, { locale = 'ru' } = {}) {
     if (state && typeof state === 'object') {
         if (!Array.isArray(state.companions)) state.companions = [];
         const existing = state.companions.find(c => c && c.originChildId === childId);
-        if (existing) return existing;
+        if (existing) {
+            if (!existing.eggSkin && EGG_SKINS.some(skin => skin.id === srcChild.eggSkin)) {
+                existing.eggSkin = srcChild.eggSkin;
+            }
+            return existing;
+        }
     }
 
     const gender = srcChild.gender === 'male' ? 'male' : 'female';
@@ -1387,6 +1613,7 @@ function createCompanionFromOffspring(child, state, { locale = 'ru' } = {}) {
         videoTaskId: '',
         needsStageArt: true,
         lastActionAt: String(state?.world?.rpDate ?? ''),
+        ...(EGG_SKINS.some(skin => skin.id === srcChild.eggSkin) ? { eggSkin: srcChild.eggSkin } : {}),
     });
 
     if (state && Array.isArray(state.companions) && state.companions.length < 6) {
@@ -1433,6 +1660,28 @@ function advanceCompanionsDays(companions, deltaDays) {
     }
     return companions;
 }
+
+function compUnlockedSkinSet(unlockedEggSkins) {
+    if (Array.isArray(unlockedEggSkins)) return new Set(unlockedEggSkins.map(String));
+    if (unlockedEggSkins instanceof Set) return new Set([...unlockedEggSkins].map(String));
+    if (Array.isArray(unlockedEggSkins?.unlockedEggSkins)) return new Set(unlockedEggSkins.unlockedEggSkins.map(String));
+    return new Set();
+}
+function equipCompanionEggSkin(companion, skinId, unlockedEggSkins = []) {
+    if (!companion || typeof companion !== 'object') {
+        return { ok: false, reason: 'companion_not_found', companion: null };
+    }
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!EGG_SKINS.some(skin => skin.id === cleanSkin)) {
+        return { ok: false, reason: 'invalid_skin', companion };
+    }
+    if (!compUnlockedSkinSet(unlockedEggSkins).has(cleanSkin)) {
+        return { ok: false, reason: 'skin_locked', companion };
+    }
+    companion.eggSkin = cleanSkin;
+    companion.needsStageArt = true;
+    return { ok: true, companion };
+}
 function buildCompanionPortraitPrompt(companion, {
     charName = '',
     charDescription = '',
@@ -1442,6 +1691,7 @@ function buildCompanionPortraitPrompt(companion, {
     const comp = normalizeCompanion(companion);
     const profile = COMP_ARCHETYPE_PROFILES[comp.archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
     const stageDesc = COMP_STAGE_VISUALS[comp.stage] || COMP_STAGE_VISUALS.infant;
+    const skinObj = comp.eggSkin ? EGG_SKINS.find(item => item.id === comp.eggSkin) : null;
 
     const styleLead = stylePreset === 'dark_gothic'
         ? 'Dark gothic chiaroscuro portrait illustration, warm candlelight, ornate sanctuary backdrop, rich oil-painted textures.'
@@ -1463,7 +1713,7 @@ function buildCompanionPortraitPrompt(companion, {
         .trim()
         .split(' ')
         .filter(Boolean)
-        .slice(0, 14)
+        .slice(0, skinObj ? 8 : 14)
         .join(' ');
 
     const lineageClause = comp.originChildId || comp.archetype === 'offspring'
@@ -1474,13 +1724,22 @@ function buildCompanionPortraitPrompt(companion, {
         ? 'enchanting dragon-blooded fantasy heir with delicate shimmering scales and warm luminous eyes'
         : profile.visualSubject;
 
+    const skinClause = skinObj
+        ? `Shell and aura motif (${skinObj.name}): ${skinObj.descriptor}`
+        : '';
+
+    const framingClause = skinObj
+        ? 'Centered solo portrait framing, soft rim light, no text overlays, no speech bubbles, no watermarks.'
+        : 'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.';
+
     const rawPrompt = [
         styleLead,
         `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
         `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
+        skinClause,
         lineageClause,
-        'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.',
-    ].join(' ');
+        framingClause,
+    ].filter(Boolean).join(' ');
 
     return compEnforceWordRange(rawPrompt, 64, 104, [
         'Warm atmospheric bokeh particles drift gently through the background air, highlighting crisp silhouettes and natural anatomy.',
@@ -1589,7 +1848,652 @@ function buildCompanionForgeConcept(companion, {
     ].join(' ');
 }
 
+// --- src/core/underworld.js ---
+// CLODEx RP Studio v1.4 — local underworld mechanics.
+// This module is deliberately network-free. It owns chat-scoped money, debt,
+// collateral and deterministic-enough (crypto-backed) mini-game primitives.
+const UW_MAX_CASH = 999_999_999;
+const UW_MAX_COLLATERAL = 6;
+const UW_SKINS = Object.freeze(['auto', 'crime', 'tavern', 'syndicate']);
+const UW_COLLATERAL_PRESETS = Object.freeze({
+    crime: ['apartment', 'car', 'business', 'watch'],
+    tavern: ['estate', 'sword', 'artifact', 'oath'],
+    syndicate: ['habitat', 'implant', 'deck', 'license'],
+});
+const UW_PRESET_VALUES = Object.freeze({
+    apartment: 15000,
+    estate: 15000,
+    habitat: 15000,
+    business: 8000,
+    artifact: 8000,
+    implant: 8000,
+    car: 3500,
+    sword: 3500,
+    deck: 3500,
+    watch: 900,
+    oath: 900,
+    license: 900,
+});
+const UW_WORLD_EVENTS = Object.freeze({
+    crime: '[World Event: collectors confront {{user}} over unpaid debt; the apartment is inaccessible.]',
+    tavern: '[World Event: guild bailiffs seal {{user}}’s quarters over unpaid debt.]',
+    syndicate: '[World Event: syndicate agents lock {{user}}’s habitation unit over unpaid debt.]',
+});
+
+function uwClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+
+function uwInt(value, min, max, fallback = min) {
+    return Math.trunc(uwClamp(value, min, max, fallback));
+}
+function uwDefaultRng() {
+    if (globalThis.crypto?.getRandomValues) {
+        const bytes = new Uint32Array(1);
+        globalThis.crypto.getRandomValues(bytes);
+        return bytes[0] / 0x1_0000_0000;
+    }
+    return Math.random();
+}
+function uwResolveSkin(value, { text = '', description = '', scenario = '' } = {}) {
+    const requested = String(value ?? '').toLowerCase();
+    if (UW_SKINS.includes(requested) && requested !== 'auto') return requested;
+    const corpus = `${text} ${description} ${scenario}`.toLowerCase();
+    if (/(cyber|сайбер|кибер|corporate|корпорат|neuro|нейро|droid|drone|дрон)/.test(corpus)) return 'syndicate';
+    if (/(fantasy|фэнтези|medieval|средневек|magic|маг|guild|гильд|tavern|таверн|dragon|дракон)/.test(corpus)) return 'tavern';
+    if (/(crime|криминал|noir|нуар|gang|банд|mafia|маф|police|полици|detective|детектив)/.test(corpus)) return 'crime';
+    return 'crime';
+}
+function uwCreateState({ skin = 'auto', currency, cash = 500 } = {}) {
+    const resolvedSkin = UW_SKINS.includes(skin) ? skin : 'auto';
+    const defaultCurrency = currency || (resolvedSkin === 'tavern' ? '🪙' : '$');
+    return {
+        skin: resolvedSkin,
+        currency: String(defaultCurrency).slice(0, 8),
+        cash: uwInt(cash, 0, UW_MAX_CASH, 500),
+        debt: 0,
+        turnsInDebt: 0,
+        collateral: [],
+        houseNet: 0,
+        heat: 0,
+        standing: 0,
+        factions: [],
+        turnsSinceEvent: 4,
+        pendingWorldEvent: '',
+        eventKind: '',
+        calmTurns: 0,
+        wagerCooldown: 0,
+        collectorNotices: 0,
+        allyTurns: 0,
+        blackjack: null,
+    };
+}
+function uwNormalizeState(raw) {
+    const out = uwCreateState();
+    if (!raw || typeof raw !== 'object') return out;
+    out.skin = UW_SKINS.includes(raw.skin) ? raw.skin : 'auto';
+    out.currency = String(raw.currency || (out.skin === 'tavern' ? '🪙' : '$')).slice(0, 8);
+    out.cash = uwInt(raw.cash, 0, UW_MAX_CASH, 500);
+    out.debt = uwInt(raw.debt, 0, UW_MAX_CASH, 0);
+    out.turnsInDebt = uwInt(raw.turnsInDebt, 0, 999, 0);
+    out.houseNet = uwInt(raw.houseNet, -UW_MAX_CASH, UW_MAX_CASH, 0);
+    out.heat = uwClamp(raw.heat, 0, 5, 0);
+    out.standing = uwInt(raw.standing, -100, 100, 0);
+    out.turnsSinceEvent = uwInt(raw.turnsSinceEvent, 0, 999, 4);
+    out.pendingWorldEvent = String(raw.pendingWorldEvent || '').replace(/[\u0000-\u001f]/g, ' ').slice(0, 320);
+    out.eventKind = ['debt', 'heat', 'faction', 'wager', 'service'].includes(raw.eventKind) ? raw.eventKind : '';
+    if (out.debt === 0) out.turnsInDebt = 0;
+    out.calmTurns = uwInt(raw.calmTurns, 0, 2, 0);
+    out.wagerCooldown = uwInt(raw.wagerCooldown, 0, 3, 0);
+    out.collectorNotices = uwInt(raw.collectorNotices, 0, 999, 0);
+    out.allyTurns = uwInt(raw.allyTurns, 0, 4, 0);
+    out.blackjack = uwNormalizeBlackjack(raw.blackjack);
+    const seen = new Set();
+    out.collateral = Array.isArray(raw.collateral) ? raw.collateral.filter(item => item && typeof item === 'object').slice(0, UW_MAX_COLLATERAL).map((item, idx) => {
+        const id = String(item.id || `pawn-${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || `pawn-${idx + 1}`;
+        if (seen.has(id)) return null;
+        seen.add(id);
+        const status = item.status === 'foreclosed' ? 'foreclosed' : 'pawned';
+        return {
+            id,
+            kind: ['preset', 'inventory', 'custom'].includes(item.kind) ? item.kind : 'custom',
+            presetKey: String(item.presetKey || '').slice(0, 40),
+            label: String(item.label || '').replace(/[<>]/g, '').slice(0, 48),
+            ...(item.kind === 'inventory' ? { inventoryLabel: String(item.inventoryLabel || item.label || '').slice(0, 80) } : {}),
+            pawnValue: uwInt(item.pawnValue, 0, UW_MAX_CASH, 0),
+            redeemCost: uwInt(item.redeemCost, 0, UW_MAX_CASH, 0),
+            dueInTurns: uwInt(item.dueInTurns, 0, 999, 0),
+            status,
+        };
+    }).filter(Boolean) : [];
+    out.factions = Array.isArray(raw.factions) ? raw.factions.slice(0, 4).map((f, idx) => ({
+        id: String(f?.id || `faction-${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `faction-${idx + 1}`,
+        name: String(f?.name || 'Faction').replace(/[<>]/g, '').slice(0, 48),
+        rep: uwInt(f?.rep, -100, 100, 0),
+    })) : [];
+    return out;
+}
+function uwSafeCollateralLabel(value, { charName = '', userName = '', companions = [] } = {}) {
+    const label = String(value ?? '').replace(/[<>()[\]{}]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 48);
+    if (!label || /https?:\/\//i.test(label)) return '';
+    const blocked = /(?:^| )(?:people|persons?|humans?|children|child|kids?|bab(?:y|ies)|npc|slaves?|familiars?|companions?|characters?|человек\w*|люди|реб[её]н\S*|дете?й|дети|сын\S*|дочь\S*|персонаж\S*|раб\S*|спутник\S*)(?: |$)/iu;
+    const lower = tnNormalize(label);
+    const names = [charName, userName, ...companions.map(c => c?.name)].map(tnNormalize).filter(Boolean);
+    if (blocked.test(lower) || names.some(name => ` ${lower} `.includes(` ${name} `))) return '';
+    return label;
+}
+const uwIsSafeCollateralLabel = uwSafeCollateralLabel;
+
+function uwWager(state, bet) {
+    const wager = Number(bet);
+    return Number.isSafeInteger(wager) && wager > 0 && wager <= state?.cash ? wager : 0;
+}
+
+function uwSettle(state, delta) {
+    const before = state.cash;
+    state.cash = uwInt(before + delta, 0, UW_MAX_CASH, 0);
+    state.houseNet = uwInt(state.houseNet + state.cash - before, -UW_MAX_CASH, UW_MAX_CASH, 0);
+}
+function uwRollDice(state, { bet = 0, side = 'over', rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!state || wager <= 0) return { ok: false, reason: 'invalid_bet', total: 0, dice: [], payout: 0 };
+    const dice = [1 + Math.floor(rng() * 6), 1 + Math.floor(rng() * 6)];
+    const total = dice[0] + dice[1];
+    const normalized = ['over', 'under', 'seven', 'double'].includes(side) ? side : 'over';
+    const win = normalized === 'over' ? total > 7 : normalized === 'under' ? total < 7 : normalized === 'seven' ? total === 7 : dice[0] === dice[1];
+    const multiplier = normalized === 'seven' ? 4.5 : normalized === 'double' ? 5 : 2;
+    const payout = win ? Math.floor(wager * multiplier) : 0;
+    uwSettle(state, payout - wager);
+    return { ok: true, dice, total, side: normalized, win, payout, net: payout - wager };
+}
+
+function uwNormalizeBlackjack(raw) {
+    if (!raw || raw.status !== 'playing') return null;
+    const lists = [raw.deck, raw.player, raw.dealer];
+    if (lists.some(list => !Array.isArray(list)) || raw.player.length < 2 || raw.dealer.length !== 2) return null;
+    const cards = lists.flat();
+    if (cards.length !== 52 || new Set(cards).size !== 52 || cards.some(n => !Number.isInteger(n) || n < 0 || n > 51)) return null;
+    if (!Number.isInteger(raw.wager) || raw.wager < 1 || raw.wager > UW_MAX_CASH) return null;
+    return { wager: raw.wager, deck: [...raw.deck], player: [...raw.player], dealer: [...raw.dealer], status: 'playing' };
+}
+function uwCardLabel(card) {
+    return `${['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'][card % 13]}${['♠', '♥', '♦', '♣'][Math.floor(card / 13)]}`;
+}
+
+function uwCardValue(cards) {
+    let total = 0;
+    let aces = 0;
+    for (const card of cards) {
+        const rank = card % 13;
+        if (rank === 0) { total += 11; aces += 1; }
+        else total += Math.min(10, rank + 1);
+    }
+    return total - 10 * Math.min(aces, Math.max(0, Math.ceil((total - 21) / 10)));
+}
+function uwHandTotal(cards) {
+    if (!Array.isArray(cards) || !cards.length) return 0;
+    return uwCardValue(cards);
+}
+
+function uwFinishBlackjack(state, session, status, payout) {
+    const before = state.cash;
+    state.cash = Math.min(UW_MAX_CASH, before + payout);
+    const net = state.cash - before - session.wager;
+    state.houseNet = uwInt(state.houseNet + net, -UW_MAX_CASH, UW_MAX_CASH, 0);
+    session.status = status;
+    state.blackjack = null;
+    return { ok: true, session, status, payout, net, playerTotal: uwCardValue(session.player), dealerTotal: uwCardValue(session.dealer) };
+}
+function uwStartBlackjack(state, { bet = 0, rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!wager || state.blackjack) return { ok: false, reason: state?.blackjack ? 'active_hand' : 'invalid_bet' };
+    const deck = Array.from({ length: 52 }, (_, index) => index);
+    for (let i = deck.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(rng() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    const session = { wager, deck, player: [deck.pop()], dealer: [deck.pop()], status: 'playing' };
+    session.player.push(deck.pop());
+    session.dealer.push(deck.pop());
+    state.cash -= wager;
+    const playerTotal = uwCardValue(session.player);
+    const dealerTotal = uwCardValue(session.dealer);
+    if (dealerTotal === 21) return uwFinishBlackjack(state, session, playerTotal === 21 ? 'push' : 'loss', playerTotal === 21 ? wager : 0);
+    if (playerTotal === 21) return uwFinishBlackjack(state, session, 'blackjack', Math.floor(wager * 2.5));
+    state.blackjack = session;
+    return { ok: true, session, playerTotal, status: 'playing', payout: 0 };
+}
+function uwBlackjackAction(state, session, action) {
+    if (!state || !session || state.blackjack !== session || session.status !== 'playing') return { ok: false, reason: 'finished' };
+    if (action === 'double' && (session.player.length !== 2 || session.wager > state.cash || session.wager * 2 > UW_MAX_CASH)) {
+        return { ok: false, reason: 'insufficient_cash' };
+    }
+    if (action === 'hit' || action === 'double') {
+        if (action === 'double') {
+            state.cash -= session.wager;
+            session.wager *= 2;
+        }
+        session.player.push(session.deck.pop());
+        const playerTotal = uwCardValue(session.player);
+        if (playerTotal > 21) return uwFinishBlackjack(state, session, 'bust', 0);
+        if (action === 'hit' && playerTotal !== 21) return { ok: true, session, status: 'playing', playerTotal, payout: 0 };
+    }
+    while (uwCardValue(session.dealer) < 17) session.dealer.push(session.deck.pop());
+    const playerTotal = uwCardValue(session.player);
+    const dealerTotal = uwCardValue(session.dealer);
+    const win = dealerTotal > 21 || playerTotal > dealerTotal;
+    const push = dealerTotal === playerTotal;
+    return uwFinishBlackjack(state, session, win ? 'win' : push ? 'push' : 'loss', win ? session.wager * 2 : push ? session.wager : 0);
+}
+
+const UW_SLOT_SYMBOLS = Object.freeze(['🍒', '🔔', '💎', '7️⃣', '🃏']);
+const UW_SLOT_TRIPLES = Object.freeze([5, 6, 6, 40, 15]);
+function uwPlaySlots(state, { bet = 0, rng = uwDefaultRng } = {}) {
+    const wager = uwWager(state, bet);
+    if (!wager) return { ok: false, reason: 'invalid_bet' };
+    const draws = Array.from({ length: 3 }, () => Math.floor(rng() * UW_SLOT_SYMBOLS.length));
+    const counts = UW_SLOT_SYMBOLS.map((_, i) => draws.filter(draw => draw === i).length);
+    const triple = counts.indexOf(3);
+    const pair = counts.indexOf(2);
+    // 5³ equiprobable draws: (72 from triples + 48 from stake-returning pairs) / 125 = 96%.
+    const payout = wager * (triple >= 0 ? UW_SLOT_TRIPLES[triple] : pair >= 0 && pair !== 4 ? 1 : 0);
+    uwSettle(state, payout - wager);
+    return { ok: true, reels: draws.map(i => UW_SLOT_SYMBOLS[i]), payout, net: payout - wager, win: payout > wager };
+}
+function uwStoryWager(state, stake, rng = uwDefaultRng) {
+    const choice = { truth: 'answer one question honestly', wish: 'honor one fair wish', secret: 'reveal one guarded secret' };
+    if (!Object.hasOwn(choice, stake) || state.wagerCooldown || state.pendingWorldEvent) return { ok: false, reason: 'busy_event' };
+    const win = rng() < 0.5;
+    const loser = win ? '{{char}}' : '{{user}}';
+    const winner = win ? '{{user}}' : '{{char}}';
+    uwSetPendingWorldEvent(state, `[Stakes won: ${loser} lost to ${winner} and should ${choice[stake]}.]`, { kind: 'wager' });
+    state.wagerCooldown = 3;
+    return { ok: true, win };
+}
+function uwTakeLoan(state, amount) {
+    const value = Number(amount);
+    if (!state || !Number.isSafeInteger(value) || value <= 0 || state.debt + value > 5_000
+        || state.cash + value > UW_MAX_CASH) return { ok: false, reason: 'invalid_amount' };
+    state.cash += value;
+    state.debt += value;
+    return { ok: true, amount: value, debt: state.debt };
+}
+function uwPawnCollateral(state, item, { skin = 'crime', charName = '', userName = '', companions = [] } = {}) {
+    if (!state || state.collateral.length >= UW_MAX_COLLATERAL) return { ok: false, reason: 'limit' };
+    const label = uwSafeCollateralLabel(item?.label, { charName, userName, companions });
+    if (!label) return { ok: false, reason: 'unsafe_label' };
+    const presetKey = UW_COLLATERAL_PRESETS[skin]?.includes(item?.presetKey) ? item.presetKey : '';
+    const kind = item?.kind === 'inventory' ? 'inventory' : presetKey ? 'preset' : 'custom';
+    if (state.collateral.some(entry => entry.presetKey && entry.presetKey === presetKey
+        || entry.label.toLowerCase() === label.toLowerCase())) return { ok: false, reason: 'already_pawned' };
+    const value = item?.pawnValue === undefined && presetKey ? UW_PRESET_VALUES[presetKey] : Number(item?.pawnValue);
+    const loans = state.collateral.reduce((sum, entry) => sum + (entry.status === 'pawned' ? entry.pawnValue : 0), 0);
+    if (!Number.isSafeInteger(value) || value < 1 || loans + value > 50_000
+        || state.cash + value > UW_MAX_CASH || state.debt + value > UW_MAX_CASH) return { ok: false, reason: 'invalid_value' };
+    const entry = {
+        id: `pawn-${Date.now().toString(36)}-${Math.floor(uwDefaultRng() * 0xffffffff).toString(36)}`,
+        kind,
+        presetKey,
+        label,
+        ...(kind === 'inventory'
+            ? { inventoryLabel: String(item.inventoryLabel || item.label || label).replace(/[<>]/g, '').trim().slice(0, 80) }
+            : {}),
+        pawnValue: value,
+        redeemCost: Math.ceil(value * 1.15),
+        dueInTurns: 6,
+        status: 'pawned',
+    };
+    state.collateral.push(entry);
+    state.cash += value;
+    state.debt += value;
+    return { ok: true, collateral: entry };
+}
+function uwPawnInventoryItem(uwState, userInventory, itemLabel, pawnValue = 250, opts = {}) {
+    if (pawnValue && typeof pawnValue === 'object') {
+        opts = pawnValue;
+        pawnValue = opts.pawnValue ?? 250;
+    }
+    if (!Array.isArray(userInventory)) return { ok: false, reason: 'not_in_inventory' };
+    const needle = String(itemLabel ?? '').trim();
+    if (!needle) return { ok: false, reason: 'not_in_inventory' };
+    let invIdx = userInventory.findIndex(entry => String(entry ?? '').trim() === needle);
+    if (invIdx < 0) {
+        invIdx = userInventory.findIndex(entry => String(entry ?? '').trim().toLowerCase() === needle.toLowerCase());
+    }
+    if (invIdx < 0) return { ok: false, reason: 'not_in_inventory' };
+    const exactLabel = String(userInventory[invIdx] ?? '').trim().slice(0, 80);
+    const res = uwPawnCollateral(uwState, {
+        kind: 'inventory',
+        label: exactLabel,
+        inventoryLabel: exactLabel,
+        pawnValue,
+    }, opts);
+    if (!res.ok) return res;
+    userInventory.splice(invIdx, 1);
+    return res;
+}
+
+function uwDebtClosed(state) {
+    state.turnsInDebt = 0;
+    if (state.eventKind === 'debt') uwConsumeWorldEvent(state);
+}
+function uwRedeemCollateral(state, id, userInventory) {
+    const idx = state?.collateral.findIndex(item => item.id === String(id)) ?? -1;
+    if (idx < 0) return { ok: false, reason: 'not_found' };
+    const item = state.collateral[idx];
+    const principal = Math.min(state.debt, item.pawnValue);
+    const cost = item.redeemCost - item.pawnValue + principal;
+    if (item.status !== 'pawned' || state.cash < cost) return { ok: false, reason: 'not_redeemable' };
+    state.cash -= cost;
+    state.debt -= principal;
+    if (!state.debt) uwDebtClosed(state);
+    state.collateral.splice(idx, 1);
+    if (Array.isArray(userInventory) && item.kind === 'inventory') {
+        const restored = String(item.inventoryLabel || item.label || '').trim().slice(0, 80);
+        if (restored) userInventory.push(restored);
+    }
+    return { ok: true, item };
+}
+function uwSetPendingWorldEvent(state, event, { kind = '', maxTokens = 25 } = {}) {
+    if (!state || state.pendingWorldEvent) return false;
+    const clean = String(event ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, 200);
+    const text = ctxPack({ worldEvent: clean, maxTokens }).depth0;
+    if (!text) return false;
+    state.pendingWorldEvent = text;
+    state.eventKind = kind;
+    return true;
+}
+function uwConsumeWorldEvent(state) {
+    state.pendingWorldEvent = '';
+    state.eventKind = '';
+}
+function uwOnTurnCommitted(state, { rng = uwDefaultRng, skin = 'crime', t = key => key } = {}) {
+    if (!state) return [];
+    const events = [];
+    state.wagerCooldown = Math.max(0, state.wagerCooldown - 1);
+    if (state.turnsSinceEvent < 4) state.turnsSinceEvent += 1;
+    if (state.debt > 0) {
+        const debtTurn = state.turnsInDebt + 1;
+        state.turnsInDebt = Math.min(debtTurn, 999);
+        if (debtTurn % 3 === 0) state.debt = Math.min(UW_MAX_CASH, Math.ceil(state.debt * 115 / 100));
+        if (debtTurn <= 2 || debtTurn % 3 === 0) {
+            state.collectorNotices = state.collectorNotices % 3 + 1;
+            const author = t(`uw.collector.${skin}`);
+            const text = t('uw.collectorNotice', { debt: state.debt, currency: state.currency });
+            events.push({ kind: 'dm', author, text });
+            if (state.collectorNotices === 3) events.push({
+                kind: 'voice', author, text: t('uw.collectorVoice'),
+                mediaPrompt: `Read in a stern, cold voice: ${text}`,
+            });
+        }
+    }
+    for (const item of state.collateral) {
+        if (item.status !== 'pawned') continue;
+        if (state.debt > 0) item.dueInTurns = Math.max(0, item.dueInTurns - 1);
+        if (item.dueInTurns === 0) {
+            item.status = 'foreclosed';
+            state.debt = Math.max(0, state.debt - item.pawnValue);
+            events.push({ kind: 'note', author: t('uw.pawn'), text: t('uw.foreclosure', { item: item.label }) });
+        }
+    }
+    if (!state.debt) uwDebtClosed(state);
+    if (state.debt > 0 && !state.pendingWorldEvent && state.turnsSinceEvent >= 4) {
+        const turn = state.turnsInDebt;
+        const event = turn >= 5
+            ? (rng() < 0.45 ? '[World Event: debt enforcers confront {{user}} and demand immediate payment.]' : '')
+            : turn >= 3 ? UW_WORLD_EVENTS[skin] : '';
+        if (turn >= 5 || event) state.turnsSinceEvent = 0;
+        if (event) uwSetPendingWorldEvent(state, event, { kind: 'debt' });
+    }
+    return events.slice(0, 2);
+}
+function uwPayDebt(state, amount = Infinity) {
+    const requested = amount === Infinity ? state?.debt : Number(amount);
+    const paid = Math.min(state?.cash, state?.debt, requested);
+    if (!Number.isSafeInteger(paid) || paid <= 0) return { ok: false, reason: 'invalid_amount' };
+    state.cash -= paid;
+    state.debt -= paid;
+    if (!state.debt) uwDebtClosed(state);
+    return { ok: true, paid, remaining: state.debt };
+}
+function uwContextLine(state) {
+    if (!state) return '';
+    const continuity = uwContinuityLine(state);
+    if (!continuity && !state.pendingWorldEvent) return '';
+    const packed = ctxPack({ scene: continuity, worldEvent: state.pendingWorldEvent || '', maxTokens: 25 });
+    return [packed.main, packed.depth0].filter(Boolean).join('\n');
+}
+
+// Compact single continuity line (<= 25 tokens) used by prompts/host adapters when
+// pendingWorldEvent is placed at depth 0 separately (never duplicated in scene).
+function uwContinuityLine(state) {
+    if (!state || typeof state !== 'object') return '';
+    const debt = Math.round(Number(state.debt) || 0);
+    const heat = Math.round(Math.max(0, Math.min(5, Number(state.heat) || 0)) * 4) / 4;
+    const standing = Math.round(Number(state.standing) || 0);
+    const factions = Array.isArray(state.factions) ? state.factions : [];
+    const hostileObj = factions.find(f => f && Number(f.rep) <= -50 && String(f.name || '').trim());
+    const friendly = standing >= 50 || factions.some(f => f && Number(f.rep) >= 60);
+    if (debt <= 0 && heat <= 0 && Math.abs(standing) < 25 && !hostileObj && !friendly) return '';
+
+    const cleanHostile = hostileObj
+        ? String(hostileObj.name).replace(/[\r\n[\],;]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : '';
+    const build = (prefix, sep, maxHostileChars) => {
+        const bits = [];
+        if (debt > 0) bits.push(`debt ${debt}`);
+        if (heat > 0) bits.push(`wanted ${Number(heat.toFixed(2))}★`);
+        if (Math.abs(standing) >= 25) bits.push(`standing ${standing > 0 ? '+' : ''}${standing}`);
+        if (cleanHostile) bits.push(`hostile faction ${cleanHostile.slice(0, maxHostileChars).trim()}`);
+        if (friendly) bits.push('friendly NPCs');
+        return prefix ? `[${prefix}: ${bits.join(sep)}]` : `[${bits.join(sep)}]`;
+    };
+    const layouts = [['Underworld', ', '], ['UW', ', '], ['', ',']];
+    if (!cleanHostile) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, 0);
+            if (tnEstimateTokens(line) <= 25) return line;
+        }
+        return build('', ',', 0);
+    }
+    const fullCap = Math.min(28, cleanHostile.length);
+    for (const [prefix, sep] of layouts) {
+        const fullLine = build(prefix, sep, fullCap);
+        if (tnEstimateTokens(fullLine) <= 25) return fullLine;
+    }
+    for (let cap = fullCap - 1; cap >= 3; cap -= 1) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, cap);
+            if (tnEstimateTokens(line) <= 25) return line;
+        }
+    }
+    return build('', ',', 3);
+}
+
+// --- src/core/reputation.js ---
+// U3: local wanted/standing/faction mechanics. No network calls are performed here.
+const REP_MAX_HEAT = 5;
+const REP_WORLD_EVENTS = Object.freeze({
+    crime: {
+        tail: '[World Event: plainclothes officers discreetly tailing {{user}} due to local heat]',
+        raid: '[World Event: patrol officers intercept {{user}} after a spike in local heat]',
+        faction: '[World Event: rival gang members recognize {{user}} in the current location]',
+    },
+    tavern: {
+        tail: '[World Event: city watch quietly follows {{user}} after rumors spread through the district]',
+        raid: '[World Event: the town guard blocks {{user}}\'s route and demands answers]',
+        faction: '[World Event: hostile guild agents cross paths with {{user}} in the current tavern]',
+    },
+    syndicate: {
+        tail: '[World Event: surveillance drones shadow {{user}} after a local heat spike]',
+        raid: '[World Event: corporate security intercepts {{user}} for a compliance sweep]',
+        faction: '[World Event: hostile syndicate operatives identify {{user}} in the current sector]',
+    },
+});
+const REP_SERVICES = Object.freeze({
+    clearHeat: { cost: 180, heat: -2 },
+    npcDossier: { cost: 260, heat: 0 },
+    muscle: { cost: 320, heat: 0 },
+});
+
+function repClamp(value, min, max, fallback = min) {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+}
+function repNormalizeFactions(raw) {
+    const out = [];
+    const seen = new Set();
+    for (const [index, item] of (Array.isArray(raw) ? raw : []).entries()) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id || `faction-${index + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `faction-${index + 1}`;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, name: String(item.name || 'Faction').replace(/[<>]/g, '').trim().slice(0, 48), rep: Math.round(repClamp(item.rep, -100, 100, 0)) });
+        if (out.length >= 4) break;
+    }
+    return out;
+}
+function repNormalizeState(state) {
+    const target = state && typeof state === 'object' ? state : {};
+    // Heat changes are quarter-star increments (services and small local
+    // consequences use ±0.25★).  Rounding to halves silently erased those
+    // changes, so keep the smallest unit promised by the tracker contract.
+    target.heat = Math.round(repClamp(target.heat, 0, REP_MAX_HEAT, 0) * 4) / 4;
+    target.standing = Math.round(repClamp(target.standing, -100, 100, 0));
+    target.factions = repNormalizeFactions(target.factions);
+    target.turnsSinceEvent = Math.max(0, Math.trunc(Number(target.turnsSinceEvent) || 0));
+    return target;
+}
+function repApplyWorldDelta(state, worldDelta) {
+    if (!state || !worldDelta || typeof worldDelta !== 'object') return state;
+    repNormalizeState(state);
+    const heatDelta = repClamp(worldDelta.heatDelta, -2, 3, 0);
+    const standingDelta = Math.round(repClamp(worldDelta.standingDelta, -25, 25, 0));
+    state.heat = Math.round(repClamp(state.heat + heatDelta, 0, REP_MAX_HEAT, 0) * 4) / 4;
+    state.standing = Math.round(repClamp(state.standing + standingDelta, -100, 100, 0));
+    const faction = worldDelta.faction;
+    if (faction && typeof faction === 'object' && String(faction.name || '').trim()) {
+        const name = String(faction.name).replace(/[<>]/g, '').trim().slice(0, 48);
+        const delta = Math.round(repClamp(faction.delta, -30, 30, 0));
+        let found = state.factions.find(item => item.name.toLowerCase() === name.toLowerCase());
+        if (!found && state.factions.length < 4) {
+            found = { id: `faction-${Date.now().toString(36)}`, name, rep: 0 };
+            state.factions.push(found);
+        }
+        if (found) found.rep = Math.round(repClamp(found.rep + delta, -100, 100, 0));
+    }
+    return state;
+}
+function repCoolHeat(state, { calmTurn = true, advanceTurn = true } = {}) {
+    if (!state) return state;
+    repNormalizeState(state);
+    // Underworld's turn hook owns the shared turnsSinceEvent counter. Callers
+    // that run both hooks pass advanceTurn:false to avoid a double tick.
+    if (advanceTurn) state.turnsSinceEvent += 1;
+    if (calmTurn && state.turnsSinceEvent % 3 === 0) state.heat = Math.max(0, Math.round((state.heat - 0.25) * 4) / 4);
+    return state;
+}
+function repRollWorldEvent(state, { rng = Math.random, skin = 'crime' } = {}) {
+    if (!state) return { event: '', kind: '' };
+    repNormalizeState(state);
+    const pack = REP_WORLD_EVENTS[skin] || REP_WORLD_EVENTS.crime;
+    if (state.turnsSinceEvent < 4) return { event: '', kind: '' };
+    if (state.heat >= 4 && rng() < 0.5) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.raid, kind: 'heat' };
+    }
+    if (state.heat >= 2 && rng() < 0.3) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.tail, kind: 'heat' };
+    }
+    if (state.factions.some(f => f.rep <= -50) && rng() < 0.3) {
+        state.turnsSinceEvent = 0;
+        return { event: pack.faction, kind: 'faction' };
+    }
+    return { event: '', kind: '' };
+}
+function repImportFactions(state, rows, { skin = 'crime' } = {}) {
+    if (!state) return [];
+    const names = Array.isArray(rows) ? rows : [];
+    const fallback = skin === 'tavern' ? ['Городская стража', 'Гильдия', 'Культ'] : skin === 'syndicate' ? ['Корпоративная СБ', 'Синдикат', 'Сопротивление'] : ['Оперативники', 'Уличная банда', 'Решалы'];
+    const source = names.length ? names : fallback.map(name => ({ name }));
+    state.factions = repNormalizeFactions(source.map((row, idx) => ({ id: row.id || `faction-${idx + 1}`, name: row.name || row.title || row.label, rep: row.rep || 0 })));
+    return state.factions;
+}
+function repUseService(state, serviceId, { target = '', skin = 'crime' } = {}) {
+    if (!state) return { ok: false, reason: 'state_required' };
+    repNormalizeState(state);
+    const service = REP_SERVICES[serviceId];
+    if (!service) return { ok: false, reason: 'unknown_service' };
+    if (Number(state.cash) < service.cost) return { ok: false, reason: 'insufficient_cash', cost: service.cost };
+    state.cash -= service.cost;
+    if (serviceId === 'clearHeat') {
+        state.heat = Math.max(0, Math.round((state.heat + service.heat) * 4) / 4);
+        return { ok: true, serviceId, cost: service.cost, event: `[World Event: a ${skin} fixer quietly erases traces and lowers {{user}}'s wanted heat]` };
+    }
+    if (serviceId === 'npcDossier') {
+        return { ok: true, serviceId, cost: service.cost, target: String(target || 'current NPC').slice(0, 80), dossierRequested: true };
+    }
+    return { ok: true, serviceId, cost: service.cost, event: `[World Event: hired ${skin === 'tavern' ? 'mercenaries' : skin === 'syndicate' ? 'a cyber-team' : 'muscle'} move against ${String(target || 'the current target').slice(0, 70)}]` };
+}
+function repContextLine(state) {
+    if (!state || (Number(state.heat) <= 0 && Math.abs(Number(state.standing) || 0) < 25)) return '';
+    const bits = [];
+    if (Number(state.heat) > 0) bits.push(`wanted ${Number(state.heat).toFixed(1)}★`);
+    if (Number(state.standing)) bits.push(`standing ${Number(state.standing) > 0 ? '+' : ''}${Math.round(Number(state.standing))}`);
+    const hostile = Array.isArray(state.factions) ? state.factions.filter(f => Number(f.rep) <= -50).slice(0, 1) : [];
+    if (hostile.length) bits.push(`hostile faction ${String(hostile[0].name).slice(0, 28)}`);
+    return `[Reputation continuity: ${bits.join(', ')}]`.slice(0, 180);
+}
+
 // --- src/core/physiology.js ---
+// The Tavo classic-bundle compatibility test intentionally strips imports from
+// a small legacy core set. Keep a tiny, dependency-free fallback so that the
+// physiology module remains executable in that reduced bundle while ESM and Tavo
+// bundles use the real direct exports above (no `import ... as` aliases!).
+function physUwMaxCash() {
+    return typeof UW_MAX_CASH === 'number' ? UW_MAX_CASH : 999_999_999;
+}
+
+function physIsValidEggSkin(skinId) {
+    const clean = String(skinId ?? '').trim();
+    if (!clean) return false;
+    if (typeof EGG_SKINS !== 'undefined' && Array.isArray(EGG_SKINS)) {
+        return EGG_SKINS.some(skin => skin.id === clean);
+    }
+    return false;
+}
+
+function physUwCreateState(...args) {
+    if (typeof uwCreateState === 'function') return uwCreateState(...args);
+    const options = args[0] && typeof args[0] === 'object' ? args[0] : {};
+    return {
+        skin: 'auto', currency: String(options.currency || '$').slice(0, 8),
+        cash: Math.max(0, Math.trunc(Number(options.cash ?? 500) || 500)),
+        debt: 0, turnsInDebt: 0, collateral: [], houseNet: 0, heat: 0,
+        standing: 0, factions: [], turnsSinceEvent: 4, pendingWorldEvent: '',
+        eventKind: '', calmTurns: 0, wagerCooldown: 0, collectorNotices: 0,
+        allyTurns: 0, blackjack: null,
+    };
+}
+
+function physUwNormalizeState(raw) {
+    if (typeof uwNormalizeState === 'function') return uwNormalizeState(raw);
+    const base = physUwCreateState();
+    if (!raw || typeof raw !== 'object') return base;
+    return { ...base, ...raw, collateral: Array.isArray(raw.collateral) ? raw.collateral.slice(0, 6) : [], factions: Array.isArray(raw.factions) ? raw.factions.slice(0, 4) : [] };
+}
+
+function physRepNormalizeState(state) {
+    if (typeof repNormalizeState === 'function') return repNormalizeState(state);
+    return state;
+}
+
+function physRepApplyWorldDelta(state, delta) {
+    if (typeof repApplyWorldDelta === 'function') return repApplyWorldDelta(state, delta);
+    return state;
+}
 const BIO_MODES = Object.freeze(['none', 'cycle', 'omegaverse', 'oviposition']);
 const DISCLOSURE_MODES = Object.freeze(['modern', 'medieval', 'omniscient']);
 const CONTRACEPTION_TYPES = Object.freeze(['none', 'barrier', 'oral', 'iud', 'infertile']);
@@ -1796,10 +2700,84 @@ function createChatState(initialDate = '2026-09-01') {
             turnsSinceAutoImage: 0,
             lastAudioPath: '',
         },
+        // U1-U3: chat-scoped wallet, debt, wanted heat, standing and factions.
+        // Global gacha/relic entitlements are deliberately kept outside this object.
+        underworld: physUwCreateState(),
         codexHistory: [], // [{ role: 'user'|'assistant', content, preset, model, at }]
         activityLog: [],  // [{ atDate, summary }]
         checkpoints: [],  // [{ key, snapshot }]
     };
+}
+function normalizeEntity(src, role = 'char') {
+    const cleanRole = role === 'user' ? 'user' : 'char';
+    const dst = createEntityState(cleanRole);
+    if (!src || typeof src !== 'object') return dst;
+    dst.enabled = src.enabled !== false;
+    if (src.vitals && typeof src.vitals === 'object') {
+        dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
+        dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
+        dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
+            ? src.vitals.respiration : 'steady';
+        dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
+            ? src.vitals.circulation : 'normal';
+        dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
+        dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
+        dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
+        dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
+            id: String(w.id || Math.random().toString(36).slice(2, 8)),
+            label: String(w.label ?? '').slice(0, 100),
+            bleeding: Boolean(w.bleeding),
+            severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
+            daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
+        })).filter(w => w.label) : [];
+    }
+    if (src.bio && typeof src.bio === 'object') {
+        const b = src.bio;
+        dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
+        dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
+        dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
+        dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
+        dst.bio.pregnant = Boolean(b.pregnant);
+        dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
+        dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
+        dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
+        dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
+            ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
+        dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
+        dst.bio.testTaken = Boolean(b.testTaken);
+        dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
+        dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
+        dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
+        dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
+        dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
+        dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
+        dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
+        dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
+        dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
+        dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
+        dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
+        dst.bio.carryingClutch = Boolean(b.carryingClutch);
+        dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
+        dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
+        dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
+        dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
+        dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
+        dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
+        if (b.nest && typeof b.nest === 'object') {
+            dst.bio.nest.active = Boolean(b.nest.active);
+            dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
+            dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
+                id: String(egg?.id || `egg-${idx + 1}`),
+                shell: SHELL_TRAITS.includes(egg?.shell) ? egg.shell : 'healthy',
+                gender: egg?.gender === 'male' ? 'male' : 'female',
+                daysIncubated: Math.max(0, Number(egg?.daysIncubated) || 0),
+                targetDays: Math.round(clamp(Number(egg?.targetDays) || 60, 14, 120)),
+                cracked: Boolean(egg?.cracked),
+                ...(physIsValidEggSkin(egg?.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
+            })) : [];
+        }
+    }
+    return dst;
 }
 function normalizeChatState(raw) {
     const base = createChatState();
@@ -1820,6 +2798,8 @@ function normalizeChatState(raw) {
         out.world.slopRule = String(raw.world.slopRule ?? '').replace(/\s+/g, ' ').trim().slice(0, 600);
     }
     out.turnExtras = normalizeTurnExtras(raw.turnExtras);
+    out.underworld = physUwNormalizeState(raw.underworld);
+    physRepNormalizeState(out.underworld);
     if (raw.counters && typeof raw.counters === 'object') {
         out.counters.turnsSinceLastPhone = physCounter(raw.counters.turnsSinceLastPhone, PHYS_PHONE_EVERY);
         out.counters.turnsSinceWiki = physCounter(raw.counters.turnsSinceWiki, 0);
@@ -1828,71 +2808,7 @@ function normalizeChatState(raw) {
     for (const key of ['user', 'char']) {
         const src = raw.entities?.[key];
         if (!src || typeof src !== 'object') continue;
-        const dst = out.entities[key];
-        dst.enabled = src.enabled !== false;
-        if (src.vitals && typeof src.vitals === 'object') {
-            dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
-            dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
-            dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
-                ? src.vitals.respiration : 'steady';
-            dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
-                ? src.vitals.circulation : 'normal';
-            dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
-            dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
-            dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
-            dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
-                id: String(w.id || Math.random().toString(36).slice(2, 8)),
-                label: String(w.label ?? '').slice(0, 100),
-                bleeding: Boolean(w.bleeding),
-                severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
-                daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
-            })).filter(w => w.label) : [];
-        }
-        if (src.bio && typeof src.bio === 'object') {
-            const b = src.bio;
-            dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
-            dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
-            dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
-            dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
-            dst.bio.pregnant = Boolean(b.pregnant);
-            dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
-            dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
-            dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
-            dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
-                ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
-            dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
-            dst.bio.testTaken = Boolean(b.testTaken);
-            dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
-            dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
-            dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
-            dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
-            dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
-            dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
-            dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
-            dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
-            dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
-            dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
-            dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
-            dst.bio.carryingClutch = Boolean(b.carryingClutch);
-            dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
-            dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
-            dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
-            dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
-            dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
-            dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
-            if (b.nest && typeof b.nest === 'object') {
-                dst.bio.nest.active = Boolean(b.nest.active);
-                dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
-                dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
-                    id: String(egg.id || `egg-${idx + 1}`),
-                    shell: SHELL_TRAITS.includes(egg.shell) ? egg.shell : 'healthy',
-                    gender: egg.gender === 'male' ? 'male' : 'female',
-                    daysIncubated: Math.max(0, Number(egg.daysIncubated) || 0),
-                    targetDays: Math.round(clamp(Number(egg.targetDays) || 60, 14, 120)),
-                    cracked: Boolean(egg.cracked),
-                })) : [];
-            }
-        }
+        out.entities[key] = normalizeEntity(src, key);
     }
     if (Array.isArray(raw.offspring)) {
         out.offspring = raw.offspring.slice(0, 40).map((child, idx) => ({
@@ -1903,6 +2819,7 @@ function normalizeChatState(raw) {
             gender: child.gender === 'male' ? 'male' : 'female',
             bornDate: String(child.bornDate || out.world.rpDate),
             notes: String(child.notes ?? '').slice(0, 140),
+            ...(physIsValidEggSkin(child?.eggSkin) ? { eggSkin: child.eggSkin } : {}),
         }));
     }
     if (Array.isArray(raw.companions)) {
@@ -2151,6 +3068,30 @@ function layEggs(entity, state, count = null) {
     logEvent(state, `${entity.role}: laid ${toLay} egg(s)`);
     return toLay;
 }
+function equipNestEggSkin(bio, eggIndex, skinId, unlockedEggSkins = []) {
+    const targetBio = bio?.nest && Array.isArray(bio.nest.eggs)
+        ? bio
+        : (bio?.bio?.nest && Array.isArray(bio.bio.nest.eggs) ? bio.bio : null);
+    if (!targetBio) return { ok: false, reason: 'egg_not_found', egg: null };
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!physIsValidEggSkin(cleanSkin)) return { ok: false, reason: 'invalid_skin', egg: null };
+    const unlocked = Array.isArray(unlockedEggSkins)
+        ? unlockedEggSkins
+        : unlockedEggSkins instanceof Set
+            ? [...unlockedEggSkins]
+            : Array.isArray(unlockedEggSkins?.unlockedEggSkins)
+                ? unlockedEggSkins.unlockedEggSkins
+                : [];
+    if (!unlocked.map(String).includes(cleanSkin)) return { ok: false, reason: 'skin_locked', egg: null };
+    const eggs = targetBio.nest.eggs;
+    const idx = typeof eggIndex === 'number' || /^\d+$/.test(String(eggIndex ?? ''))
+        ? Math.trunc(Number(eggIndex))
+        : eggs.findIndex(item => item && item.id === String(eggIndex));
+    const egg = idx >= 0 && idx < eggs.length ? eggs[idx] : null;
+    if (!egg) return { ok: false, reason: 'egg_not_found', egg: null };
+    egg.eggSkin = cleanSkin;
+    return { ok: true, egg };
+}
 function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
     const { bio } = entity;
     if (!bio.nest.active || !bio.nest.eggs.length) return [];
@@ -2166,6 +3107,7 @@ function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
                 gender: egg.gender,
                 bornDate: state.world.rpDate,
                 notes: `Hatched (${egg.shell})`,
+                ...(physIsValidEggSkin(egg.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
             };
             state.offspring.push(hatchling);
             hatched.push(hatchling);
@@ -2577,8 +3519,10 @@ function physApplyTurnExtras(state, delta, turnKey) {
         state.counters.turnsSinceLastPhone = 0;
     }
 }
-function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng } = {}) {
+function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng, saveCheckpoint: persistCheckpoint = true } = {}) {
     if (!delta || typeof delta !== 'object') return state;
+    if (!state.underworld || typeof state.underworld !== 'object') state.underworld = physUwCreateState();
+    state.underworld = physUwNormalizeState(state.underworld);
 
     let forwardDays = Math.max(0, Math.trunc(Number(delta.daysElapsed) || 0));
     if (delta.newRpDate) {
@@ -2700,6 +3644,19 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
         }
     }
 
+    // U3 world delta is optional and lives in the same tracker response; it is
+    // clamped by repApplyWorldDelta so a malformed/overly enthusiastic model
+    // cannot mint money or jump the wanted meter in one turn.
+    if (delta.worldDelta && typeof delta.worldDelta === 'object') {
+        if (Number.isFinite(Number(delta.worldDelta.cashDelta))) {
+            const maxCash = physUwMaxCash();
+            const cashDelta = Math.trunc(Math.min(50_000, Math.max(-50_000, Number(delta.worldDelta.cashDelta))));
+            state.underworld.cash = Math.min(maxCash, Math.max(0, state.underworld.cash + cashDelta));
+            state.underworld.houseNet = Math.min(maxCash, Math.max(-maxCash, state.underworld.houseNet + cashDelta));
+        }
+        physRepApplyWorldDelta(state.underworld, delta.worldDelta);
+    }
+
     // Companion mood reaction to explicit delta or scene combat / stress atmosphere
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const hasExplicitMood = delta.companionMoodDelta !== undefined
@@ -2743,7 +3700,7 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
     // M3/M4/M5 bookkeeping: turnExtras (only when present) and counters. Phone/wiki stores are not touched here.
     physApplyTurnExtras(state, delta, String(checkpointKey || ''));
 
-    if (checkpointKey) saveCheckpoint(state, checkpointKey);
+    if (checkpointKey && persistCheckpoint) saveCheckpoint(state, checkpointKey);
     return state;
 }
 function getVisibleBiologySummary(entity, disclosureMode = 'modern') {
@@ -2781,6 +3738,69 @@ function logEvent(state, summary) {
 }
 
 // --- src/core/prompts.js ---
+function promptsEstimateTokens(text) {
+    const s = String(text ?? '');
+    if (!s) return 0;
+    let latin = 0;
+    let cyrillic = 0;
+    let other = 0;
+    for (let i = 0; i < s.length; i += 1) {
+        const c = s.charCodeAt(i);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7)) latin += 1;
+        else if (c >= 0x400 && c <= 0x4ff) cyrillic += 1;
+        else other += 1;
+    }
+    return Math.ceil(latin / 4 + cyrillic / 2.2 + other / 3);
+}
+
+// Keep the compact legacy bundle test (which strips underworld/reputation imports)
+// executable while using direct exported identifiers in full ESM & Tavo bundles.
+function promptsWorldContinuityLine(state) {
+    if (typeof uwContinuityLine === 'function') return uwContinuityLine(state);
+    if (!state || typeof state !== 'object') return '';
+    const debt = Math.round(Number(state.debt) || 0);
+    const heat = Math.round(Math.max(0, Math.min(5, Number(state.heat) || 0)) * 4) / 4;
+    const standing = Math.round(Number(state.standing) || 0);
+    const factions = Array.isArray(state.factions) ? state.factions : [];
+    const hostileObj = factions.find(f => f && Number(f.rep) <= -50 && String(f.name || '').trim());
+    const friendly = standing >= 50 || factions.some(f => f && Number(f.rep) >= 60);
+    if (debt <= 0 && heat <= 0 && Math.abs(standing) < 25 && !hostileObj && !friendly) {
+        return typeof repContextLine === 'function' ? '' : '';
+    }
+    const cleanHostile = hostileObj
+        ? String(hostileObj.name).replace(/[\r\n[\],;]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : '';
+    const build = (prefix, sep, maxHostileChars) => {
+        const bits = [];
+        if (debt > 0) bits.push(`debt ${debt}`);
+        if (heat > 0) bits.push(`wanted ${Number(heat.toFixed(2))}★`);
+        if (Math.abs(standing) >= 25) bits.push(`standing ${standing > 0 ? '+' : ''}${standing}`);
+        if (cleanHostile) bits.push(`hostile faction ${cleanHostile.slice(0, maxHostileChars).trim()}`);
+        if (friendly) bits.push('friendly NPCs');
+        return prefix ? `[${prefix}: ${bits.join(sep)}]` : `[${bits.join(sep)}]`;
+    };
+    const layouts = [['Underworld', ', '], ['UW', ', '], ['', ',']];
+    if (!cleanHostile) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, 0);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+        return build('', ',', 0);
+    }
+    const fullCap = Math.min(28, cleanHostile.length);
+    for (const [prefix, sep] of layouts) {
+        const fullLine = build(prefix, sep, fullCap);
+        if (promptsEstimateTokens(fullLine) <= 25) return fullLine;
+    }
+    for (let cap = fullCap - 1; cap >= 3; cap -= 1) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, cap);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+    }
+    return build('', ',', 3);
+}
+
 // Background turn-analysis response budget (v1.3, spec 10.4): critical tracker fields first,
 // then innerThought / suggestedActions, phoneEvents last, so truncation never hits the tracker core.
 const TRACKER_MAX_TOKENS = 1100;
@@ -2901,6 +3921,9 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
         lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
     }
 
+    const continuityLine = promptsWorldContinuityLine(state.underworld);
+    if (continuityLine) lines.push(continuityLine);
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -2967,7 +3990,8 @@ function buildTrackerExtractionMessages(state, recentMessages, {
         '    "char": { /* same fields as user */ }',
         '  },',
         `  "innerThought": "", // 1-2 sentences (max 160 chars) of what ${charName} privately thinks but did not say this turn; in the chat language; "" if unclear`,
-        `  "suggestedActions": ["", "", ""]${includePhone ? ',' : ''} // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "suggestedActions": ["", "", ""], // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "worldDelta": { "cashDelta": 0, "heatDelta": 0, "standingDelta": 0, "faction": { "name": "", "delta": 0 } }${includePhone ? ',' : ''} // optional explicit present-turn changes; clamp in client`,
         ...(includePhone ? [
             `  "phoneEvents": [] // 0-2 items ONLY if the story gives a natural reason (usually []): { "kind": "note" | "dm" | "feed" | "photo" | "voice", "author": "who wrote it", "text": "max 280 chars, in the chat language", "mediaPrompt": "short English visual/voice brief for photo/voice, else empty" } — ${charName}'s secret notes, messages to other NPCs, or how the world/forum/social feed reacts to ${userName}`,
         ] : []),
@@ -3829,6 +4853,10 @@ tavo.plugin.onSidebarAction('open-cradle', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-cradle' });
 });
 
+tavo.plugin.onSidebarAction('open-underworld', async () => {
+    tavo.plugin.emit('clodex-command', { action: 'open-underworld' });
+});
+
 tavo.plugin.onSidebarAction('open-phone', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-phone' });
 });
@@ -3906,7 +4934,14 @@ tavo.plugin.on('generation:prepare', async event => {
     }
     const slop = slopMode === 'inject' ? String(state.world?.slopRule ?? '') : '';
 
-    const packed = ctxPack({ director, scene, wiki, slop, maxTokens: ENTRY_CTX_MAX_TOKENS });
+    const packed = ctxPack({
+        director,
+        worldEvent: injectAllowed ? String(state.underworld?.pendingWorldEvent || '') : '',
+        scene,
+        wiki,
+        slop,
+        maxTokens: ENTRY_CTX_MAX_TOKENS,
+    });
     if (packed.main) {
         event.addContext({
             text: packed.main,

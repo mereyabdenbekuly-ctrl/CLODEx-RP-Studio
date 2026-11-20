@@ -135,6 +135,7 @@ export const DEFAULT_ST_SETTINGS = Object.freeze({
     injectContext: true,
     confirmPaid: true,
     maxAutoSpendUsd: 0.25,
+    rpPrefs: {},
     autoImageEvery: 0,
     bgDim: 35,
     hudPos: null,
@@ -158,6 +159,7 @@ export function loadStSettings(context) {
         injectContext: raw.injectContext !== false,
         confirmPaid: raw.confirmPaid !== false,
         maxAutoSpendUsd: normalizeMaxAutoSpend(raw.maxAutoSpendUsd),
+        rpPrefs: raw.rpPrefs && typeof raw.rpPrefs === 'object' ? structuredClone(raw.rpPrefs) : {},
         autoImageEvery: Math.max(0, Math.min(30, Number(raw.autoImageEvery) || 0)),
         bgDim: Math.max(0, Math.min(80, Number(raw.bgDim ?? 35))),
         hudPos: raw.hudPos && Number.isFinite(raw.hudPos.x) && Number.isFinite(raw.hudPos.y)
@@ -297,7 +299,14 @@ export async function initializeSillyTavern({
                 }
             }
             const slop = settings.slopMode === 'inject' ? String(chatState.world?.slopRule ?? '') : '';
-            packed = ctxPack({ director, scene, wiki, slop, maxTokens: ST_CTX_MAX_TOKENS });
+            packed = ctxPack({
+                director,
+                worldEvent: settings.injectContext ? String(chatState.underworld?.pendingWorldEvent || '') : '',
+                scene,
+                wiki,
+                slop,
+                maxTokens: ST_CTX_MAX_TOKENS,
+            });
         } catch (err) {
             globalThis.console?.warn?.('[CLODEx RP Studio] context assembly failed', err);
         }
@@ -480,6 +489,14 @@ export async function initializeSillyTavern({
             if (!ST_STORE_NAMES.includes(name)) throw new Error(`Unknown store: ${name}`);
             const raw = readStore(name);
             return raw ? structuredClone(raw) : null;
+        },
+        async loadRpPrefs() {
+            const raw = getContext().extensionSettings?.[ST_SETTINGS_KEY]?.rpPrefs;
+            return raw && typeof raw === 'object' ? structuredClone(raw) : null;
+        },
+        async saveRpPrefs(value) {
+            settings.rpPrefs = value && typeof value === 'object' ? structuredClone(value) : {};
+            getContext().saveSettingsDebounced?.();
         },
         async saveStore(name, value) {
             if (!ST_STORE_NAMES.includes(name)) throw new Error(`Unknown store: ${name}`);
@@ -716,6 +733,9 @@ export async function initializeSillyTavern({
         context.registerSlashCommand('clodex-forge', () => controller.openTab('forge'), [], 'Open CLODEx Character & Lorebook Forge', true, true);
         context.registerSlashCommand('clodex-speak', () => controller.speakLatestReply({ auto: false }), [], 'Speak latest character reply via CLODEx TTS', true, true);
         context.registerSlashCommand('clodex-phone', () => controller.openTab('phone'), [], 'Open CLODEx character phone / diary & world feed', true, true);
+        context.registerSlashCommand('clodex-casino', () => controller.openTab('underworld'), [], 'Open CLODEx Underworld casino & debt ledger', true, true);
+        context.registerSlashCommand('clodex-underworld', () => controller.openTab('underworld'), [], 'Open CLODEx Underworld tracker', true, true);
+        context.registerSlashCommand('clodex-gacha', () => controller.openTab('cradle'), [], 'Open CLODEx Altar & Relics', true, true);
         context.registerSlashCommand('clodex-wiki', () => controller.openTab('wiki'), [], 'Open CLODEx living session wiki', true, true);
         context.registerSlashCommand('clodex-director', () => controller.openTab('director'), [], 'Open CLODEx director panel (next reply modifiers)', true, true);
     }

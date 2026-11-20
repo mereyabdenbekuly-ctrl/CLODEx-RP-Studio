@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0 — 2026-11-20
+
+- **Underworld, Wanted & Relics («Подполье, Розыск и Реликвии»)** — full offline-first economy, shadow reputation, summoning altar, and cryptographically signed relic companions with strict FinOps and prompt-budget discipline:
+  - **Underworld Wallet, Casino & Story Wagers (`🧬 Tracker → 🎲 Underworld & Casino`)**: chat-scoped wallet, setting-aware skin selector (`Auto / Crime / Tavern / Syndicate`), visible Casino outcome display for **Dice (`2d6`)** (`Over 7 ×2`, `Under 7 ×2`, `Exact 7 ×4.5`, `Double ×5`), **3-Reel Slots** (`[ 🍒 | 🔔 | 💎 ]`), interactive **Blackjack (`21`)** (live player cards + total, dealer upcard + `[🂠]`, *Hit*, *Stand*, and *Double* on 2-card hands), and **Story Wagers with `{{char}}`** (*Truth / Wish / Secret* stakes arming one-turn depth-0 `[Stakes won: ...]` world events).
+  - **Pawn Shop, Inventory Pawning & Debt Escalation**: independent loan/pawn valuation, 1-click setting-themed property presets (*Apartment / Car / Business / Watch*, *Estate / Ancestral Blade / Artifact / Oath*, *Habitat Pod / Cyber Implant / Neurodeck / License* via `UW_PRESET_VALUES`), 1-click pawning and redemption of player inventory items (`state.inventory.user`), strict safety guard blocking character/companion names from collateral, collector DMs + turn-3 voice warning in `📱`, and foreclosure after 6 unpaid turns.
+  - **Wanted Stars (`0..5★`), Factions & Shadow Services**: visual 5-star heat meter, `-100..+100` standing, 1-click NPC faction import from Living Session Wiki (`wikiCache.npcs`), single combined continuity line (`≤ 25` tokens), and 3 skin-localized Shadow Services: *Erase Traces (`−2★`, `180`)*, *Black-Market NPC Dossier → `📱` (`260`, `confirmPaid`, auto-refunded if cancelled or failed)*, and *Call Enforcers / Mercenaries / Cyber-Team (`320`, arms next-turn world event)*.
+  - **Summoning Altar & 12 Collectible Egg Skins (`🐣 Cradle → 🥚 Altar & Skins`)**: story-cash summons (`50`) and optional paid CLODEx rituals (custom JSON lore + **Nano Banana** egg artwork with `confirmPaid`; paid rituals never alter rarity odds), Epic (`10`) & SSR (`30`) pity counters, localized `common..mythic` rarities and all 12 `EGG_SKINS`, egg preview cards (`artPath`, `mutationTrait`, `personality`, `prophecy`), and live unlocked-skin equipping across **Altar eggs**, **active Cradle companions**, and **Oviposition Nest eggs** (propagated on hatching).
+  - **ES256 Verified Relics (`🐣 Cradle → 💎 Relics`)**: offline WebCrypto `ECDSA P-256` (`ES256`) verification of server-signed `clodex.xyz` relic certificates (`rpr_*`), read-only `/v1/rp/relics/{catalog,inventory}` sync, offline PNG Character Card V2 signature verifier, mobile WebView-safe `<a target="_blank" rel="noopener noreferrer">` edition links + copy-link action, and automatic certificate attachment when graduating a verified relic companion in Character Forge.
+- **Mobile UI & Runtime Fixes**:
+  - Fixed strict-mode WebView `style` string attribute handling in `hud.js`, eliminated double `.clodex-rp-tab-body` padding on `Underworld`, `Altar`, and `Relics` sub-screens for `390px` mobile screens, added a compact HUD alert chip (`🚔 N★ · 💸 $Debt`) within `HUD_MAX_CHIPS = 4`, and fixed tracker prompt JSON schema commas when `includePhone === false`.
+
 ## 1.3.1 — 2026-11-19
 
 - **Mobile Tavo AI WebView Hotfix**:

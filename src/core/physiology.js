@@ -1,5 +1,55 @@
 import { advanceCompanionsDays, COMPANION_ARCHETYPES, createCompanionFromArchetype, normalizeCompanion } from './companion.js';
 import { addDaysToIso, diffDaysForward, parseIsoDate, TIME_SLOTS } from './date.js';
+import { EGG_SKINS } from './gacha.js';
+import { UW_MAX_CASH, uwCreateState, uwNormalizeState } from './underworld.js';
+import { repApplyWorldDelta, repNormalizeState } from './reputation.js';
+
+// The Tavo classic-bundle compatibility test intentionally strips imports from
+// a small legacy core set. Keep a tiny, dependency-free fallback so that the
+// physiology module remains executable in that reduced bundle while ESM and Tavo
+// bundles use the real direct exports above (no `import ... as` aliases!).
+function physUwMaxCash() {
+    return typeof UW_MAX_CASH === 'number' ? UW_MAX_CASH : 999_999_999;
+}
+
+function physIsValidEggSkin(skinId) {
+    const clean = String(skinId ?? '').trim();
+    if (!clean) return false;
+    if (typeof EGG_SKINS !== 'undefined' && Array.isArray(EGG_SKINS)) {
+        return EGG_SKINS.some(skin => skin.id === clean);
+    }
+    return false;
+}
+
+function physUwCreateState(...args) {
+    if (typeof uwCreateState === 'function') return uwCreateState(...args);
+    const options = args[0] && typeof args[0] === 'object' ? args[0] : {};
+    return {
+        skin: 'auto', currency: String(options.currency || '$').slice(0, 8),
+        cash: Math.max(0, Math.trunc(Number(options.cash ?? 500) || 500)),
+        debt: 0, turnsInDebt: 0, collateral: [], houseNet: 0, heat: 0,
+        standing: 0, factions: [], turnsSinceEvent: 4, pendingWorldEvent: '',
+        eventKind: '', calmTurns: 0, wagerCooldown: 0, collectorNotices: 0,
+        allyTurns: 0, blackjack: null,
+    };
+}
+
+function physUwNormalizeState(raw) {
+    if (typeof uwNormalizeState === 'function') return uwNormalizeState(raw);
+    const base = physUwCreateState();
+    if (!raw || typeof raw !== 'object') return base;
+    return { ...base, ...raw, collateral: Array.isArray(raw.collateral) ? raw.collateral.slice(0, 6) : [], factions: Array.isArray(raw.factions) ? raw.factions.slice(0, 4) : [] };
+}
+
+function physRepNormalizeState(state) {
+    if (typeof repNormalizeState === 'function') return repNormalizeState(state);
+    return state;
+}
+
+function physRepApplyWorldDelta(state, delta) {
+    if (typeof repApplyWorldDelta === 'function') return repApplyWorldDelta(state, delta);
+    return state;
+}
 
 export const BIO_MODES = Object.freeze(['none', 'cycle', 'omegaverse', 'oviposition']);
 export const DISCLOSURE_MODES = Object.freeze(['modern', 'medieval', 'omniscient']);
@@ -215,10 +265,85 @@ export function createChatState(initialDate = '2026-09-01') {
             turnsSinceAutoImage: 0,
             lastAudioPath: '',
         },
+        // U1-U3: chat-scoped wallet, debt, wanted heat, standing and factions.
+        // Global gacha/relic entitlements are deliberately kept outside this object.
+        underworld: physUwCreateState(),
         codexHistory: [], // [{ role: 'user'|'assistant', content, preset, model, at }]
         activityLog: [],  // [{ atDate, summary }]
         checkpoints: [],  // [{ key, snapshot }]
     };
+}
+
+export function normalizeEntity(src, role = 'char') {
+    const cleanRole = role === 'user' ? 'user' : 'char';
+    const dst = createEntityState(cleanRole);
+    if (!src || typeof src !== 'object') return dst;
+    dst.enabled = src.enabled !== false;
+    if (src.vitals && typeof src.vitals === 'object') {
+        dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
+        dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
+        dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
+            ? src.vitals.respiration : 'steady';
+        dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
+            ? src.vitals.circulation : 'normal';
+        dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
+        dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
+        dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
+        dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
+            id: String(w.id || Math.random().toString(36).slice(2, 8)),
+            label: String(w.label ?? '').slice(0, 100),
+            bleeding: Boolean(w.bleeding),
+            severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
+            daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
+        })).filter(w => w.label) : [];
+    }
+    if (src.bio && typeof src.bio === 'object') {
+        const b = src.bio;
+        dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
+        dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
+        dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
+        dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
+        dst.bio.pregnant = Boolean(b.pregnant);
+        dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
+        dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
+        dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
+        dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
+            ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
+        dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
+        dst.bio.testTaken = Boolean(b.testTaken);
+        dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
+        dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
+        dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
+        dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
+        dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
+        dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
+        dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
+        dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
+        dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
+        dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
+        dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
+        dst.bio.carryingClutch = Boolean(b.carryingClutch);
+        dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
+        dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
+        dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
+        dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
+        dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
+        dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
+        if (b.nest && typeof b.nest === 'object') {
+            dst.bio.nest.active = Boolean(b.nest.active);
+            dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
+            dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
+                id: String(egg?.id || `egg-${idx + 1}`),
+                shell: SHELL_TRAITS.includes(egg?.shell) ? egg.shell : 'healthy',
+                gender: egg?.gender === 'male' ? 'male' : 'female',
+                daysIncubated: Math.max(0, Number(egg?.daysIncubated) || 0),
+                targetDays: Math.round(clamp(Number(egg?.targetDays) || 60, 14, 120)),
+                cracked: Boolean(egg?.cracked),
+                ...(physIsValidEggSkin(egg?.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
+            })) : [];
+        }
+    }
+    return dst;
 }
 
 export function normalizeChatState(raw) {
@@ -240,6 +365,8 @@ export function normalizeChatState(raw) {
         out.world.slopRule = String(raw.world.slopRule ?? '').replace(/\s+/g, ' ').trim().slice(0, 600);
     }
     out.turnExtras = normalizeTurnExtras(raw.turnExtras);
+    out.underworld = physUwNormalizeState(raw.underworld);
+    physRepNormalizeState(out.underworld);
     if (raw.counters && typeof raw.counters === 'object') {
         out.counters.turnsSinceLastPhone = physCounter(raw.counters.turnsSinceLastPhone, PHYS_PHONE_EVERY);
         out.counters.turnsSinceWiki = physCounter(raw.counters.turnsSinceWiki, 0);
@@ -248,71 +375,7 @@ export function normalizeChatState(raw) {
     for (const key of ['user', 'char']) {
         const src = raw.entities?.[key];
         if (!src || typeof src !== 'object') continue;
-        const dst = out.entities[key];
-        dst.enabled = src.enabled !== false;
-        if (src.vitals && typeof src.vitals === 'object') {
-            dst.vitals.heartRate = Math.round(clamp(Number(src.vitals.heartRate), 40, 210));
-            dst.vitals.breathRate = Math.round(clamp(Number(src.vitals.breathRate), 8, 50));
-            dst.vitals.respiration = ['steady', 'deep', 'rapid', 'breathless', 'shallow'].includes(src.vitals.respiration)
-                ? src.vitals.respiration : 'steady';
-            dst.vitals.circulation = ['normal', 'flushed', 'adrenaline', 'pallor', 'hypovolemia'].includes(src.vitals.circulation)
-                ? src.vitals.circulation : 'normal';
-            dst.vitals.bloodLossPct = Math.round(clamp(Number(src.vitals.bloodLossPct), 0, 45));
-            dst.vitals.stamina = Math.round(clamp(Number(src.vitals.stamina), 0, 100));
-            dst.vitals.stress = Math.round(clamp(Number(src.vitals.stress), 0, 100));
-            dst.vitals.wounds = Array.isArray(src.vitals.wounds) ? src.vitals.wounds.slice(0, 8).map(w => ({
-                id: String(w.id || Math.random().toString(36).slice(2, 8)),
-                label: String(w.label ?? '').slice(0, 100),
-                bleeding: Boolean(w.bleeding),
-                severity: Math.round(clamp(Number(w.severity) || 1, 1, 3)),
-                daysOld: Math.max(0, Math.trunc(Number(w.daysOld) || 0)),
-            })).filter(w => w.label) : [];
-        }
-        if (src.bio && typeof src.bio === 'object') {
-            const b = src.bio;
-            dst.bio.mode = BIO_MODES.includes(b.mode) ? b.mode : 'none';
-            dst.bio.cycleLength = Math.round(clamp(Number(b.cycleLength) || 28, 21, 35));
-            dst.bio.cycleDay = Math.round(clamp(Number(b.cycleDay) || 1, 1, dst.bio.cycleLength));
-            dst.bio.contraception = CONTRACEPTION_TYPES.includes(b.contraception) ? b.contraception : 'none';
-            dst.bio.pregnant = Boolean(b.pregnant);
-            dst.bio.gestationDays = Math.max(0, Math.trunc(Number(b.gestationDays) || 0));
-            dst.bio.gestationTarget = Math.round(clamp(Number(b.gestationTarget) || 280, 120, 310));
-            dst.bio.fetusCount = Math.round(clamp(Number(b.fetusCount) || 0, 0, 4));
-            dst.bio.fetusGenders = Array.isArray(b.fetusGenders)
-                ? b.fetusGenders.slice(0, 4).map(g => (g === 'male' ? 'male' : 'female')) : [];
-            dst.bio.complication = COMPLICATION_POOL.includes(b.complication) ? b.complication : 'none';
-            dst.bio.testTaken = Boolean(b.testTaken);
-            dst.bio.ultrasoundWeek = Math.max(0, Math.trunc(Number(b.ultrasoundWeek) || 0));
-            dst.bio.postpartumDaysLeft = Math.max(0, Math.trunc(Number(b.postpartumDaysLeft) || 0));
-            dst.bio.cSectionScarDays = Math.max(0, Math.trunc(Number(b.cSectionScarDays) || 0));
-            dst.bio.omegaRole = OMEGA_ROLES.includes(b.omegaRole) ? b.omegaRole : dst.bio.omegaRole;
-            dst.bio.pheromoneScent = String(b.pheromoneScent ?? '').slice(0, 80);
-            dst.bio.pheromoneIntensity = Math.round(clamp(Number(b.pheromoneIntensity) || 20, 0, 100));
-            dst.bio.suppressants = SUPPRESSANT_LEVELS.includes(b.suppressants) ? b.suppressants : 'none';
-            dst.bio.inHeatOrRut = Boolean(b.inHeatOrRut);
-            dst.bio.heatDaysLeft = Math.max(0, Math.trunc(Number(b.heatDaysLeft) || 0));
-            dst.bio.bondType = BOND_TYPES.includes(b.bondType) ? b.bondType : 'none';
-            dst.bio.bondPartner = String(b.bondPartner ?? '').slice(0, 80);
-            dst.bio.carryingClutch = Boolean(b.carryingClutch);
-            dst.bio.clutchDays = Math.max(0, Math.trunc(Number(b.clutchDays) || 0));
-            dst.bio.clutchTargetDays = Math.round(clamp(Number(b.clutchTargetDays) || 42, 14, 90));
-            dst.bio.clutchTotal = Math.round(clamp(Number(b.clutchTotal) || 0, 0, 8));
-            dst.bio.clutchLaid = Math.round(clamp(Number(b.clutchLaid) || 0, 0, dst.bio.clutchTotal));
-            dst.bio.clutchShells = Array.isArray(b.clutchShells) ? b.clutchShells.slice(0, 8).map(String) : [];
-            dst.bio.clutchGenders = Array.isArray(b.clutchGenders) ? b.clutchGenders.slice(0, 8).map(String) : [];
-            if (b.nest && typeof b.nest === 'object') {
-                dst.bio.nest.active = Boolean(b.nest.active);
-                dst.bio.nest.warmth = ['optimal', 'cool', 'overheated'].includes(b.nest.warmth) ? b.nest.warmth : 'optimal';
-                dst.bio.nest.eggs = Array.isArray(b.nest.eggs) ? b.nest.eggs.slice(0, 12).map((egg, idx) => ({
-                    id: String(egg.id || `egg-${idx + 1}`),
-                    shell: SHELL_TRAITS.includes(egg.shell) ? egg.shell : 'healthy',
-                    gender: egg.gender === 'male' ? 'male' : 'female',
-                    daysIncubated: Math.max(0, Number(egg.daysIncubated) || 0),
-                    targetDays: Math.round(clamp(Number(egg.targetDays) || 60, 14, 120)),
-                    cracked: Boolean(egg.cracked),
-                })) : [];
-            }
-        }
+        out.entities[key] = normalizeEntity(src, key);
     }
     if (Array.isArray(raw.offspring)) {
         out.offspring = raw.offspring.slice(0, 40).map((child, idx) => ({
@@ -323,6 +386,7 @@ export function normalizeChatState(raw) {
             gender: child.gender === 'male' ? 'male' : 'female',
             bornDate: String(child.bornDate || out.world.rpDate),
             notes: String(child.notes ?? '').slice(0, 140),
+            ...(physIsValidEggSkin(child?.eggSkin) ? { eggSkin: child.eggSkin } : {}),
         }));
     }
     if (Array.isArray(raw.companions)) {
@@ -578,6 +642,31 @@ export function layEggs(entity, state, count = null) {
     return toLay;
 }
 
+export function equipNestEggSkin(bio, eggIndex, skinId, unlockedEggSkins = []) {
+    const targetBio = bio?.nest && Array.isArray(bio.nest.eggs)
+        ? bio
+        : (bio?.bio?.nest && Array.isArray(bio.bio.nest.eggs) ? bio.bio : null);
+    if (!targetBio) return { ok: false, reason: 'egg_not_found', egg: null };
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!physIsValidEggSkin(cleanSkin)) return { ok: false, reason: 'invalid_skin', egg: null };
+    const unlocked = Array.isArray(unlockedEggSkins)
+        ? unlockedEggSkins
+        : unlockedEggSkins instanceof Set
+            ? [...unlockedEggSkins]
+            : Array.isArray(unlockedEggSkins?.unlockedEggSkins)
+                ? unlockedEggSkins.unlockedEggSkins
+                : [];
+    if (!unlocked.map(String).includes(cleanSkin)) return { ok: false, reason: 'skin_locked', egg: null };
+    const eggs = targetBio.nest.eggs;
+    const idx = typeof eggIndex === 'number' || /^\d+$/.test(String(eggIndex ?? ''))
+        ? Math.trunc(Number(eggIndex))
+        : eggs.findIndex(item => item && item.id === String(eggIndex));
+    const egg = idx >= 0 && idx < eggs.length ? eggs[idx] : null;
+    if (!egg) return { ok: false, reason: 'egg_not_found', egg: null };
+    egg.eggSkin = cleanSkin;
+    return { ok: true, egg };
+}
+
 export function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
     const { bio } = entity;
     if (!bio.nest.active || !bio.nest.eggs.length) return [];
@@ -593,6 +682,7 @@ export function hatchReadyEggs(entity, state, { forceAll = false } = {}) {
                 gender: egg.gender,
                 bornDate: state.world.rpDate,
                 notes: `Hatched (${egg.shell})`,
+                ...(physIsValidEggSkin(egg.eggSkin) ? { eggSkin: egg.eggSkin } : {}),
             };
             state.offspring.push(hatchling);
             hatched.push(hatchling);
@@ -1009,8 +1099,10 @@ function physApplyTurnExtras(state, delta, turnKey) {
     }
 }
 
-export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng } = {}) {
+export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng, saveCheckpoint: persistCheckpoint = true } = {}) {
     if (!delta || typeof delta !== 'object') return state;
+    if (!state.underworld || typeof state.underworld !== 'object') state.underworld = physUwCreateState();
+    state.underworld = physUwNormalizeState(state.underworld);
 
     let forwardDays = Math.max(0, Math.trunc(Number(delta.daysElapsed) || 0));
     if (delta.newRpDate) {
@@ -1132,6 +1224,19 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
         }
     }
 
+    // U3 world delta is optional and lives in the same tracker response; it is
+    // clamped by repApplyWorldDelta so a malformed/overly enthusiastic model
+    // cannot mint money or jump the wanted meter in one turn.
+    if (delta.worldDelta && typeof delta.worldDelta === 'object') {
+        if (Number.isFinite(Number(delta.worldDelta.cashDelta))) {
+            const maxCash = physUwMaxCash();
+            const cashDelta = Math.trunc(Math.min(50_000, Math.max(-50_000, Number(delta.worldDelta.cashDelta))));
+            state.underworld.cash = Math.min(maxCash, Math.max(0, state.underworld.cash + cashDelta));
+            state.underworld.houseNet = Math.min(maxCash, Math.max(-maxCash, state.underworld.houseNet + cashDelta));
+        }
+        physRepApplyWorldDelta(state.underworld, delta.worldDelta);
+    }
+
     // Companion mood reaction to explicit delta or scene combat / stress atmosphere
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const hasExplicitMood = delta.companionMoodDelta !== undefined
@@ -1175,7 +1280,7 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
     // M3/M4/M5 bookkeeping: turnExtras (only when present) and counters. Phone/wiki stores are not touched here.
     physApplyTurnExtras(state, delta, String(checkpointKey || ''));
 
-    if (checkpointKey) saveCheckpoint(state, checkpointKey);
+    if (checkpointKey && persistCheckpoint) saveCheckpoint(state, checkpointKey);
     return state;
 }
 

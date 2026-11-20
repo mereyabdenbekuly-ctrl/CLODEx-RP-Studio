@@ -71,6 +71,16 @@ test('phone replay by activeTurnKeys: A → B → A, swipe deletes nothing', () 
     assert.equal(store.journal.length, 3);
 });
 
+test('phoneIngestEvents deduplicates per source, allowing tracker + local underworld events on one turn', () => {
+    const store = phoneCreateStore();
+    phoneIngestEvents(store, [{ kind: 'note', text: 'tracker event' }], A, { source: 'tracker' });
+    phoneIngestEvents(store, [{ kind: 'dm', text: 'collector event' }], A, { source: 'underworld' });
+    phoneIngestEvents(store, [{ kind: 'feed', text: 'duplicate tracker' }], A, { source: 'tracker' });
+    const entries = phoneView(store, [A]).entries;
+    assert.deepEqual(entries.map(entry => entry.text), ['tracker event', 'collector event']);
+    assert.equal(store.journal.filter(op => op.kind === 'phone.add').at(-1).source, 'underworld');
+});
+
 test('phoneGc removes deleted turns (and their seenIds), keeps the rest', () => {
     const store = phoneCreateStore();
     phoneIngestEvents(store, [{ kind: 'note', text: 'Ход 1' }], T1);

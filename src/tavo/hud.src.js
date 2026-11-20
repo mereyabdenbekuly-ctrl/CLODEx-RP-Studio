@@ -101,6 +101,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
         injectContext: tavo.plugin.config.get('injectContext') !== false,
         confirmPaid: tavo.plugin.config.get('confirmPaid') !== false,
         maxAutoSpendUsd: 0.25,
+        rpPrefs: {},
         autoImageEvery: 0,
         bgDim: Number(tavo.plugin.config.get('bgDim') ?? 35),
         hudPos: null,
@@ -206,6 +207,14 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
             if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
             const raw = await tavo.variable.get(name).catch(() => null);
             return raw && typeof raw === 'object' ? raw : null;
+        },
+        async loadRpPrefs() {
+            return cachedPrefs.rpPrefs && typeof cachedPrefs.rpPrefs === 'object'
+                ? structuredClone(cachedPrefs.rpPrefs) : null;
+        },
+        async saveRpPrefs(value) {
+            cachedPrefs.rpPrefs = value && typeof value === 'object' ? structuredClone(value) : {};
+            await tavo.variable.set(GLOBAL_PREFS_KEY, cachedPrefs, 'global');
         },
         async saveStore(name, value) {
             if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
@@ -393,6 +402,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
         const action = payload?.action;
         if (action === 'open-tracker') controller.openTab('tracker');
         else if (action === 'open-cradle') controller.openTab('cradle');
+        else if (action === 'open-underworld') controller.openTab('underworld');
         else if (action === 'open-codex') controller.openTab('codex');
         else if (action === 'open-forge') controller.openTab('forge');
         else if (action === 'open-phone') controller.openTab('phone');

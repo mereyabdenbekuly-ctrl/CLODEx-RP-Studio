@@ -2,12 +2,12 @@
   "specVersion": 2,
   "id": "xyz.clodex.rp-studio",
   "name": { "$t": "plugin.name" },
-  "version": "1.3.1",
+  "version": "1.4.0",
   "minAppVersion": "0.93.0",
   "entry": "entry.js",
   "author": "CLODEx",
   "description": { "$t": "plugin.description" },
-  "releaseNotes": { "$t": "releaseNotes.1_3_1" },
+  "releaseNotes": { "$t": "releaseNotes.1_4_0" },
   "localization": {
     "defaultLocale": "en",
     "resources": {
@@ -45,6 +45,10 @@
       {
         "id": "open-cradle",
         "label": { "$t": "actions.openCradle" }
+      },
+      {
+        "id": "open-underworld",
+        "label": { "$t": "actions.openUnderworld" }
       },
       {
         "id": "open-phone",

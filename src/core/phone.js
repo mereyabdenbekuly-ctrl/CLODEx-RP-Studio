@@ -14,7 +14,7 @@ export const PHONE_MAX_BYTES = 48000;
 export const PHONE_MIN_TURNS_BETWEEN = 3;
 export const PHONE_OP_ADD = 'phone.add';
 export const PHONE_OP_REVEAL = 'phone.reveal';
-export const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160 });
+export const PHONE_LIMITS = Object.freeze({ author: 48, text: 420, mediaPrompt: 360, mediaPath: 512, id: 64, turnKey: 160, source: 32 });
 
 const PHONE_MAX_SEEN = 480;
 const PHONE_HARD_MAX_OPS = 720;
@@ -49,6 +49,11 @@ function phoneSafeId(value) {
 
 function phoneSafeTurnKey(value) {
     return phoneSanitizeText(value, PHONE_LIMITS.turnKey);
+}
+
+function phoneSafeSource(value) {
+    const source = String(value ?? 'tracker').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, PHONE_LIMITS.source);
+    return source || 'tracker';
 }
 
 function phoneSafeMediaPath(value) {
@@ -101,7 +106,7 @@ export function phoneNormalizeStore(raw) {
             if (!op || typeof op !== 'object') continue;
             const turnKey = phoneSafeTurnKey(op.turnKey);
             if (!turnKey) continue;
-            const base = { id: op.id, kind: op.kind, turnKey, at: Number.isFinite(op.at) ? op.at : 0 };
+            const base = { id: op.id, kind: op.kind, turnKey, source: phoneSafeSource(op.source), at: Number.isFinite(op.at) ? op.at : 0 };
             if (op.kind === PHONE_OP_ADD) {
                 const entry = phoneSanitizeEntry(op.payload, { turnKey });
                 if (!entry || !entry.id) continue;
@@ -128,24 +133,25 @@ export function phoneShouldInclude(state) {
 
 // Appends up to 2 sanitized events created by `turnKey`. Idempotent per turnKey:
 // a repeated sync of the same turn does not duplicate entries. Mutates and returns the store.
-export function phoneIngestEvents(store, events, turnKey) {
+export function phoneIngestEvents(store, events, turnKey, { source = 'tracker' } = {}) {
     if (!store || typeof store !== 'object') return store;
     if (!Array.isArray(store.journal)) store.journal = [];
     const key = phoneSafeTurnKey(turnKey);
+    const origin = phoneSafeSource(source);
     if (!key || !Array.isArray(events) || events.length === 0) return store;
-    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key)) return store;
+    if (store.journal.some((op) => op && op.kind === PHONE_OP_ADD && op.turnKey === key && phoneSafeSource(op.source) === origin)) return store;
     const usedIds = new Set(store.journal.filter((op) => op?.kind === PHONE_OP_ADD).map((op) => op.payload?.id));
     let added = 0;
     for (let i = 0; i < events.length && added < PHONE_MAX_EVENTS_PER_TURN; i += 1) {
         const entry = phoneSanitizeEntry({ ...(events[i] && typeof events[i] === 'object' ? events[i] : {}), id: '', mediaPath: '' }, { turnKey: key });
         if (!entry) continue;
-        let id = `ph-${phoneHash(`${key}|${i}|${entry.kind}|${entry.text}`)}`;
+        let id = `ph-${phoneHash(`${key}|${origin}|${i}|${entry.kind}|${entry.text}`)}`;
         let n = 1;
         while (usedIds.has(id)) id = `ph-${phoneHash(`${key}|${i}|${entry.text}|${n++}`)}`;
         usedIds.add(id);
         entry.id = id;
         entry.turnKey = key;
-        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, payload: entry });
+        phoneJournalAppend(store, { kind: PHONE_OP_ADD, turnKey: key, source: origin, payload: entry });
         added += 1;
     }
     if (store.journal.length > PHONE_HARD_MAX_OPS) store.journal = store.journal.slice(-PHONE_HARD_MAX_OPS);

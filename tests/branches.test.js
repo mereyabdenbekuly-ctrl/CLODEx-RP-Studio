@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import { COMPANION_ARCHETYPES, createCompanionFromArchetype } from '../src/core/companion.js';
 import { jrAppend, jrGc, jrReplay, jrTurnKey } from '../src/core/journal.js';
+import { repImportFactions } from '../src/core/reputation.js';
+import { uwPawnCollateral } from '../src/core/underworld.js';
 import {
     applyMeterPresetPack, applyTurnExtraction, checkpointSnapshotBytes, createChatState, normalizeChatState,
     PHYS_CHECKPOINT_LIMIT, physDecodeSnapshot, physEncodeSnapshot, restoreCheckpointBefore, restoreCheckpointExact,
@@ -33,6 +35,24 @@ function richState() {
     for (const pack of ['dark_romance', 'fantasy_rpg', 'detective']) applyMeterPresetPack(state, pack, 'ru');
     return state;
 }
+
+test('Snapshots fit the RP budget with 6 companions, 8 meters, 6 pawns and 4 factions', () => {
+    const state = richState();
+    for (let i = 0; i < 6; i += 1) {
+        assert.equal(uwPawnCollateral(state.underworld, { label: `Серебряный амулет ${i + 1}`, pawnValue: 50 }).ok, true);
+    }
+    repImportFactions(state.underworld, ['Орден', 'Гильдия', 'Вороны', 'Стража'].map(name => ({ name })));
+    assert.equal(state.underworld.collateral.length, 6);
+    assert.equal(state.underworld.factions.length, 4);
+    for (let i = 1; i <= PHYS_CHECKPOINT_LIMIT; i += 1) {
+        state.underworld.cash -= 1;
+        saveCheckpoint(state, k(i));
+        const bytes = checkpointSnapshotBytes(state);
+        assert.ok(bytes <= 2_764, `snapshot ${i} is ${bytes} bytes (> 2.7 KiB)`);
+    }
+    assert.equal(state.checkpoints.length, 25);
+    assert.ok(Buffer.byteLength(JSON.stringify(state)) <= 65_536, '25 checkpoints and live state must fit 64 KiB');
+});
 
 test('Compact state with 6 companions and 8 meters fits 2.5 KB per snapshot; 25 snapshots fit 64 KB', () => {
     const state = richState();
@@ -256,6 +276,30 @@ test('Tracker extraction: 1100-token budget, field order, phoneEvents only with 
     const iPhone = withPhone.indexOf('"phoneEvents"');
     assert.ok(iPhone > withPhone.indexOf('"suggestedActions"'), 'phoneEvents is last');
     assert.match(withPhone, /"note" \| "dm" \| "feed" \| "photo" \| "voice"/);
+
+    // Schema JSON comma validity for BOTH includePhone: false and includePhone: true
+    const extractSchemaJson = promptText => {
+        const schemaStart = promptText.indexOf('JSON schema:\n') + 'JSON schema:\n'.length;
+        const schemaEnd = promptText.lastIndexOf('\n}\n') + 2;
+        const rawSchema = promptText.slice(schemaStart, schemaEnd)
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/\/\/.*$/gm, '')
+            .replace(/"[^"]*"\s*(?:\|\s*"[^"]*"\s*)+/g, '"morning"');
+        return JSON.parse(rawSchema);
+    };
+    const parsedWithoutPhone = extractSchemaJson(without);
+    assert.deepEqual(parsedWithoutPhone.suggestedActions, ['', '', '']);
+    assert.deepEqual(parsedWithoutPhone.worldDelta, {
+        cashDelta: 0,
+        heatDelta: 0,
+        standingDelta: 0,
+        faction: { name: '', delta: 0 },
+    });
+    assert.equal('phoneEvents' in parsedWithoutPhone, false);
+
+    const parsedWithPhone = extractSchemaJson(withPhone);
+    assert.deepEqual(parsedWithPhone.suggestedActions, ['', '', '']);
+    assert.ok(Array.isArray(parsedWithPhone.phoneEvents));
 });
 
 test('Truncated tracker JSON salvages complete tracker fields; garbage yields an empty delta', () => {

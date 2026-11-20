@@ -131,7 +131,7 @@ export class ClodexApi {
         this.now = now;
     }
 
-    async request(path, { method = 'GET', body, auth = true, signal, timeout = 60_000, blob = false } = {}) {
+    async request(path, { method = 'GET', body, auth = true, signal, timeout = 60_000, blob = false, headers: extraHeaders = {} } = {}) {
         if (!/^\/(v1\/|api\/(usage\/token\/|status$|pricing$))/.test(path)
             || path.includes('..') || path.includes('\\') || path.includes('#')) {
             throw new ApiError('Invalid API path.', { code: 'invalid_path' });
@@ -140,6 +140,9 @@ export class ClodexApi {
         const headers = new Headers();
         if (key) headers.set('Authorization', `Bearer ${key}`);
         if (body !== undefined) headers.set('Content-Type', 'application/json');
+        for (const [name, value] of Object.entries(extraHeaders || {})) {
+            if (value !== undefined && value !== null) headers.set(name, String(value));
+        }
 
         const controller = new AbortController();
         const onAbort = () => controller.abort(signal.reason);
@@ -190,6 +193,28 @@ export class ClodexApi {
 
     pricing(signal) {
         return this.request('/api/pricing', { signal, auth: false, timeout: 15_000 });
+    }
+
+    rpRelicCatalog(signal) {
+        return this.request('/v1/rp/relics/catalog', { signal, auth: false, timeout: 30_000 });
+    }
+
+    rpRelicInventory(signal) {
+        return this.request('/v1/rp/relics/inventory', { signal, timeout: 30_000 });
+    }
+
+    rpRelicMint({ editionKey, idempotencyKey } = {}, signal) {
+        const key = String(editionKey || '').trim();
+        if (!/^[a-zA-Z0-9_-]{1,64}$/.test(key)) throw new ApiError('Invalid relic edition.', { code: 'invalid_input' });
+        const idem = String(idempotencyKey || '').trim();
+        if (!/^[a-zA-Z0-9._:-]{8,80}$/.test(idem)) throw new ApiError('Invalid idempotency key.', { code: 'invalid_input' });
+        return this.request('/v1/rp/relics/mint', {
+            method: 'POST',
+            body: { editionKey: key },
+            headers: { 'Idempotency-Key': idem },
+            signal,
+            timeout: 90_000,
+        });
     }
 
     status(signal) {

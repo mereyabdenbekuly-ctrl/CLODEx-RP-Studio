@@ -51,7 +51,7 @@ function jrClonePayload(payload) {
 }
 
 // Mutates `journal` (push) and returns the appended operation.
-function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
+function jrAppend(journal, { kind, turnKey = '', payload = null, source = '' } = {}) {
     if (!Array.isArray(journal)) throw new TypeError('jrAppend: journal must be an array');
     const cleanKind = String(kind ?? '').trim().slice(0, JR_KIND_MAX);
     if (!cleanKind) throw new TypeError('jrAppend: kind is required');
@@ -62,6 +62,8 @@ function jrAppend(journal, { kind, turnKey = '', payload = null } = {}) {
         payload: jrClonePayload(payload),
         at: Date.now(),
     };
+    const cleanSource = String(source ?? '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 32);
+    if (cleanSource) op.source = cleanSource;
     journal.push(op);
     return op;
 }

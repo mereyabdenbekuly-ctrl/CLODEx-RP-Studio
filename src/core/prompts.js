@@ -1,4 +1,69 @@
 import { activeEntitiesForTarget, getCyclePhase, getVisibleBiologySummary } from './physiology.js';
+import { uwContinuityLine } from './underworld.js';
+import { repContextLine } from './reputation.js';
+
+function promptsEstimateTokens(text) {
+    const s = String(text ?? '');
+    if (!s) return 0;
+    let latin = 0;
+    let cyrillic = 0;
+    let other = 0;
+    for (let i = 0; i < s.length; i += 1) {
+        const c = s.charCodeAt(i);
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 0xc0 && c <= 0x24f && c !== 0xd7 && c !== 0xf7)) latin += 1;
+        else if (c >= 0x400 && c <= 0x4ff) cyrillic += 1;
+        else other += 1;
+    }
+    return Math.ceil(latin / 4 + cyrillic / 2.2 + other / 3);
+}
+
+// Keep the compact legacy bundle test (which strips underworld/reputation imports)
+// executable while using direct exported identifiers in full ESM & Tavo bundles.
+function promptsWorldContinuityLine(state) {
+    if (typeof uwContinuityLine === 'function') return uwContinuityLine(state);
+    if (!state || typeof state !== 'object') return '';
+    const debt = Math.round(Number(state.debt) || 0);
+    const heat = Math.round(Math.max(0, Math.min(5, Number(state.heat) || 0)) * 4) / 4;
+    const standing = Math.round(Number(state.standing) || 0);
+    const factions = Array.isArray(state.factions) ? state.factions : [];
+    const hostileObj = factions.find(f => f && Number(f.rep) <= -50 && String(f.name || '').trim());
+    const friendly = standing >= 50 || factions.some(f => f && Number(f.rep) >= 60);
+    if (debt <= 0 && heat <= 0 && Math.abs(standing) < 25 && !hostileObj && !friendly) {
+        return typeof repContextLine === 'function' ? '' : '';
+    }
+    const cleanHostile = hostileObj
+        ? String(hostileObj.name).replace(/[\r\n[\],;]+/g, ' ').replace(/\s+/g, ' ').trim()
+        : '';
+    const build = (prefix, sep, maxHostileChars) => {
+        const bits = [];
+        if (debt > 0) bits.push(`debt ${debt}`);
+        if (heat > 0) bits.push(`wanted ${Number(heat.toFixed(2))}★`);
+        if (Math.abs(standing) >= 25) bits.push(`standing ${standing > 0 ? '+' : ''}${standing}`);
+        if (cleanHostile) bits.push(`hostile faction ${cleanHostile.slice(0, maxHostileChars).trim()}`);
+        if (friendly) bits.push('friendly NPCs');
+        return prefix ? `[${prefix}: ${bits.join(sep)}]` : `[${bits.join(sep)}]`;
+    };
+    const layouts = [['Underworld', ', '], ['UW', ', '], ['', ',']];
+    if (!cleanHostile) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, 0);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+        return build('', ',', 0);
+    }
+    const fullCap = Math.min(28, cleanHostile.length);
+    for (const [prefix, sep] of layouts) {
+        const fullLine = build(prefix, sep, fullCap);
+        if (promptsEstimateTokens(fullLine) <= 25) return fullLine;
+    }
+    for (let cap = fullCap - 1; cap >= 3; cap -= 1) {
+        for (const [prefix, sep] of layouts) {
+            const line = build(prefix, sep, cap);
+            if (promptsEstimateTokens(line) <= 25) return line;
+        }
+    }
+    return build('', ',', 3);
+}
 
 // Background turn-analysis response budget (v1.3, spec 10.4): critical tracker fields first,
 // then innerThought / suggestedActions, phoneEvents last, so truncation never hits the tracker core.
@@ -121,6 +186,9 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
         lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
     }
 
+    const continuityLine = promptsWorldContinuityLine(state.underworld);
+    if (continuityLine) lines.push(continuityLine);
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -188,7 +256,8 @@ export function buildTrackerExtractionMessages(state, recentMessages, {
         '    "char": { /* same fields as user */ }',
         '  },',
         `  "innerThought": "", // 1-2 sentences (max 160 chars) of what ${charName} privately thinks but did not say this turn; in the chat language; "" if unclear`,
-        `  "suggestedActions": ["", "", ""]${includePhone ? ',' : ''} // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "suggestedActions": ["", "", ""], // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        `  "worldDelta": { "cashDelta": 0, "heatDelta": 0, "standingDelta": 0, "faction": { "name": "", "delta": 0 } }${includePhone ? ',' : ''} // optional explicit present-turn changes; clamp in client`,
         ...(includePhone ? [
             `  "phoneEvents": [] // 0-2 items ONLY if the story gives a natural reason (usually []): { "kind": "note" | "dm" | "feed" | "photo" | "voice", "author": "who wrote it", "text": "max 280 chars, in the chat language", "mediaPrompt": "short English visual/voice brief for photo/voice, else empty" } — ${charName}'s secret notes, messages to other NPCs, or how the world/forum/social feed reacts to ${userName}`,
         ] : []),

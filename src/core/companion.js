@@ -1,4 +1,5 @@
 import { diffDaysForward } from './date.js';
+import { EGG_SKINS, GA_RARITIES } from './gacha.js';
 
 export const COMPANION_STAGES = Object.freeze(['infant', 'child', 'teen', 'adult']);
 
@@ -261,6 +262,11 @@ export function normalizeCompanion(raw, idx = 0) {
         videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
         needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
         lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
+        ...(GA_RARITIES.includes(src.rarity) ? { rarity: src.rarity } : {}),
+        ...(EGG_SKINS.some(skin => skin.id === src.eggSkin) ? { eggSkin: src.eggSkin } : {}),
+        ...(typeof src.mutationTrait === 'string' && src.mutationTrait
+            ? { mutationTrait: src.mutationTrait.replace(/[<>]/g, '').slice(0, 120) } : {}),
+        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
     };
 }
 
@@ -380,7 +386,12 @@ export function createCompanionFromOffspring(child, state, { locale = 'ru' } = {
     if (state && typeof state === 'object') {
         if (!Array.isArray(state.companions)) state.companions = [];
         const existing = state.companions.find(c => c && c.originChildId === childId);
-        if (existing) return existing;
+        if (existing) {
+            if (!existing.eggSkin && EGG_SKINS.some(skin => skin.id === srcChild.eggSkin)) {
+                existing.eggSkin = srcChild.eggSkin;
+            }
+            return existing;
+        }
     }
 
     const gender = srcChild.gender === 'male' ? 'male' : 'female';
@@ -417,6 +428,7 @@ export function createCompanionFromOffspring(child, state, { locale = 'ru' } = {
         videoTaskId: '',
         needsStageArt: true,
         lastActionAt: String(state?.world?.rpDate ?? ''),
+        ...(EGG_SKINS.some(skin => skin.id === srcChild.eggSkin) ? { eggSkin: srcChild.eggSkin } : {}),
     });
 
     if (state && Array.isArray(state.companions) && state.companions.length < 6) {
@@ -466,6 +478,29 @@ export function advanceCompanionsDays(companions, deltaDays) {
     return companions;
 }
 
+function compUnlockedSkinSet(unlockedEggSkins) {
+    if (Array.isArray(unlockedEggSkins)) return new Set(unlockedEggSkins.map(String));
+    if (unlockedEggSkins instanceof Set) return new Set([...unlockedEggSkins].map(String));
+    if (Array.isArray(unlockedEggSkins?.unlockedEggSkins)) return new Set(unlockedEggSkins.unlockedEggSkins.map(String));
+    return new Set();
+}
+
+export function equipCompanionEggSkin(companion, skinId, unlockedEggSkins = []) {
+    if (!companion || typeof companion !== 'object') {
+        return { ok: false, reason: 'companion_not_found', companion: null };
+    }
+    const cleanSkin = String(skinId ?? '').trim();
+    if (!EGG_SKINS.some(skin => skin.id === cleanSkin)) {
+        return { ok: false, reason: 'invalid_skin', companion };
+    }
+    if (!compUnlockedSkinSet(unlockedEggSkins).has(cleanSkin)) {
+        return { ok: false, reason: 'skin_locked', companion };
+    }
+    companion.eggSkin = cleanSkin;
+    companion.needsStageArt = true;
+    return { ok: true, companion };
+}
+
 export function buildCompanionPortraitPrompt(companion, {
     charName = '',
     charDescription = '',
@@ -475,6 +510,7 @@ export function buildCompanionPortraitPrompt(companion, {
     const comp = normalizeCompanion(companion);
     const profile = COMP_ARCHETYPE_PROFILES[comp.archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
     const stageDesc = COMP_STAGE_VISUALS[comp.stage] || COMP_STAGE_VISUALS.infant;
+    const skinObj = comp.eggSkin ? EGG_SKINS.find(item => item.id === comp.eggSkin) : null;
 
     const styleLead = stylePreset === 'dark_gothic'
         ? 'Dark gothic chiaroscuro portrait illustration, warm candlelight, ornate sanctuary backdrop, rich oil-painted textures.'
@@ -496,7 +532,7 @@ export function buildCompanionPortraitPrompt(companion, {
         .trim()
         .split(' ')
         .filter(Boolean)
-        .slice(0, 14)
+        .slice(0, skinObj ? 8 : 14)
         .join(' ');
 
     const lineageClause = comp.originChildId || comp.archetype === 'offspring'
@@ -507,13 +543,22 @@ export function buildCompanionPortraitPrompt(companion, {
         ? 'enchanting dragon-blooded fantasy heir with delicate shimmering scales and warm luminous eyes'
         : profile.visualSubject;
 
+    const skinClause = skinObj
+        ? `Shell and aura motif (${skinObj.name}): ${skinObj.descriptor}`
+        : '';
+
+    const framingClause = skinObj
+        ? 'Centered solo portrait framing, soft rim light, no text overlays, no speech bubbles, no watermarks.'
+        : 'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.';
+
     const rawPrompt = [
         styleLead,
         `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
         `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
+        skinClause,
         lineageClause,
-        'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.',
-    ].join(' ');
+        framingClause,
+    ].filter(Boolean).join(' ');
 
     return compEnforceWordRange(rawPrompt, 64, 104, [
         'Warm atmospheric bokeh particles drift gently through the background air, highlighting crisp silhouettes and natural anatomy.',

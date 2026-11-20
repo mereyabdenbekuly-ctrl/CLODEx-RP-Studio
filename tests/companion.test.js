@@ -304,6 +304,7 @@ test('Classic-IIFE bundler compatibility: core modules concatenate into strict V
         'src/core/catalog.js',
         'src/core/date.js',
         'src/core/physiology.js',
+        'src/core/gacha.js',
         'src/core/companion.js',
         'src/core/prompts.js',
         'src/core/codex.js',

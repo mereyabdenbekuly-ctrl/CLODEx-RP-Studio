@@ -8,11 +8,26 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { webcrypto } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 import { EN_CATALOG, RU_CATALOG } from '../src/core/localesData.js';
+import { relNormalizePublicJwk } from '../src/core/relic.js';
 import { findBundleCollisions, resolveBundleFiles, TAVO_BUNDLES } from './bundles.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
+const relicKeySetting = process.env.CLODEX_RP_RELIC_PUBLIC_JWK;
+const relicPublicKey = relicKeySetting ? relNormalizePublicJwk(JSON.parse(relicKeySetting)) : null;
+if (relicKeySetting) {
+    if (!relicPublicKey) throw new Error('CLODEX_RP_RELIC_PUBLIC_JWK must be an ES256 public JWK.');
+    await webcrypto.subtle.importKey('jwk', relicPublicKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+}
+
+function packageRpSource(relativePath, source) {
+    if (relativePath !== 'src/core/relic.js') return source;
+    const marker = '/* rel:public-key */ null';
+    if (!source.includes(marker)) throw new Error('Missing RP Relic public-key marker.');
+    return source.replace(marker, relicPublicKey ? `Object.freeze(${JSON.stringify(relicPublicKey)})` : 'null');
+}
 
 function crc32(buffer) {
     let crc = 0xffffffff;
@@ -100,7 +115,7 @@ async function bundleClassicIife(entryRelativePaths) {
     }
     const parts = [];
     for (const rel of entryRelativePaths) {
-        const src = await readFile(resolve(root, rel), 'utf8');
+        const src = packageRpSource(rel, await readFile(resolve(root, rel), 'utf8'));
         const stripped = src
             .replace(/^\s*import\s+[\s\S]*?from\s+['"][^'"]+['"];?\s*$/gm, '')
             .replace(/^\s*export\s+(async\s+function|function|class|const|let)\s+/gm, '$1 ');
@@ -250,7 +265,7 @@ const stEntries = [];
 for (const rel of stFiles) {
     stEntries.push({
         archivePath: `CLODEx-RP-Studio/${rel}`,
-        data: await readFile(resolve(root, rel)),
+        data: Buffer.from(packageRpSource(rel, await readFile(resolve(root, rel), 'utf8'))),
     });
 }
 const stManifest = JSON.parse(await readFile(resolve(root, 'manifest.json'), 'utf8'));

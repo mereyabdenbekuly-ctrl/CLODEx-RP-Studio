@@ -143,3 +143,22 @@ export function extractCharacterCardFromPng(pngBytes) {
     }
     return null;
 }
+
+// CCv2 helpers kept separate from the generic PNG chunk reader so existing
+// forge exports remain unchanged. The relic payload contains no account data.
+export function embedRelicInCharacterCard(cardObject, certPayload, certSignature) {
+    const card = cardObject && typeof cardObject === 'object' ? structuredClone(cardObject) : {};
+    if (!card.data || typeof card.data !== 'object') card.data = {};
+    if (!card.data.extensions || typeof card.data.extensions !== 'object') card.data.extensions = {};
+    card.data.extensions.clodex_rp_relic = {
+        payload: typeof certPayload === 'string' ? certPayload : JSON.stringify(certPayload),
+        sig: String(certSignature ?? ''),
+    };
+    return card;
+}
+
+export function extractRelicFromCharacterCard(cardObject) {
+    const relic = cardObject?.data?.extensions?.clodex_rp_relic;
+    if (!relic || typeof relic !== 'object' || !relic.payload || !relic.sig) return null;
+    return { payload: String(relic.payload), sig: String(relic.sig) };
+}

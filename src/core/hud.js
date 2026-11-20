@@ -4,16 +4,16 @@ import { buildCodexMessages, CODEX_PRESETS } from './codex.js';
 import {
     COMPANION_ARCHETYPES, COMPANION_STAGES, buildCompanionBabbleMessages, buildCompanionForgeConcept,
     buildCompanionPortraitPrompt, buildCompanionVideoPrompt, createCompanionFromArchetype,
-    createCompanionFromOffspring, interactWithCompanion,
+    createCompanionFromOffspring, equipCompanionEggSkin, interactWithCompanion, normalizeCompanion,
 } from './companion.js';
 import { formatShortDate, TIME_SLOTS } from './date.js';
 import { buildForgePromptMessages, FORGE_CONCEPT_CHIPS, parseForgedCardV2 } from './forge.js';
 import {
-    advanceSimulationDays, applyMeterPresetPack, applyTurnExtraction, BIO_MODES, BOND_TYPES,
-    CONTRACEPTION_TYPES, deliverBabies, DISCLOSURE_MODES, getCyclePhase, getVisibleBiologySummary,
+    advanceSimulationDays, applyMeterPresetPack, applyTurnExtraction, BIO_MODES, BOND_TYPES, saveCheckpoint,
+    CONTRACEPTION_TYPES, deliverBabies, DISCLOSURE_MODES, equipNestEggSkin, getCyclePhase, getVisibleBiologySummary,
     hatchReadyEggs, layEggs, OMEGA_ROLES, SUPPRESSANT_LEVELS, triggerConception,
 } from './physiology.js';
-import { embedCharacterCardInPng } from './pngCard.js';
+import { embedCharacterCardInPng, extractCharacterCardFromPng } from './pngCard.js';
 import {
     buildSceneVisualPromptMessages, buildTrackerExtractionMessages, parseTrackerExtraction, TRACKER_MAX_TOKENS,
 } from './prompts.js';
@@ -36,6 +36,23 @@ import { vWikiRender } from './views/codex-wiki.js';
 import { vStyleRender } from './views/codex-style.js';
 import { vPhoneRender } from './views/phone.js';
 import { vPackRender } from './views/packs.js';
+import { VUW_WAGER_STAKES, vUwRender } from './views/underworld.js';
+import { vGaRarityLabel, vGaRenderAltar, vGaRenderRelics, vGaSkinName } from './views/cradle-gacha.js';
+import {
+    REP_SERVICES, repCoolHeat, repImportFactions, repRollWorldEvent, repUseService,
+} from './reputation.js';
+import {
+    UW_MAX_CASH, UW_SKINS, uwBlackjackAction, uwConsumeWorldEvent, uwOnTurnCommitted,
+    uwPawnCollateral, uwPawnInventoryItem, uwPayDebt, uwPlaySlots, uwRedeemCollateral,
+    uwResolveSkin, uwRollDice, uwSetPendingWorldEvent, uwStartBlackjack, uwStoryWager, uwTakeLoan,
+} from './underworld.js';
+import {
+    EGG_SKINS, GA_PITY_EPIC, GA_PITY_SSR, GA_RARITIES, gaBuildPaidPrompt, gaCanStartPaid,
+    gaCreateSummon, gaEquipSkinOnEgg, gaHatchEgg, gaNormalizePrefs, gaQueueVerifiedRelicEgg, gaWarmEgg,
+} from './gacha.js';
+import {
+    relAttachToCard, relPublicBadge, relSyncCatalog, relSyncInventory, relVerifyCard, relVerifyInventory,
+} from './relic.js';
 
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -44,6 +61,7 @@ function el(doc, tag, props = {}, ...children) {
     for (const [k, v] of Object.entries(props)) {
         if (v === undefined || v === null) continue;
         if (k === 'className') node.className = v;
+        else if (k === 'style' && typeof v === 'string') node.setAttribute('style', v);
         else if (k === 'dataset') Object.assign(node.dataset, v);
         else if (k.startsWith('on') && typeof v === 'function') {
             node.addEventListener(k.slice(2).toLowerCase(), v);
@@ -104,6 +122,7 @@ export function createRpStudioController(bridge) {
     let sessionAutoSpendUsd = 0;
 
     let forgeConcept = '';
+    let forgeRelic = null;
     let forgeLang = bridge.getLocale() === 'ru' ? 'ru' : 'en';
     let forgeLoreCount = 5;
     let forgeStatusText = '';
@@ -141,6 +160,27 @@ export function createRpStudioController(bridge) {
     let packPreview = null; // { pack, errors }
     let packStatusText = '';
     let currentCharDescription = '';
+    let currentUserName = '';
+    let rpPrefs = gaNormalizePrefs({});
+    let trackerSub = 'physiology'; // physiology | underworld
+    let cradleSub = 'companions'; // companions | gacha | relics
+    let underworldBetDraft = 25;
+    let pawnValueDraft = 500;
+    let underworldTargetDraft = '';
+    let collateralDraft = '';
+    let wagerStakeDraft = 'truth';
+    let lastCasinoOutcome = null;
+    let dossierBusy = false;
+    let summonBusy = false;
+    let relicCatalog = [];
+    let relicSyncStatus = '';
+    let relicChecking = false;
+    let relicCardStatus = '';
+    let relicCardVerified = false;
+    let verifiedRelics = new Map();
+    // A host may emit both MESSAGE_RECEIVED and its own assistant-turn event.
+    // Keep turn consequences idempotent for the lifetime of this controller.
+    const committedTurnKeys = new Set();
 
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
@@ -191,7 +231,11 @@ export function createRpStudioController(bridge) {
                 currentCharName = rp.charName;
                 changed = true;
             }
-            if (changed && drawerOpen && (activeTab === 'scene' || activeTab === 'phone')) renderDrawer();
+            if (rp?.userName && rp.userName !== currentUserName) {
+                currentUserName = rp.userName;
+                changed = true;
+            }
+            if (changed && drawerOpen && (activeTab === 'scene' || activeTab === 'phone' || (activeTab === 'tracker' && trackerSub === 'underworld'))) renderDrawer();
         }).catch(() => {});
     }
 
@@ -453,6 +497,22 @@ export function createRpStudioController(bridge) {
             }, parts.join(' · ')));
         }
 
+        const uwHud = state.underworld;
+        if (uwHud && (Number(uwHud.heat) >= 1 || Number(uwHud.turnsInDebt) >= 1)) {
+            const uwParts = [];
+            if (Number(uwHud.heat) >= 1) {
+                const heatVal = Math.round(Number(uwHud.heat) * 100) / 100;
+                uwParts.push(`🚔 ${heatVal}★`);
+            }
+            if (Number(uwHud.turnsInDebt) >= 1) {
+                uwParts.push(`💸 ${uwHud.currency || '$'}${Math.trunc(Number(uwHud.debt) || 0)}`);
+            }
+            secondary.push(el(doc, 'span', {
+                className: 'clodex-rp-chip clodex-rp-chip-uw',
+                dataset: { rpChip: 'underworld' },
+            }, uwParts.join(' · ')));
+        }
+
         if (state.world.enableAdultBiology && entity?.bio?.mode !== 'none') {
             const b = entity.bio;
             const vis = getVisibleBiologySummary(entity, state.world.disclosureMode);
@@ -592,6 +652,47 @@ export function createRpStudioController(bridge) {
         return String(fallback || '');
     }
 
+    // Local U2/U3 consequences run after a reply is committed, regardless of
+    // whether an API key/tracker model is configured.  The previous pending
+    // event belongs to the reply just completed; consume it before scheduling
+    // the next one so a newly-created event survives into the next prompt.
+    async function applyLocalTurnConsequences(checkpointKey = '') {
+        const key = String(checkpointKey || '');
+        if (key && committedTurnKeys.has(key)) return false;
+        if (key) {
+            const activeKey = await getLatestTurnKeySafe(key);
+            if (activeKey && activeKey !== key) return false;
+        }
+        const state = bridge.getChatState();
+        if (!state || !state.underworld) return false;
+        if (key) committedTurnKeys.add(key);
+
+        const hadPending = Boolean(state.underworld.pendingWorldEvent);
+        if (hadPending) uwConsumeWorldEvent(state.underworld);
+        const skin = uwResolveSkin(state.underworld.skin, {
+            text: `${state.world?.location || ''} ${state.world?.weather || ''}`,
+            description: currentCharDescription,
+        });
+        const localPhoneEvents = uwOnTurnCommitted(state.underworld, {
+            skin,
+            t: (token, params) => bridge.t?.(token, params) || token,
+        });
+        repCoolHeat(state.underworld, { calmTurn: true, advanceTurn: false });
+        const repEvent = repRollWorldEvent(state.underworld, { skin });
+        if (repEvent?.event && !state.underworld.pendingWorldEvent) {
+            uwSetPendingWorldEvent(state.underworld, repEvent.event, { kind: repEvent.kind });
+        }
+        if (localPhoneEvents.length && typeof bridge.saveStore === 'function') {
+            await loadLivingWorld();
+            if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+            phoneStore = asStore(phoneIngestEvents(phoneStore, localPhoneEvents, key, { source: 'underworld' }), phoneStore);
+            await savePhoneStore();
+        }
+        if (key) saveCheckpoint(state, key);
+        await bridge.saveChatState(state);
+        return true;
+    }
+
     // Loads clodex_rp_phone / clodex_rp_wiki + active branch keys. Returns true when visible data changed.
     async function loadLivingWorld() {
         if (typeof bridge.loadStore !== 'function') return false;
@@ -615,6 +716,105 @@ export function createRpStudioController(bridge) {
             livingPromise = null;
         });
         return livingPromise;
+    }
+
+    async function loadRpEntitlements() {
+        if (typeof bridge.loadRpPrefs !== 'function') return rpPrefs;
+        try { rpPrefs = gaNormalizePrefs(await bridge.loadRpPrefs()); } catch { rpPrefs = gaNormalizePrefs({}); }
+        verifiedRelics = await relVerifyInventory(rpPrefs.relics);
+        return rpPrefs;
+    }
+
+    async function runPaidGachaRitual() {
+        if (summonBusy) return null;
+        const settings = bridge.getSettings();
+        const key = bridge.getEffectiveKey();
+        if (!key) { activeTab = 'account'; toggleDrawer(true); return null; }
+        const textModel = settings.codexModel || settings.trackerModel;
+        const imageModel = settings.imageModel;
+        if (!textModel || !imageModel) { errorBanner = t('gacha.needModels'); renderAll(); return null; }
+        summonBusy = true;
+        errorBanner = '';
+        renderAll();
+        try {
+            if (settings.confirmPaid !== false) {
+                const textPrice = priceView(catalog.find(model => model.id === textModel)?.price);
+                const imagePrice = priceView(catalog.find(model => model.id === imageModel)?.price);
+                const textCost = textPrice?.unit === 'request' ? textPrice.input
+                    : textPrice?.unit === 'per_1m_total_tokens' ? textPrice.input * 600 / 1e6
+                    : textPrice?.unit === 'per_1m_tokens' && Number.isFinite(textPrice.output)
+                        ? (textPrice.input + textPrice.output) * 300 / 1e6 : null;
+                const imageCost = imagePrice?.unit === 'request' ? imagePrice.input : null;
+                const cost = Number.isFinite(textCost) && Number.isFinite(imageCost)
+                    ? formatUsd(textCost + imageCost) : t('gacha.estimateUnavailable');
+                const confirmed = await bridge.confirm(t('gacha.confirmPaid', { model: `${textModel} + ${imageModel}`, cost }));
+                if (!gaCanStartPaid({ confirmed })) return null;
+            }
+            const local = gaCreateSummon(rpPrefs, { cost: 0 });
+            if (!local.ok) { errorBanner = t('relic.cradleFull'); return null; }
+            const skin = EGG_SKINS.find(item => item.id === local.egg.eggSkin) || EGG_SKINS[0];
+            const rp = await bridge.getRpContext?.() || {};
+            const raw = await api.chat({ model: textModel, messages: [{ role: 'user', content: gaBuildPaidPrompt({ rarity: local.egg.rarity, skinId: local.egg.eggSkin, locale: bridge.getLocale(), charName: rp.charName || '{{char}}' }) }], maxTokens: 300, temperature: 0.5, jsonMode: true });
+            let lore = {};
+            try { lore = JSON.parse(raw); } catch { lore = { name: `${skin.name} companion`, mutationTrait: local.egg.mutationTrait, personality: '', prophecy: '' }; }
+            const art = await api.image({ model: imageModel, prompt: `${skin.descriptor} Render a collectible companion egg, ${local.egg.rarity} rarity, no text.` });
+            const blob = art.b64_json ? base64ToBlob(art.b64_json, 'image/png') : await api.downloadImage(art.url);
+            const base64 = art.b64_json || await blobToBase64(blob);
+            const egg = {
+                ...local.egg,
+                name: lore?.name || `${skin.name} companion`,
+                mutationTrait: lore?.mutationTrait || local.egg.mutationTrait,
+                personality: lore?.personality,
+                prophecy: lore?.prophecy,
+                artPath: await saveCompanionAsset(local.egg.id, 'image', blob, base64),
+            };
+            // gaCreateSummon already placed the egg in local.prefs. Persist that
+            // state rather than appending to the stale global snapshot a second
+            // time (paid rituals must be idempotent at the UI state boundary).
+            local.prefs.pendingEggs = local.prefs.pendingEggs.map(item => item.id === egg.id ? egg : item);
+            await saveRpEntitlements(local.prefs);
+            bridge.notify?.(t('gacha.ritualDone'));
+            return egg;
+        } catch (err) { errorBanner = redact(err?.message ?? err, key); return null; }
+        finally { summonBusy = false; renderAll(); }
+    }
+
+    async function hatchPendingEgg(eggId, state) {
+        const result = gaHatchEgg(rpPrefs, eggId);
+        if (!result.ok) { errorBanner = t(`gacha.error.${result.reason}`); renderAll(); return null; }
+        const egg = result.egg;
+        if ((state.companions || []).length >= 6) { errorBanner = t('cradle.maxReached'); return null; }
+        const claims = verifiedRelics.get(egg.relicUid)?.claims;
+        if (egg.relicUid && !claims) { errorBanner = t('relic.unverified'); renderAll(); return null; }
+        const base = createCompanionFromArchetype(claims?.archetype ?? egg.archetype, { locale: bridge.getLocale(), customName: egg.name });
+        const companion = normalizeCompanion({
+            ...base,
+            rarity: claims?.rarity ?? egg.rarity, eggSkin: claims?.eggSkin ?? egg.eggSkin,
+            mutationTrait: claims ? claims.genes.trait : egg.mutationTrait,
+            portraitPath: egg.artPath || base.portraitPath, relicUid: egg.relicUid,
+        });
+        state.companions.push(companion);
+        await bridge.saveChatState(state);
+        await saveRpEntitlements(result.prefs);
+        renderAll();
+        return companion;
+    }
+
+    async function saveRpEntitlements(next) {
+        rpPrefs = gaNormalizePrefs(next || rpPrefs);
+        await bridge.saveRpPrefs?.(rpPrefs);
+        return rpPrefs;
+    }
+
+    async function syncRpRelics() {
+        const [catalogResult, inventoryResult] = await Promise.all([
+            relSyncCatalog(api), relSyncInventory(api),
+        ]);
+        if (!inventoryResult.unavailable) {
+            await saveRpEntitlements({ ...rpPrefs, relics: inventoryResult.relics });
+            verifiedRelics = await relVerifyInventory(rpPrefs.relics);
+        }
+        return { editions: catalogResult.editions, catalogueUnavailable: catalogResult.unavailable, inventoryUnavailable: inventoryResult.unavailable };
     }
 
     function scheduleLivingRefresh() {
@@ -1042,6 +1242,9 @@ export function createRpStudioController(bridge) {
             });
             // 3. one background request per turn, budget TRACKER_MAX_TOKENS (spec 10.4)
             const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: TRACKER_MAX_TOKENS, jsonMode: true });
+            // Do not apply a late response to a swiped/deleted branch.
+            const currentTurnKey = await getLatestTurnKeySafe(turnKey);
+            if (turnKey && currentTurnKey && turnKey !== currentTurnKey) return false;
             let delta = {};
             try {
                 delta = parseTrackerExtraction(raw) || {};
@@ -1053,19 +1256,18 @@ export function createRpStudioController(bridge) {
             const phoneEvents = includePhone && Array.isArray(delta.phoneEvents) ? delta.phoneEvents.slice(0, 2) : [];
             if (!includePhone && 'phoneEvents' in delta) delete delta.phoneEvents;
             // 4. compact state + checkpoint for this exact variant
-            applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey });
+            applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey, saveCheckpoint: false });
             // 6. Anti-Slop rule is recomputed locally after every reply (0 requests)
             try {
                 await recomputeSlop({ state, save: false });
             } catch {
                 // radar failures must never block the tracker
             }
-            await bridge.saveChatState(state);
             // 5. phone journal (separate store, append-only, bound to turnKey)
             if (phoneEvents.length && typeof bridge.saveStore === 'function') {
                 await loadLivingWorld();
                 if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
-                phoneStore = asStore(phoneIngestEvents(phoneStore, phoneEvents, turnKey || checkpointKey), phoneStore);
+                phoneStore = asStore(phoneIngestEvents(phoneStore, phoneEvents, turnKey || checkpointKey, { source: 'tracker' }), phoneStore);
                 await savePhoneStore();
             }
             // 7. periodic wiki refresh in the background, bound to targetTurnKey
@@ -1613,6 +1815,7 @@ export function createRpStudioController(bridge) {
         const rp = await bridge.getRpContext?.().catch(() => ({}));
         if (rp?.charName) currentCharName = rp.charName;
         const locale = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+        forgeRelic = verifiedRelics.get(comp.relicUid) || null;
         forgeConcept = buildCompanionForgeConcept(comp, {
             charName: rp?.charName || '',
             userName: rp?.userName || '',
@@ -1650,6 +1853,7 @@ export function createRpStudioController(bridge) {
         }
 
         busyState = 'forge';
+        const relic = forgeRelic;
         forgeStatusText = t('forge.generatingCard');
         errorBanner = '';
         renderAll();
@@ -1661,6 +1865,7 @@ export function createRpStudioController(bridge) {
             });
             const cardJsonRaw = await api.chat({ model: textModel, messages: msgs, temperature: 0.7, maxTokens: 2800, jsonMode: true });
             const { card, avatarPrompt } = parseForgedCardV2(cardJsonRaw);
+            if (relic) relAttachToCard(card, relic.payload, relic.sig);
 
             forgeStatusText = t('forge.generatingAvatar');
             renderAll();
@@ -1736,6 +1941,23 @@ export function createRpStudioController(bridge) {
 
     function renderTrackerTab(state) {
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+        const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-2 clodex-rp-subtabs', dataset: { rpView: 'tracker-subtabs' } },
+            ...[['physiology', `🩺 ${t('tracker.physiology')}`], ['underworld', `🎲 ${t('tracker.underworld')}`]].map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${trackerSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'tracker-sub', sub: id },
+                onClick: () => {
+                    trackerSub = id;
+                    if (id === 'underworld') syncCachedCharName();
+                    renderDrawer();
+                },
+            }, label)),
+        );
+        container.append(subNav);
+        if (trackerSub === 'underworld') {
+            container.append(renderUnderworldTab(state));
+            return container;
+        }
 
         // Action row
         container.append(el(doc, 'div', { className: 'clodex-rp-btn-row' },
@@ -2275,15 +2497,50 @@ export function createRpStudioController(bridge) {
                                 ),
                             ),
                             el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
-                                ...b.nest.eggs.map((egg, i) => el(doc, 'div', { className: 'clodex-rp-list-item' },
-                                    t('bio.nestEggItem', {
-                                        idx: i + 1,
-                                        shell: egg.shell,
-                                        days: Math.floor(egg.daysIncubated),
-                                        target: egg.targetDays,
-                                        cracked: egg.cracked ? t('bio.crackedBadge') : '',
-                                    }),
-                                )),
+                                ...b.nest.eggs.map((egg, i) => {
+                                    const unlockedSkins = Array.isArray(rpPrefs.unlockedEggSkins) ? rpPrefs.unlockedEggSkins : [];
+                                    const skinSelectOptions = [
+                                        el(doc, 'option', { value: '', selected: !egg.eggSkin }, t('gacha.skinDefault')),
+                                        ...(egg.eggSkin && !unlockedSkins.includes(egg.eggSkin)
+                                            ? [el(doc, 'option', { value: egg.eggSkin, selected: true, disabled: true }, vGaSkinName(t, egg.eggSkin))]
+                                            : []),
+                                        ...unlockedSkins.map(skinId => el(doc, 'option', {
+                                            value: skinId,
+                                            selected: egg.eggSkin === skinId,
+                                        }, vGaSkinName(t, skinId))),
+                                    ];
+                                    return el(doc, 'div', {
+                                        className: 'clodex-rp-list-item clodex-rp-nest-item',
+                                        dataset: { rpView: 'nest-egg', eggIndex: String(i) },
+                                    },
+                                    el(doc, 'span', {},
+                                        t('bio.nestEggItem', {
+                                            idx: i + 1,
+                                            shell: egg.shell,
+                                            days: Math.floor(egg.daysIncubated),
+                                            target: egg.targetDays,
+                                            cracked: egg.cracked ? t('bio.crackedBadge') : '',
+                                        }),
+                                        egg.eggSkin ? ` · 🥚 ${vGaSkinName(t, egg.eggSkin)}` : ''),
+                                    unlockedSkins.length > 0 ? el(doc, 'select', {
+                                        className: 'clodex-rp-input clodex-rp-nest-skin-select',
+                                        'aria-label': t('gacha.equipSkinLabel'),
+                                        dataset: { rpAction: 'nest-egg-skin', eggIndex: String(i) },
+                                        onChange: async e => {
+                                            const chosen = String(e.target.value || '');
+                                            if (!chosen) return;
+                                            const eq = equipNestEggSkin(b, i, chosen, unlockedSkins);
+                                            if (!eq.ok) {
+                                                errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                                                renderAll();
+                                                return;
+                                            }
+                                            errorBanner = '';
+                                            await bridge.saveChatState(state);
+                                            renderAll();
+                                        },
+                                    }, ...skinSelectOptions) : null);
+                                }),
                             ),
                             el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
                                 el(doc, 'button', {
@@ -2579,8 +2836,29 @@ export function createRpStudioController(bridge) {
     }
 
     function renderCradleTab(state) {
-        if (!Array.isArray(state.companions)) state.companions = [];
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+        const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-3 clodex-rp-subtabs', dataset: { rpView: 'cradle-subtabs' } },
+            ...[['companions', `🐾 ${t('cradle.companions')}`], ['gacha', `🥚 ${t('cradle.gacha')}`], ['relics', `💎 ${t('cradle.relics')}`]].map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${cradleSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'cradle-sub', sub: id },
+                onClick: () => {
+                    cradleSub = id;
+                    if (id === 'relics' && !relicCatalog.length) loadRelicCatalog();
+                    else renderDrawer();
+                },
+            }, label)),
+        );
+        container.append(subNav);
+        if (cradleSub === 'gacha') {
+            container.append(renderGachaSub(state));
+            return container;
+        }
+        if (cradleSub === 'relics') {
+            container.append(renderRelicsSub());
+            return container;
+        }
+        if (!Array.isArray(state.companions)) state.companions = [];
 
         if (state.world.pendingMemoryHint) {
             container.append(el(doc, 'div', { className: 'clodex-rp-banner' },
@@ -2732,7 +3010,20 @@ export function createRpStudioController(bridge) {
         const rawCompAudio = companionAudioMap.get(activeComp.id) || '';
         const compAudioSrc = bridge.resolveMediaSrc?.(rawCompAudio) || rawCompAudio;
 
-        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+        const verifiedCompanion = activeComp.relicUid ? verifiedRelics.get(activeComp.relicUid) : null;
+        const compRarity = GA_RARITIES.includes(activeComp.rarity) ? activeComp.rarity : 'common';
+        const unlockedCompSkins = Array.isArray(rpPrefs.unlockedEggSkins) ? rpPrefs.unlockedEggSkins : [];
+        const compSkinOptions = [
+            el(doc, 'option', { value: '', selected: !activeComp.eggSkin }, t('gacha.skinDefault')),
+            ...(activeComp.eggSkin && !unlockedCompSkins.includes(activeComp.eggSkin)
+                ? [el(doc, 'option', { value: activeComp.eggSkin, selected: true, disabled: true }, vGaSkinName(t, activeComp.eggSkin))]
+                : []),
+            ...unlockedCompSkins.map(skinId => el(doc, 'option', {
+                value: skinId,
+                selected: activeComp.eggSkin === skinId,
+            }, vGaSkinName(t, skinId))),
+        ];
+        container.append(el(doc, 'div', { className: `clodex-rp-card${verifiedCompanion ? ' clodex-rp-relic-certified' : ''}` },
             el(doc, 'div', { className: 'clodex-rp-comp-hero' },
                 mediaNode,
                 el(doc, 'div', { style: 'flex:1;min-width:0' },
@@ -2753,6 +3044,13 @@ export function createRpStudioController(bridge) {
                             }, '✕'),
                         ),
                     ),
+                    el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                        el(doc, 'span', { className: `clodex-rp-rarity is-${compRarity}` }, vGaRarityLabel(t, compRarity)),
+                        activeComp.eggSkin ? el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-cradle' }, `🥚 ${vGaSkinName(t, activeComp.eggSkin)}`) : null,
+                    ),
+                    activeComp.relicUid ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt', dataset: { rpView: 'companion-relic-badge' } },
+                        verifiedCompanion ? relPublicBadge(verifiedCompanion.payload, true) : t('relic.unverified'),
+                    ) : null,
                     el(doc, 'div', { className: 'clodex-rp-stage-steps' },
                         ...COMPANION_STAGES.map(st => el(doc, 'span', {
                             className: `clodex-rp-stage-pill ${safeStage === st ? 'active' : ''}`,
@@ -2768,6 +3066,28 @@ export function createRpStudioController(bridge) {
                             : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
                                 ...traits.map(tr => el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, String(tr)))),
                     ),
+                    unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                        el(doc, 'span', {}, t('gacha.equipSkinLabel')),
+                        el(doc, 'select', {
+                            className: 'clodex-rp-input',
+                            dataset: { rpAction: 'companion-egg-skin', companionId: String(activeComp.id) },
+                            onChange: async e => {
+                                const chosen = String(e.target.value || '');
+                                if (!chosen) return;
+                                const eq = equipCompanionEggSkin(activeComp, chosen, unlockedCompSkins);
+                                if (!eq.ok) {
+                                    errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                                    renderAll();
+                                    return;
+                                }
+                                const idx = state.companions.findIndex(c => c.id === activeComp.id);
+                                if (idx >= 0) state.companions[idx] = eq.companion;
+                                errorBanner = '';
+                                await bridge.saveChatState(state);
+                                renderAll();
+                            },
+                        }, ...compSkinOptions),
+                    ) : null,
                 ),
             ),
             el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
@@ -3255,6 +3575,7 @@ export function createRpStudioController(bridge) {
                     type: 'button',
                     className: 'clodex-rp-chip-btn',
                     onClick: () => {
+                        forgeRelic = null;
                         forgeConcept = locale === 'ru' ? chip.ru : chip.en;
                         forgeLang = locale;
                         renderDrawer();
@@ -3701,6 +4022,462 @@ export function createRpStudioController(bridge) {
         return container;
     }
 
+    function resolveUnderworldSkin(state) {
+        return uwResolveSkin(state?.underworld?.skin, {
+            text: `${state?.world?.location || ''} ${state?.world?.weather || ''}`,
+            description: currentCharDescription,
+        });
+    }
+
+    async function ensureIdentityCached() {
+        if (currentCharName && currentUserName) return;
+        const rp = await bridge.getRpContext?.().catch(() => null);
+        if (rp?.charName) currentCharName = rp.charName;
+        if (rp?.userName) currentUserName = rp.userName;
+        if (rp?.charDescription !== undefined && !currentCharDescription) {
+            currentCharDescription = String(rp.charDescription || '');
+        }
+    }
+
+    async function saveUnderworld(state) {
+        await bridge.saveChatState(state);
+        renderAll();
+    }
+
+    async function runNpcDossierService(state) {
+        if (dossierBusy) return false;
+        const uw = state.underworld;
+        const resolvedSkin = resolveUnderworldSkin(state);
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return false;
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.codexModel || settings.trackerModel;
+        if (!model) {
+            errorBanner = t('wiki.needModel');
+            renderAll();
+            return false;
+        }
+        const rp = await bridge.getRpContext?.().catch(() => ({})) || {};
+        if (rp?.charName) currentCharName = rp.charName;
+        if (rp?.userName) currentUserName = rp.userName;
+        const target = underworldTargetDraft.trim() || rp.charName || currentCharName || '{{char}}';
+        const charge = repUseService(uw, 'npcDossier', { target, skin: resolvedSkin });
+        if (!charge.ok) {
+            errorBanner = t(`uw.error.${charge.reason || 'insufficient_cash'}`);
+            renderAll();
+            return false;
+        }
+        const refund = () => {
+            uw.cash = Math.min(UW_MAX_CASH, Math.max(0, Math.trunc(Number(uw.cash) || 0) + charge.cost));
+        };
+        if (settings.confirmPaid !== false) {
+            const ok = await bridge.confirm(t('uw.dossierConfirm', {
+                target,
+                model,
+                cost: `${uw.currency || '$'}${charge.cost}`,
+            }));
+            if (!ok) {
+                refund();
+                renderAll();
+                return false;
+            }
+        }
+        dossierBusy = true;
+        errorBanner = '';
+        renderAll();
+        try {
+            const recentText = (rp.recentMessages ?? []).map(m => String(m?.content ?? '')).join(' ');
+            const chatLocale = recentText
+                ? (/[а-яё]/i.test(recentText) ? 'ru' : 'en')
+                : (bridge.getLocale() === 'ru' ? 'ru' : 'en');
+            const langLabel = chatLocale === 'ru' ? 'Russian' : 'English';
+            const promptMessages = [
+                {
+                    role: 'system',
+                    content: `You are an underground information broker in a ${resolvedSkin} roleplay setting. Write a compact 2-3 sentence leaked dossier or guarded secret about "${target}" in ${langLabel}. Plain text only, no HTML, no markdown headers.`,
+                },
+                {
+                    role: 'user',
+                    content: [
+                        `Target: ${target}`,
+                        rp.charDescription ? `Character context: ${String(rp.charDescription).slice(0, 500)}` : '',
+                        rp.scenario ? `Scenario: ${String(rp.scenario).slice(0, 300)}` : '',
+                        recentText ? `Recent scene: ${recentText.slice(-800)}` : '',
+                    ].filter(Boolean).join('\n'),
+                },
+            ];
+            const raw = await api.chat({ model, messages: promptMessages, temperature: 0.55, maxTokens: 240 });
+            const dossierText = String(raw ?? '').trim();
+            if (!dossierText) throw new Error('Empty dossier response.');
+            await loadLivingWorld();
+            if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+            const turnKey = await getLatestTurnKeySafe();
+            phoneStore = asStore(phoneIngestEvents(phoneStore, [{
+                kind: 'dm',
+                author: t(`uw.dossierAuthor.${resolvedSkin}`),
+                text: dossierText,
+            }], turnKey, { source: 'underworld' }), phoneStore);
+            await savePhoneStore();
+            underworldTargetDraft = '';
+            await bridge.saveChatState(state);
+            bridge.notify?.(t('uw.dossierDone', { target }));
+            return true;
+        } catch (err) {
+            refund();
+            await bridge.saveChatState(state).catch(() => {});
+            errorBanner = redact(err?.message ?? err, key);
+            return false;
+        } finally {
+            dossierBusy = false;
+            renderAll();
+        }
+    }
+
+    function renderUnderworldTab(state) {
+        const uw = state.underworld;
+        const resolvedSkin = resolveUnderworldSkin(state);
+        if (!state.inventory || typeof state.inventory !== 'object') {
+            state.inventory = { char: [], user: [] };
+        }
+        if (!Array.isArray(state.inventory.user)) state.inventory.user = [];
+
+        const handleResult = res => {
+            if (!res?.ok) {
+                errorBanner = t(`uw.error.${res?.reason || 'invalid_amount'}`);
+                return false;
+            }
+            errorBanner = '';
+            return true;
+        };
+
+        return vUwRender(doc, t, {
+            uw,
+            resolvedSkin,
+            betDraft: underworldBetDraft,
+            pawnValueDraft,
+            collateralDraft,
+            targetDraft: underworldTargetDraft,
+            wagerStake: wagerStakeDraft,
+            lastOutcome: lastCasinoOutcome,
+            userInventory: state.inventory.user,
+            charName: currentCharName || '{{char}}',
+            dossierBusy,
+        }, {
+            onSkin: async nextSkin => {
+                const clean = UW_SKINS.includes(nextSkin) ? nextSkin : 'auto';
+                uw.skin = clean;
+                const nextResolved = resolveUnderworldSkin(state);
+                if (nextResolved === 'tavern' && uw.currency === '$') uw.currency = '🪙';
+                else if (nextResolved !== 'tavern' && uw.currency === '🪙') uw.currency = '$';
+                await saveUnderworld(state);
+            },
+            onBetInput: val => { underworldBetDraft = Math.max(1, Math.trunc(Number(val) || 1)); },
+            onDice: async side => {
+                const res = uwRollDice(uw, { bet: underworldBetDraft, side });
+                if (handleResult(res)) {
+                    lastCasinoOutcome = {
+                        game: 'dice',
+                        dice: res.dice,
+                        total: res.total,
+                        side: res.side,
+                        win: res.win,
+                        payout: res.payout,
+                        net: res.net,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onSlots: async () => {
+                const res = uwPlaySlots(uw, { bet: underworldBetDraft });
+                if (handleResult(res)) {
+                    lastCasinoOutcome = {
+                        game: 'slots',
+                        reels: res.reels,
+                        payout: res.payout,
+                        net: res.net,
+                        win: res.win,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onBjDeal: async () => {
+                const res = uwStartBlackjack(uw, { bet: underworldBetDraft });
+                if (handleResult(res)) {
+                    if (res.status !== 'playing' && res.session) {
+                        lastCasinoOutcome = {
+                            game: 'blackjack',
+                            status: res.status,
+                            player: [...res.session.player],
+                            dealer: [...res.session.dealer],
+                            playerTotal: res.playerTotal,
+                            dealerTotal: res.dealerTotal,
+                            payout: res.payout,
+                            net: res.net,
+                        };
+                    } else {
+                        lastCasinoOutcome = null;
+                    }
+                }
+                await saveUnderworld(state);
+            },
+            onBjAction: async action => {
+                const res = uwBlackjackAction(uw, uw.blackjack, action);
+                if (handleResult(res) && res.status !== 'playing' && res.session) {
+                    lastCasinoOutcome = {
+                        game: 'blackjack',
+                        status: res.status,
+                        player: [...res.session.player],
+                        dealer: [...res.session.dealer],
+                        playerTotal: res.playerTotal,
+                        dealerTotal: res.dealerTotal,
+                        payout: res.payout,
+                        net: res.net,
+                    };
+                }
+                await saveUnderworld(state);
+            },
+            onWagerStake: stake => {
+                if (VUW_WAGER_STAKES.includes(stake)) {
+                    wagerStakeDraft = stake;
+                    renderDrawer();
+                }
+            },
+            onStoryWager: async () => {
+                const res = uwStoryWager(uw, wagerStakeDraft);
+                if (handleResult(res)) {
+                    lastCasinoOutcome = { game: 'wager', stake: wagerStakeDraft, win: res.win };
+                }
+                await saveUnderworld(state);
+            },
+            onPawnValueInput: val => {
+                pawnValueDraft = Math.max(1, Math.min(50000, Math.trunc(Number(val) || 500)));
+            },
+            onTakeLoan: async () => {
+                handleResult(uwTakeLoan(uw, Math.min(5000, Math.max(1, pawnValueDraft))));
+                await saveUnderworld(state);
+            },
+            onPayDebt: async () => {
+                handleResult(uwPayDebt(uw));
+                await saveUnderworld(state);
+            },
+            onPawnPreset: async (presetKey, label, val) => {
+                await ensureIdentityCached();
+                const res = uwPawnCollateral(uw, {
+                    kind: 'preset',
+                    presetKey,
+                    label,
+                    pawnValue: val,
+                }, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                handleResult(res);
+                await saveUnderworld(state);
+            },
+            onCollateralInput: val => { collateralDraft = String(val ?? ''); },
+            onPawnCustom: async () => {
+                await ensureIdentityCached();
+                const res = uwPawnCollateral(uw, {
+                    kind: 'custom',
+                    label: collateralDraft,
+                    pawnValue: pawnValueDraft,
+                }, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                if (handleResult(res)) collateralDraft = '';
+                await saveUnderworld(state);
+            },
+            onPawnInventory: async itemLabel => {
+                await ensureIdentityCached();
+                const res = uwPawnInventoryItem(uw, state.inventory.user, itemLabel, pawnValueDraft, {
+                    skin: resolvedSkin,
+                    charName: currentCharName,
+                    userName: currentUserName,
+                    companions: state.companions || [],
+                });
+                handleResult(res);
+                await saveUnderworld(state);
+            },
+            onRedeem: async collateralId => {
+                handleResult(uwRedeemCollateral(uw, collateralId, state.inventory.user));
+                await saveUnderworld(state);
+            },
+            onImportFactions: async () => {
+                await loadLivingWorld();
+                repImportFactions(uw, wikiCache.npcs, { skin: resolvedSkin });
+                errorBanner = '';
+                await saveUnderworld(state);
+            },
+            onTargetInput: val => { underworldTargetDraft = String(val ?? ''); },
+            onService: async serviceId => {
+                if (serviceId === 'npcDossier') {
+                    await runNpcDossierService(state);
+                    return;
+                }
+                if (serviceId === 'muscle') {
+                    if (uw.pendingWorldEvent) {
+                        errorBanner = t('uw.error.busy_event');
+                        renderAll();
+                        return;
+                    }
+                    await ensureIdentityCached();
+                    const target = underworldTargetDraft.trim() || currentCharName || 'the current target';
+                    const res = repUseService(uw, 'muscle', { target, skin: resolvedSkin });
+                    if (handleResult(res)) {
+                        uwSetPendingWorldEvent(uw, res.event, { kind: 'service' });
+                        underworldTargetDraft = '';
+                        bridge.notify?.(t('uw.muscleArmed'));
+                    }
+                    await saveUnderworld(state);
+                    return;
+                }
+                handleResult(repUseService(uw, 'clearHeat', { skin: resolvedSkin }));
+                await saveUnderworld(state);
+            },
+        });
+    }
+
+    function renderGachaSub(state) {
+        return vGaRenderAltar(doc, t, {
+            prefs: rpPrefs,
+            currency: state.underworld?.currency || '$',
+            cash: state.underworld?.cash ?? 0,
+            summonBusy,
+            resolveSrc: path => bridge.resolveMediaSrc?.(path) || path,
+        }, {
+            onSummon: async () => {
+                const result = gaCreateSummon(rpPrefs, { cash: state.underworld.cash, cost: 50 });
+                if (!result.ok) {
+                    errorBanner = t(result.reason === 'cradle_full' ? 'relic.cradleFull' : 'uw.error.insufficient_cash');
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                state.underworld.cash = result.cash;
+                await saveRpEntitlements(result.prefs);
+                await bridge.saveChatState(state);
+                bridge.notify?.(`${t('gacha.summoned')} ${vGaRarityLabel(t, result.egg.rarity)}`);
+                renderAll();
+            },
+            onPaidRitual: () => runPaidGachaRitual(),
+            onWarm: async eggId => {
+                const warmed = gaWarmEgg(rpPrefs, eggId, 20);
+                if (!warmed.ok) {
+                    errorBanner = t(`gacha.error.${warmed.reason || 'egg_not_found'}`);
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(warmed.prefs);
+                renderAll();
+            },
+            onHatch: eggId => hatchPendingEgg(eggId, state),
+            onEquipEggSkin: async (eggId, skinId) => {
+                const eq = gaEquipSkinOnEgg(rpPrefs, eggId, skinId);
+                if (!eq.ok) {
+                    errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(eq.prefs);
+                renderAll();
+            },
+        });
+    }
+
+    async function loadRelicCatalog() {
+        if (relicChecking) return;
+        relicChecking = true;
+        renderAll();
+        try {
+            const synced = await syncRpRelics();
+            relicCatalog = synced.editions;
+            relicSyncStatus = synced.catalogueUnavailable ? t('relic.unavailable')
+                : synced.inventoryUnavailable ? t('relic.inventoryUnavailable') : t('relic.synced');
+        } catch {
+            relicSyncStatus = t('relic.inventoryUnavailable');
+        } finally {
+            relicChecking = false;
+            renderAll();
+        }
+    }
+
+    async function verifyRelicPng(file) {
+        if (!file) return;
+        relicCardVerified = false;
+        relicCardStatus = t('relic.unverified');
+        try {
+            if (file.size > 16 * 1024 * 1024) throw new Error('PNG too large.');
+            const card = extractCharacterCardFromPng(await file.arrayBuffer());
+            const result = await relVerifyCard(card);
+            if (result.verified) {
+                relicCardVerified = true;
+                relicCardStatus = relPublicBadge(result.relic.payload, true);
+            }
+        } catch { /* Invalid, oversized or unsigned images do not get a badge. */ }
+        renderAll();
+    }
+
+    async function copyRelicMintLink(url) {
+        const cleanUrl = String(url || '');
+        if (!cleanUrl) return;
+        try {
+            if (typeof bridge.copyText === 'function') {
+                await bridge.copyText(cleanUrl);
+            } else if (win.navigator?.clipboard?.writeText) {
+                await win.navigator.clipboard.writeText(cleanUrl);
+            } else if (globalThis.navigator?.clipboard?.writeText) {
+                await globalThis.navigator.clipboard.writeText(cleanUrl);
+            }
+            bridge.notify?.(t('relic.linkCopied'));
+        } catch {
+            // Clipboard permission may be restricted in sandboxed WebViews; anchor link remains directly tappable.
+        }
+    }
+
+    function renderRelicsSub() {
+        return vGaRenderRelics(doc, t, {
+            catalog: relicCatalog,
+            relics: rpPrefs.relics,
+            verifiedRelics,
+            hatchedRelicUids: rpPrefs.hatchedRelicUids,
+            pendingEggs: rpPrefs.pendingEggs,
+            syncStatus: relicSyncStatus,
+            checking: relicChecking,
+            cardStatus: relicCardStatus,
+            cardVerified: relicCardVerified,
+            summonBusy,
+            locale: bridge.getLocale(),
+        }, {
+            onSync: () => loadRelicCatalog(),
+            onVerifyPng: file => verifyRelicPng(file),
+            onCopyLink: url => copyRelicMintLink(url),
+            onQueueEgg: async claims => {
+                const queued = gaQueueVerifiedRelicEgg(rpPrefs, claims);
+                if (!queued.ok) {
+                    errorBanner = t(queued.reason === 'cradle_full' ? 'relic.cradleFull' : 'relic.added');
+                    renderAll();
+                    return;
+                }
+                errorBanner = '';
+                await saveRpEntitlements(queued.prefs);
+                cradleSub = 'gacha';
+                renderAll();
+            },
+        });
+    }
+
     function renderPacksSub() {
         return vPackRender(doc, t, {
             name: packNameDraft,
@@ -3877,6 +4654,10 @@ export function createRpStudioController(bridge) {
         if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
             tracked = await syncTrackerFromChat({ checkpointKey, silent: true });
         }
+        // Apply deterministic underworld/reputation ticks even in offline
+        // mode. This also writes the checkpoint only after tracker extraction
+        // and local consequences have both completed.
+        await applyLocalTurnConsequences(checkpointKey);
         if (!tracked) {
             // Anti-Slop is local: keep the radar fresh even without a key / with auto-track disabled.
             await recomputeSlop().catch(() => {});
@@ -3920,12 +4701,26 @@ export function createRpStudioController(bridge) {
     applyPillPosition(bridge.loadHudPosition?.());
     syncCachedCharName();
     loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
+    loadRpEntitlements().then(renderAll).catch(() => {});
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }
 
     function openTab(tabId = 'tracker') {
-        const id = String(tabId || 'tracker');
+        const requested = String(tabId || 'tracker');
+        const id = requested === 'underworld' || requested === 'casino' ? 'tracker'
+            : requested === 'gacha' || requested === 'relics' ? 'cradle' : requested;
+        if (requested === 'tracker') trackerSub = 'physiology';
+        else if (requested === 'underworld' || requested === 'casino') {
+            trackerSub = 'underworld';
+            syncCachedCharName();
+        }
+        if (requested === 'cradle') cradleSub = 'companions';
+        else if (requested === 'gacha') cradleSub = 'gacha';
+        else if (requested === 'relics') {
+            cradleSub = 'relics';
+            if (!relicCatalog.length) loadRelicCatalog();
+        }
         if (id === 'wiki' || id === 'style' || id === 'questions') {
             activeTab = 'codex';
             codexSub = id;
@@ -3972,6 +4767,9 @@ export function createRpStudioController(bridge) {
         onAssistantMessageCommitted,
         refreshAccount,
         reloadLivingWorld,
+        loadRpEntitlements,
+        saveRpEntitlements,
+        syncRpRelics,
         runWikiUpdate,
         recomputeSlop,
         revealPhoneEntry,
