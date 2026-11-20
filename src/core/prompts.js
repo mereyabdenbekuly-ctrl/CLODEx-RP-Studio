@@ -1,3 +1,4 @@
+import { nestHintFor, nestPromptName } from './coopNest.js';
 import { activeEntitiesForTarget, getCyclePhase, getVisibleBiologySummary } from './physiology.js';
 import { uwContinuityLine } from './underworld.js';
 import { repContextLine } from './reputation.js';
@@ -176,7 +177,12 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
 
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const compact = state.companions.length <= 2;
-        const compItems = state.companions.slice(0, 4).map(c => {
+        const hintIndex = state.companions.findIndex(c => nestHintFor(c));
+        const visible = state.companions.slice(0, 4);
+        if (hintIndex > 3) visible[3] = state.companions[hintIndex];
+        const compItems = visible.map(c => {
+            const i = state.companions.indexOf(c);
+            const hint = i === hintIndex ? nestHintFor(c) : '';
             const moodNum = Number.isFinite(Number(c.mood)) ? Math.round(Number(c.mood)) : 85;
             const fullNum = Number.isFinite(Number(c.fullness)) ? Math.round(Number(c.fullness)) : 85;
             const energyNum = Number.isFinite(Number(c.energy)) ? Math.round(Number(c.energy)) : 90;
@@ -185,10 +191,12 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
             const fullWord = compact && fullNum <= 35 ? 'hungry ' : '';
             const energyWord = compact && energyNum <= 35 ? 'sleepy ' : '';
             const bondTag = compact && bondNum >= 75 ? ', deeply bonded' : '';
-            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullWord}${fullNum}%, energy ${energyWord}${energyNum}%${bondTag})`;
+            return `${String(nestPromptName(c, i) || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullWord}${fullNum}%, energy ${energyWord}${energyNum}%${bondTag}${hint ? `, ${hint}` : ''})`;
         });
         const moreSuffix = state.companions.length > 4 ? ` (+${state.companions.length - 4} more)` : '';
-        lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
+        const line = `• Active Companions: ${compItems.join('; ')}${moreSuffix}.`;
+        if (hintIndex >= 0) lines.splice(3, 0, line);
+        else lines.push(line);
     }
 
     const continuityLine = promptsWorldContinuityLine(state.underworld);
@@ -215,7 +223,7 @@ export function buildTrackerExtractionMessages(state, recentMessages, {
         ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
         : '';
     const companionNames = Array.isArray(state.companions) && state.companions.length > 0
-        ? state.companions.slice(0, 6).map(c => c.name).filter(Boolean).join(', ')
+        ? state.companions.slice(0, 6).map(nestPromptName).filter(Boolean).join(', ')
         : '';
     const companionSchemaHint = companionNames
         ? [

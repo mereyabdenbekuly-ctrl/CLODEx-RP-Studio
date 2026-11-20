@@ -4,6 +4,7 @@ import { dirBuildCue } from '../core/director.js';
 import { createRpStudioController } from '../core/hud.js';
 import { jrTurnKey } from '../core/journal.js';
 import { PACK_MAX_BYTES } from '../core/pack.js';
+import { GIFT_MAX_BYTES } from '../core/gift.js';
 import { phoneGc, phoneNormalizeStore } from '../core/phone.js';
 import { createChatState, normalizeChatState, restoreCheckpointBefore, restoreCheckpointExact } from '../core/physiology.js';
 import { buildSystemContext } from '../core/prompts.js';
@@ -459,6 +460,7 @@ export async function initializeSillyTavern({
             pushExtensionPrompt();
             renderTurnExtras();
         },
+        getChatScope: () => String(getContext().getCurrentChatId?.() ?? getContext().chatId ?? 'default'),
         getChatState() {
             const cid = String(getContext().getCurrentChatId?.() ?? getContext().chatId ?? 'default');
             if (cid !== currentChatId) loadStateForCurrentChat();
@@ -519,6 +521,14 @@ export async function initializeSillyTavern({
             if (blob.size > PACK_MAX_BYTES) throw new Error(`Pack is larger than ${PACK_MAX_BYTES} bytes.`);
             const base = String(pack?.name || 'clodex').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'clodex';
             downloadBlob(blob, `${base}.clodex-pack`);
+        },
+        async exportPet(filename, json) {
+            const blob = new Blob([json], { type: 'application/json' });
+            if (blob.size > GIFT_MAX_BYTES) throw new Error('tooLarge');
+            downloadBlob(blob, filename);
+        },
+        async importPet() {
+            return pickTextFile('.clodex-pet,application/json', GIFT_MAX_BYTES);
         },
         async importPack() {
             const text = await pickTextFile('.clodex-pack,.json,application/json', PACK_MAX_BYTES);

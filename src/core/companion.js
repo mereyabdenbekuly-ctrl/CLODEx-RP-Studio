@@ -1,3 +1,4 @@
+import { nestLinkFields, nestPromptName } from './coopNest.js';
 import { diffDaysForward } from './date.js';
 import { EGG_SKINS, GA_RARITIES } from './gacha.js';
 
@@ -261,12 +262,14 @@ export function normalizeCompanion(raw, idx = 0) {
         videoPath,
         videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
         needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
+        ...nestLinkFields(src),
+        ...(src.cradleCarry === true ? { cradleCarry: true } : {}),
         lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
         ...(GA_RARITIES.includes(src.rarity) ? { rarity: src.rarity } : {}),
         ...(EGG_SKINS.some(skin => skin.id === src.eggSkin) ? { eggSkin: src.eggSkin } : {}),
         ...(typeof src.mutationTrait === 'string' && src.mutationTrait
             ? { mutationTrait: src.mutationTrait.replace(/[<>]/g, '').slice(0, 120) } : {}),
-        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
+        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
     };
 }
 
@@ -450,9 +453,12 @@ export function interactWithCompanion(companion, action, { rpDate = '' } = {}) {
 
     const stageLabel = COMPANION_STAGES.includes(target.stage) ? target.stage : 'infant';
     const roleLabel = target.originChildId ? `${stageLabel} child` : `${stageLabel} companion`;
-    const memoryHint = `{{user}} ${spec.verb} ${target.name} (${roleLabel}); naturally weave a brief moment of ${target.name} ${spec.detail} into this turn.`;
+    const safeName = nestPromptName(target) || target.name;
+    const memoryHint = `{{user}} ${spec.verb} ${safeName} (${roleLabel}); naturally weave a brief moment of ${safeName} ${spec.detail} into this turn.`;
 
-    return { companion: target, memoryHint };
+    return { companion: target, memoryHint, care: {
+        fullnessDelta: spec.fullness, moodDelta: spec.mood, bondDelta: spec.bond, energyDelta: spec.energy,
+    } };
 }
 
 export function advanceCompanionsDays(companions, deltaDays) {
@@ -461,7 +467,7 @@ export function advanceCompanionsDays(companions, deltaDays) {
     if (days <= 0) return companions;
 
     for (const comp of companions) {
-        if (!comp || typeof comp !== 'object') continue;
+        if (!comp || typeof comp !== 'object' || comp.sharedNestUid) continue;
         const prevStage = COMPANION_STAGES.includes(comp.stage) ? comp.stage : compStageForAge(comp.ageDays);
         comp.ageDays = Math.max(0, Math.trunc(compFiniteOr(comp.ageDays, 0))) + days;
         const nextStage = compStageForAge(comp.ageDays);
@@ -553,7 +559,7 @@ export function buildCompanionPortraitPrompt(companion, {
 
     const rawPrompt = [
         styleLead,
-        `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
+        `Subject: ${nestPromptName(comp)}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
         `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
         skinClause,
         lineageClause,
@@ -576,7 +582,7 @@ export function buildCompanionVideoPrompt(companion) {
             : 'soft sleepy demeanor settling cozily for warmth';
 
     const rawPrompt = [
-        `Subtle 4-second cinematic image-to-video animation of ${comp.name} at the ${comp.stage} stage:`,
+        `Subtle 4-second cinematic image-to-video animation of ${nestPromptName(comp)} at the ${comp.stage} stage:`,
         `${profile.motionCue}, natural eye blink, ${moodMotion}.`,
         'Smooth micro-camera push-in, consistent character anatomy and lighting, drifting ambient dust motes, seamless loopable motion, no distortion or text.',
     ].join(' ');
@@ -615,7 +621,7 @@ export function buildCompanionBabbleMessages(companion, {
                 : 'feeling calm and attentive';
 
     const systemContent = [
-        `You roleplay ONLY as ${comp.name} (${comp.originChildId ? 'child/heir' : comp.speciesKey.replace(/_/g, ' ')}, stage: ${comp.stage}).`,
+        `You roleplay ONLY as ${nestPromptName(comp)} (${comp.originChildId ? 'child/heir' : (comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, stage: ${comp.stage}).`,
         `Write in ${langName}. Return ONLY 1–2 short spoken sentences enclosed in quotation marks (${quoteExample}) suitable for direct text-to-speech playback, with no narration outside quotes and no markdown.`,
         stageVoiceRule,
         `Traits: ${comp.traits.join(', ')}. Current state: ${needNote}, bond ${comp.bond}/100.`,
@@ -623,8 +629,8 @@ export function buildCompanionBabbleMessages(companion, {
 
     const caregivers = [charName, userName].filter(Boolean).join(' & ') || 'your caregiver';
     const userContent = isRu
-        ? `Произнеси одну живую короткую реплику в кавычках от лица ${comp.name} для ${caregivers}.`
-        : `Speak one short, vivid in-character line in quotes as ${comp.name} addressing ${caregivers}.`;
+        ? `Произнеси одну живую короткую реплику в кавычках от лица ${nestPromptName(comp)} для ${caregivers}.`
+        : `Speak one short, vivid in-character line in quotes as ${nestPromptName(comp)} addressing ${caregivers}.`;
 
     return [
         { role: 'system', content: systemContent },
@@ -647,9 +653,9 @@ export function buildCompanionForgeConcept(companion, {
     if (isRu) {
         const lineage = isHeir
             ? `Повзрослевший наследник второго поколения (${comp.gender === 'male' ? 'сын' : 'дочь'} ${parentA} и ${parentB}, проживший ${comp.ageDays} дн. в хронике Колыбели)`
-            : `Пробудившийся в самостоятельном облике фамильяр-спутник (${comp.speciesKey.replace(/_/g, ' ')}, воспитанный ${parentA} и ${parentB} за ${comp.ageDays} дн. странствий, узы ${comp.bond}/100)`;
+            : `Пробудившийся в самостоятельном облике фамильяр-спутник (${(comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, воспитанный ${parentA} и ${parentB} за ${comp.ageDays} дн. странствий, узы ${comp.bond}/100)`;
         return [
-            `Имя персонажа: ${comp.name}.`,
+            `Имя персонажа: ${nestPromptName(comp)}.`,
             `Происхождение и роль: ${lineage}.`,
             `Унаследованные черты характера: ${traitsList}. Темперамент и настрой: ${comp.mood}/100.`,
             `Сделай полноценную карточку второго поколения (CCv2): детальная внешность взрослой стадии, манера речи, личная цель и сложная эмоциональная связь с {{user}} и ${parentA}.`,
@@ -659,10 +665,10 @@ export function buildCompanionForgeConcept(companion, {
 
     const lineageEn = isHeir
         ? `Grown second-generation dynasty heir (${comp.gender === 'male' ? 'son' : 'daughter'} of ${parentA} and ${parentB}, raised across ${comp.ageDays} days in the Cradle chronicle)`
-        : `Awakened ascendant familiar (${comp.speciesKey.replace(/_/g, ' ')}, raised by ${parentA} and ${parentB} over ${comp.ageDays} days, bond ${comp.bond}/100)`;
+        : `Awakened ascendant familiar (${(comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, raised by ${parentA} and ${parentB} over ${comp.ageDays} days, bond ${comp.bond}/100)`;
 
     return [
-        `Character Name: ${comp.name}.`,
+        `Character Name: ${nestPromptName(comp)}.`,
         `Origin & Role: ${lineageEn}.`,
         `Inherited Personality Traits: ${traitsList}. Temperament & morale: ${comp.mood}/100.`,
         `Design a rich second-generation CCv2 character card: adult appearance, distinct voice, personal ambition, and deep history with {{user}} and ${parentA}.`,

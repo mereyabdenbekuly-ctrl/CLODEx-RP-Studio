@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0 — 2026-11-20
+
+- **Pet & Egg Gift Capsules (`🎁 Pet Gifts`, `CLXPET1:` / `.clodex-pet`)**: package any ordinary companion or Altar egg into an offline shareable `CLXPET1:` code or `.clodex-pet` file with sender alias and 140-char note (no local paths, chat text, or ownership tokens). Includes local replay guard, unlocked-skin transfer, and sender recall backup.
+- **Verified Relic Ownership Transfer (`RPR-GIFT-XXXX-XXXX-XXXX`)**: issue a one-time 72-hour gift code for an owned limited-edition relic on `https://clodex.xyz/console/rp-relics` and claim it in either **Tavo AI**, **SillyTavern**, or the web console with atomic ownership transfer and fresh `ES256` certificate re-issuance.
+- **Multiplayer Shared Cradle (`🤝 Shared Cradle`, `NEST-XXXX-XXXX`)**: raise a shared egg or companion across two guardians' independent RP chats via `/v1/rp/nests` (passport + bounded care deltas only, `0` chat text transmitted, `0` quota charged), preserving safe companion names across RP context, portraits, video, TTS, and CCv2 graduation while blocking prompt-injection strings and double local care mutations.
+
 ## 1.4.2 — 2026-11-20
 
 - **Two-Way Narrative Companion Care (Zero Extra API Calls)**:

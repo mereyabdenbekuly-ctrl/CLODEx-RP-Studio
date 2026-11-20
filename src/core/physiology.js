@@ -250,6 +250,7 @@ export function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        cradleRemoved: [],
         companions: [],   // up to 6 active companions/heirs normalized via normalizeCompanion
         customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
         inventory: {
@@ -389,6 +390,8 @@ export function normalizeChatState(raw) {
             ...(physIsValidEggSkin(child?.eggSkin) ? { eggSkin: child.eggSkin } : {}),
         }));
     }
+    out.cradleRemoved = [...new Set((Array.isArray(raw.cradleRemoved) ? raw.cradleRemoved : [])
+        .filter(id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(id)))].slice(-100);
     if (Array.isArray(raw.companions)) {
         const seenIds = new Set();
         const seenChildIds = new Set();
@@ -901,7 +904,8 @@ export function physEncodeSnapshot(state) {
     if (src.scene && typeof src.scene === 'object') delete src.scene.imagePrompt;
     if (Array.isArray(src.activityLog)) src.activityLog = src.activityLog.slice(-PHYS_SNAPSHOT_LOG_TAIL);
 
-    const companions = Array.isArray(src.companions) ? src.companions : [];
+    delete src.cradleRemoved;
+    const companions = Array.isArray(src.companions) ? src.companions.filter(comp => !comp.cradleCarry && !comp.sharedNestUid) : [];
     const meters = Array.isArray(src.customMeters) ? src.customMeters : [];
     delete src.companions;
     delete src.customMeters;
@@ -1005,6 +1009,11 @@ function physRestoreInto(state, target, keptCheckpoints) {
     const preservedImagePrompt = state.scene?.imagePrompt;
     const preservedCodex = state.codexHistory;
     const restored = physDecodeSnapshot(target.snapshot);
+    const carried = (state.companions || []).filter(comp => comp.cradleCarry || comp.sharedNestUid);
+    const removed = state.cradleRemoved || [];
+    restored.companions = [...carried, ...restored.companions.filter(comp =>
+        !comp.sharedNestUid && !comp.cradleCarry && !removed.includes(comp.id) && !carried.some(live => live.id === comp.id))].slice(0, 6);
+    restored.cradleRemoved = removed;
     Object.assign(state, restored);
     if (preservedDirector !== undefined) state.world.director = normalizeDirectorState(preservedDirector);
     if (preservedHint !== undefined) state.world.pendingMemoryHint = String(preservedHint ?? '');
@@ -1284,6 +1293,7 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
 
             const targets = selectCareTargets(care.target ?? care.name ?? '');
             for (const comp of targets) {
+                if (comp.sharedNestUid) continue;
                 if (fullShift) comp.fullness = applyZeroPunishDelta(comp.fullness, fullShift, 85, 20);
                 if (energyShift) comp.energy = applyZeroPunishDelta(comp.energy, energyShift, 90, 20);
                 if (bondShift > 0) {
@@ -1305,6 +1315,7 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
 
         if (hasExplicitMood && explicitMoodShift !== 0) {
             for (const comp of state.companions) {
+                if (comp.sharedNestUid) continue;
                 comp.mood = applyZeroPunishDelta(comp.mood, explicitMoodShift, 85, 20);
             }
         } else if (!hasExplicitMood && !hadCareMoodBoost) {
@@ -1324,6 +1335,7 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
             const ambientShift = freshTrauma ? -10 : highStress ? -6 : soothingTurn ? 5 : 0;
             if (ambientShift !== 0) {
                 for (const comp of state.companions) {
+                if (comp.sharedNestUid) continue;
                     comp.mood = applyZeroPunishDelta(comp.mood, ambientShift, 85, 20);
                 }
             }

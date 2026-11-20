@@ -375,6 +375,7 @@ test('Classic-IIFE bundler compatibility: core modules concatenate into strict V
         'src/core/physiology.js',
         'src/core/gacha.js',
         'src/core/companion.js',
+        'src/core/coopNest.js',
         'src/core/prompts.js',
         'src/core/codex.js',
         'src/core/voice.js',

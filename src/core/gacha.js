@@ -1,3 +1,5 @@
+import { nestLinkFields, nestPrefsFields } from './coopNest.js';
+
 // U4: autonomous altar/gacha. Only the paid summon path is allowed to call
 // the host API, and callers must explicitly confirm before doing so.
 
@@ -50,7 +52,14 @@ export function gaNormalizePrefs(raw) {
             && typeof x?.sig === 'string' && x.sig.length <= 256
         ).map(({ payload, sig }) => ({ payload, sig })) : [],
         hatchedRelicUids: [...new Set((Array.isArray(source.hatchedRelicUids) ? source.hatchedRelicUids : [])
-            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(value)))],
+            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(value)))],
+        ...nestPrefsFields(source),
+        sentGifts: (Array.isArray(source.sentGifts) ? source.sentGifts : []).filter(item =>
+            /^gft_[a-f0-9]{16}$/.test(item?.giftId) && ['egg', 'companion'].includes(item?.kind)
+            && /^CLXPET1:[A-Za-z0-9_-]{1,5462}$/.test(item?.code)
+        ).slice(-5).map(({ giftId, kind, name, code, sentAt }) => ({ giftId, kind, name: String(name || '').slice(0, 80), code, sentAt })),
+        redeemedGiftIds: [...new Set((Array.isArray(source.redeemedGiftIds) ? source.redeemedGiftIds : [])
+            .filter(id => typeof id === 'string' && /^gft_[a-f0-9]{16}$/.test(id)))].slice(-100),
         pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
     };
 }
@@ -71,8 +80,10 @@ export function gaNormalizeEgg(raw) {
         name: String(raw.name || '').replace(/[<>]/g, '').slice(0, 80),
         personality: String(raw.personality || '').replace(/[<>]/g, '').slice(0, 240),
         prophecy: String(raw.prophecy || '').replace(/[<>]/g, '').slice(0, 240),
+        ...nestLinkFields(raw),
+        ...(raw.needsStageArt === true ? { needsStageArt: true } : {}),
         artPath: String(raw.artPath || '').slice(0, 512),
-        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
+        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
     };
 }
 

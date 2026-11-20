@@ -8,6 +8,10 @@
 
 ## Highlights
 
+- **Pet Gifts, Relic Transfers & Shared Cradle (`v1.5`):**
+  - **Offline Pet & Egg Gift Capsules (`🎁 Pet Gifts`, `CLXPET1:` / `.clodex-pet`):** Package any non-relic companion or Altar egg into a compact `CLXPET1:` string or `.clodex-pet` file with sender alias, 140-char note, and automatic egg-skin unlock (zero private paths or chat text), plus local recall backup.
+  - **Verified Relic Ownership Transfer (`RPR-GIFT-XXXX-XXXX-XXXX`):** Mint a one-time 72-hour transfer code on `https://clodex.xyz/console/rp-relics` and claim it in **Tavo AI**, **SillyTavern**, or the web console with atomic server-side re-certification (`ES256`).
+  - **Multiplayer Shared Cradle (`🤝 Shared Cradle`, `NEST-XXXX-XXXX`) & Two-Way Story Care (`v1.4.2–v1.5.0`):** Co-raise an egg or companion with a second guardian across separate RP chats via `/v1/rp/nests` (passport + bounded care deltas only, `0` chat text sent, `0` quota charged), while feeding/resting/petting in story prose automatically updates companion stats.
 - **Underworld, Wanted & Relics (`v1.4`):**
   - **Underworld Wallet, Casino & Story Wagers (`🧬 Tracker → 🎲 Underworld & Casino`):** Chat-scoped wallet with setting-aware skins (`Auto / Crime / Tavern / Syndicate`), visible outcome displays for **Dice (`2d6`)**, **3-Reel Slots**, interactive **Blackjack (`21`)** (player cards + total, dealer upcard + `[🂠]`, *Hit*, *Stand*, *Double*), and **Story Wagers with `{{char}}`** (*Truth / Wish / Secret* stakes arming one-turn depth-0 world events).
   - **Pawn Shop, Inventory Pawning & Debt Escalation:** Separate loan/pawn valuation, 1-click setting-themed property presets (*Apartment, Car, Estate, Ancestral Blade, Habitat Pod, Cyber Implant*, etc.), 1-click pawning & redemption of items from `state.inventory.user`, character/companion safety filter, and collector DMs + turn-3 voice warning in `📱`.
@@ -30,8 +34,8 @@
 
 ## Installation
 
-- **Tavo AI (`v0.93.0+`):** Download **[CLODEx-RP-Studio-1.4.1.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.1/CLODEx-RP-Studio-1.4.1.tpg)**, enable **Advanced Rendering**, import the `.tpg` package under **Plugins**, enter your `sk-...` key from `https://clodex.xyz`, and tap the top HUD pill in chat.
-- **SillyTavern (`1.19.0+`):** Install via **Extensions → Install Extension** using `https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio` (or download **[CLODEx-RP-Studio-SillyTavern-1.4.1.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.1/CLODEx-RP-Studio-SillyTavern-1.4.1.zip)** and unpack into `data/<user>/extensions/CLODEx-RP-Studio`). If `CLODEx for SillyTavern` is already installed, your API key is detected automatically.
+- **Tavo AI (`v0.93.0+`):** Download **[CLODEx-RP-Studio-1.5.0.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.5.0/CLODEx-RP-Studio-1.5.0.tpg)**, enable **Advanced Rendering**, import the `.tpg` package under **Plugins**, enter your `sk-...` key from `https://clodex.xyz`, and tap the top HUD pill in chat.
+- **SillyTavern (`1.19.0+`):** Install via **Extensions → Install Extension** using `https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio` (or download **[CLODEx-RP-Studio-SillyTavern-1.5.0.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.5.0/CLODEx-RP-Studio-SillyTavern-1.5.0.zip)** and unpack into `data/<user>/extensions/CLODEx-RP-Studio`). If `CLODEx for SillyTavern` is already installed, your API key is detected automatically.
 - **SillyTavern Slash Commands & Deletion Rollback Note:** Includes `/clodex-phone`, `/clodex-wiki`, `/clodex-director`, `/clodex-underworld` (`/clodex-casino`), `/clodex-gacha` (in addition to `/clodex-rp`, `/clodex-cradle`, `/clodex-codex`, `/clodex-scene`, `/clodex-forge`, `/clodex-speak`). Deleting messages from the **tail of the chat** is the primary rollback scenario and cleanly reverts tracker snapshots, hidden thoughts, phone entries, and wiki patches; when deleting a message from the **middle** of an ST chat, `#hash(send_date)` protects journal entries from index shifts while exact snapshot index alignment cannot be guaranteed across shifted middle items.
 
 ---

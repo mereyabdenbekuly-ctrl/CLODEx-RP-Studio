@@ -12,6 +12,9 @@ import {
     REL_PUBLIC_JWK,
     relAttachToCard,
     relBytesToBase64Url,
+    relClaimGift,
+    relReconcileServerInventory,
+    relSyncInventory,
     relCanonicalPayload,
     relNormalizePublicJwk,
     relPublicBadge,
@@ -161,3 +164,45 @@ test('pinned production clodex.xyz REL_PUBLIC_JWK is frozen and WebCrypto-import
     assert.equal(imported.type, 'public');
 });
 
+
+test('Gift claim validates its code, uses a retry key and verifies the unchanged ES256 certificate', async () => {
+    const signed = await signedCertificate();
+    const calls = [];
+    const api = { request: async (url, opts) => {
+        calls.push({ url, ...opts });
+        return { success: true, data: { certPayload: signed.payload, certSignature: signed.signature } };
+    } };
+    const signedOptions = { publicJwk: signed.publicJwk, cryptoImpl: webcrypto };
+    const code = 'RPR-GIFT-ABCD-EFGH-JKLM';
+    const key = 'retry-failed-response';
+    const entry = await relClaimGift(api, code.toLowerCase(), key, signedOptions);
+    assert.equal(entry.claims.relicUid, certificate().relicUid);
+    assert.equal(entry.payload, signed.payload);
+    assert.deepEqual(calls, [{
+        url: '/v1/rp/relics/transfer/claim', method: 'POST', body: { code },
+        headers: { 'Idempotency-Key': key }, timeout: 12000,
+    }]);
+    await assert.rejects(() => relClaimGift(api, 'wrong code', key, signedOptions), /invalid_input/);
+    await assert.rejects(() => relClaimGift({
+        request: async () => ({ success: true, data: { certPayload: signed.payload.replace('"serial":17', '"serial":18'), certSignature: signed.signature } }),
+    }, code, key, signedOptions), /unverified/);
+});
+
+test('Only a verified inventory response removes transferred certificates and unhatched eggs', async () => {
+    const signed = await signedCertificate();
+    const id = certificate().relicUid;
+    const ordinaryEgg = { id: 'ordinary' };
+    const relicEgg = { id: 'relic', relicUid: id };
+    const prefs = { pendingEggs: [ordinaryEgg, relicEgg], hatchedRelicUids: [id], relics: [{ payload: signed.payload, sig: signed.signature }] };
+    const state = { companions: [{ id: 'companion', relicUid: id }] };
+    const options = { publicJwk: signed.publicJwk };
+    const bad = await relSyncInventory({ rpRelicInventory: async () => ({ success: true, relics: [{ certPayload: signed.payload }] }) }, null, options);
+    assert.equal(relReconcileServerInventory(prefs, bad, state), prefs);
+    assert.equal(state.companions[0].relicUid, id);
+    const after = await relSyncInventory({ rpRelicInventory: async () => ({ success: true, relics: [] }) }, null, options);
+    const next = relReconcileServerInventory(prefs, after, state);
+    assert.deepEqual(next.relics, []);
+    assert.deepEqual(next.hatchedRelicUids, []);
+    assert.deepEqual(next.pendingEggs, [ordinaryEgg]);
+    assert.deepEqual(state.companions, [{ id: 'companion', cradleCarry: true }]);
+});

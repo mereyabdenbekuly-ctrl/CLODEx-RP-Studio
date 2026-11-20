@@ -3,6 +3,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createRpStudioController } from '../src/core/hud.js';
+import { createCompanionFromArchetype } from '../src/core/companion.js';
+import { nestPassport } from '../src/core/coopNest.js';
+import { relBytesToBase64Url, relCanonicalPayload } from '../src/core/relic.js';
 import { EN_CATALOG, RU_CATALOG } from '../src/core/localesData.js';
 import { packBuild } from '../src/core/pack.js';
 import { phoneCreateStore, phoneIngestEvents } from '../src/core/phone.js';
@@ -238,6 +241,8 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
     if (chatOverrides.underworld) Object.assign(state.underworld, chatOverrides.underworld);
     if (chatOverrides.inventory) Object.assign(state.inventory, chatOverrides.inventory);
     if (Array.isArray(chatOverrides.companions)) state.companions = chatOverrides.companions;
+    let chatScope = 'chat-v13';
+    const chats = new Map([[chatScope, state]]);
     let savedRpPrefs = rpPrefsOverrides ? structuredClone(rpPrefsOverrides) : {};
 
     const settings = {
@@ -367,8 +372,9 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         getEffectiveKey: () => settings.apiKey,
         getSettings: () => settings,
         async updateSettings(patch) { Object.assign(settings, patch); },
+        getChatScope: () => chatScope,
         getChatState: () => state,
-        async saveChatState(next) { state = next; },
+        async saveChatState(next) { state = next; chats.set(chatScope, next); },
         getActiveTurnKeys: async () => activeKeys,
         getLatestTurnKey: async () => latestTurnKey,
         loadStore: async name => (stores[name] ? structuredClone(stores[name]) : null),
@@ -398,6 +404,11 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         calls,
         stores,
         getState: () => state,
+        setChatScope: scope => {
+            chatScope = scope;
+            if (!chats.has(scope)) chats.set(scope, createChatState('2026-11-19'));
+            state = chats.get(scope);
+        },
         getSettings: () => settings,
         getRpPrefs: () => savedRpPrefs,
         setActiveKeys: k => { activeKeys = k; },
@@ -1218,4 +1229,130 @@ test('Altar pending egg details & re-skinning, Companion & Oviposition Nest skin
 
     assert.deepEqual(h.getMissingKeys(), []);
     h.controller.dispose();
+});
+
+function typeCradleInput(input, text) {
+    assert.ok(input);
+    input.value = text;
+    input.dispatchEvent({ type: 'input', target: input });
+}
+
+test('Relics UI claims a gift, offers incubation, and drops an egg after server ownership changes', async t => {
+    // UI wiring only; relic.test.js verifies real signatures and rejects forged certificates.
+    t.mock.method(globalThis.crypto.subtle, 'verify', async () => true);
+    const relicUid = 'rpr_fixtureserial';
+    const code = 'RPR-GIFT-ABCD-EFGH-JKLM';
+    const relic = {
+        certPayload: relCanonicalPayload({
+            v: 1, iss: 'clodex.xyz', relicUid, edition: 'ash', serial: 13, maxSupply: 100, rarity: 'ssr',
+            eggSkin: 'obsidian_kintsugi', archetype: 'familiar_fox', genes: { trait: 'seam' }, issuedAt: 1795180000,
+        }),
+        certSignature: relBytesToBase64Url(new Uint8Array(64)),
+    };
+    const requests = [];
+    const h = makeTestHarness({ locale: 'en', fetchHandler: async (url, init) => {
+        if (url.endsWith('/v1/rp/relics/transfer/claim')) {
+            requests.push({ ...init, body: JSON.parse(init.body) });
+            return Response.json({ success: true, data: relic });
+        }
+        if (url.endsWith('/v1/rp/relics/inventory')) return Response.json({ success: true, relics: [] });
+    } });
+    t.after(() => h.controller.dispose());
+    h.controller.openTab('relics');
+    await flush();
+    const claim = h.doc.body.querySelector('[data-rp-view="relic-gift-claim"]');
+    assert.equal(claim.querySelector('input').maxLength, code.length);
+    typeCradleInput(claim.querySelector('input'), code);
+    claim.querySelector('button').click();
+    await flush();
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].body, { code });
+    assert.match(new Headers(requests[0].headers).get('Idempotency-Key'), /^nest-[0-9a-f]{32}$/);
+    assert.deepEqual(h.getRpPrefs().unlockedEggSkins, ['obsidian_kintsugi']);
+    const incubate = h.doc.body.querySelector('[data-rp-action="relic-queue-egg"]');
+    assert.ok(incubate);
+    incubate.click();
+    await flush();
+    assert.equal(h.getRpPrefs().pendingEggs[0].relicUid, relicUid);
+    h.controller.openTab('relics');
+    h.doc.body.querySelector('[data-rp-action="relic-sync"]').click();
+    await flush();
+    assert.deepEqual(h.getRpPrefs().pendingEggs, []);
+    assert.deepEqual(h.getRpPrefs().relics, []);
+    assert.equal(h.doc.body.querySelector('[data-rp-action="relic-queue-egg"]'), null);
+    assert.deepEqual(h.getMissingKeys(), []);
+});
+
+test('Shared Cradle does not attach a late create to another chat; retry reuses the saved key', async t => {
+    const nestUid = 'rpn_' + 'a'.repeat(32);
+    const fox = createCompanionFromArchetype('familiar_fox');
+    const requestKeys = [];
+    let endFirst;
+    const first = new Promise(resolve => { endFirst = resolve; });
+    const h = makeTestHarness({ locale: 'en', chatOverrides: { companions: [fox] }, fetchHandler: async (url, init) => {
+        if (!url.endsWith('/v1/rp/nests')) return;
+        if (init.method === 'GET') return Response.json({ success: true, data: [] });
+        requestKeys.push(new Headers(init.headers).get('Idempotency-Key'));
+        if (requestKeys.length === 1) await first;
+        return Response.json({ success: true, data: {
+            nestUid, revision: 1, role: 'owner', companion: nestPassport(fox, 'companion'), events: [], canRotate: true,
+            ...(requestKeys.length === 1 ? { inviteCode: 'NEST-A123-BC45' } : {}),
+        } });
+    } });
+    t.after(() => h.controller.dispose());
+    h.controller.openTab('cradle');
+    await flush();
+    const create = () => h.doc.body.querySelector('[data-rp-view="nest-join"]');
+    h.doc.body.querySelectorAll('button').find(button => button.textContent === '🤝 Raise together').click();
+    typeCradleInput(create().querySelector('input'), 'Fox keeper');
+    create().querySelector('button').click();
+    await flush();
+    assert.equal(requestKeys.length, 1);
+    assert.equal(h.getState().companions[0].nestCreateKey, requestKeys[0]);
+    h.setChatScope('another-chat');
+    endFirst();
+    await flush();
+    assert.equal(h.getState().companions.length, 0);
+    h.setChatScope('chat-v13');
+    h.controller.openTab('cradle');
+    await flush();
+    create().querySelector('button').click();
+    await flush();
+    assert.deepEqual(requestKeys, [requestKeys[0], requestKeys[0]]);
+    assert.equal(h.getState().companions[0].sharedNestUid, nestUid);
+    assert.equal(h.getState().companions[0].nestCreateKey, undefined);
+    assert.equal(h.getState().companions[0].nestCanRotate, true);
+});
+
+test('A rejected shared hatch keeps the egg; only a server acknowledgement replaces it', async t => {
+    const nestUid = 'rpn_' + 'b'.repeat(32);
+    const egg = { id: 'fixture-egg', name: 'Fox', archetype: 'familiar_fox', warmth: 100,
+        sharedNestUid: nestUid, sharedRev: 1, sharedRole: 'owner', nestCanRotate: true };
+    let count = 0;
+    const h = makeTestHarness({ locale: 'en', rpPrefsOverrides: { pendingEggs: [egg] }, fetchHandler: async (url, init) => {
+        if (url.endsWith('/v1/rp/nests')) return Response.json({ success: true, data: [{
+            nestUid, revision: 1, role: 'owner', companion: nestPassport(egg, 'egg'), events: [], canRotate: true,
+        }] });
+        if (!url.endsWith('/care')) return;
+        assert.equal(JSON.parse(init.body).action, 'hatch');
+        if (++count === 1) return Response.json({ success: false, code: 'nest_state_changed' }, { status: 409 });
+        return Response.json({ success: true, data: {
+            nestUid, revision: 2, role: 'owner', companion: nestPassport(egg, 'companion'), events: [], canRotate: true,
+        } });
+    } });
+    t.after(() => h.controller.dispose());
+    h.controller.openTab('gacha');
+    await flush();
+    const hatch = () => h.doc.body.querySelector('[data-rp-action="gacha-hatch"]');
+    hatch().click();
+    await flush();
+    assert.equal(count, 1);
+    assert.equal(h.getRpPrefs().pendingEggs[0].id, egg.id);
+    assert.equal(h.getState().companions.length, 0);
+    assert.equal(h.getRpPrefs().pendingNestOps.length, 0);
+    hatch().click();
+    await flush();
+    assert.equal(count, 2);
+    assert.deepEqual(h.getRpPrefs().pendingEggs, []);
+    assert.equal(h.getState().companions[0].sharedNestUid, nestUid);
 });

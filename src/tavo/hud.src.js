@@ -2,6 +2,7 @@
 import { blobToBase64, validateKey } from '../core/api.js';
 import { createRpStudioController } from '../core/hud.js';
 import { PACK_MAX_BYTES } from '../core/pack.js';
+import { GIFT_MAX_BYTES } from '../core/gift.js';
 import { createChatState, normalizeChatState } from '../core/physiology.js';
 import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
 
@@ -121,11 +122,15 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
     };
     let lastTurnExtrasSig = '';
 
+    let tavoChatScope = '';
+
     async function reloadFromTavo() {
-        const [rawState, rawPrefs] = await Promise.all([
+        const [rawState, rawPrefs, chat] = await Promise.all([
             tavo.variable.get(CHAT_VAR_KEY).catch(() => null),
             tavo.variable.get(GLOBAL_PREFS_KEY, 'global').catch(() => null),
+            tavo.chat.current().catch(() => null),
         ]);
+        tavoChatScope = String(chat?.id ?? '');
         if (rawState && typeof rawState === 'object') {
             cachedState = normalizeChatState(rawState);
         } else {
@@ -181,6 +186,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
                 tavo.plugin.emit?.('clodex-turn-extras', { reason: 'prefs' });
             }
         },
+        getChatScope: () => tavoChatScope,
         getChatState: () => cachedState,
         async saveChatState(nextState) {
             cachedState = normalizeChatState(nextState);
@@ -236,6 +242,14 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
             if (blob.size > PACK_MAX_BYTES) throw new Error(`Pack is larger than ${PACK_MAX_BYTES} bytes.`);
             const base = String(pack?.name || 'clodex').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'clodex';
             await tavo.file.export(`${base}.clodex-pack`, await blobToBase64(blob), { encoding: 'base64' });
+        },
+        async exportPet(filename, json) {
+            const blob = new Blob([json], { type: 'application/json' });
+            if (blob.size > GIFT_MAX_BYTES) throw new Error('tooLarge');
+            await tavo.file.export(filename, await blobToBase64(blob), { encoding: 'base64' });
+        },
+        async importPet() {
+            return pickJsonFileText({ accept: '.clodex-pet,application/json', maxBytes: GIFT_MAX_BYTES });
         },
         async importPack() {
             const text = await pickJsonFileText();

@@ -51,8 +51,12 @@ import {
     gaCreateSummon, gaEquipSkinOnEgg, gaHatchEgg, gaNormalizePrefs, gaQueueVerifiedRelicEgg, gaWarmEgg,
 } from './gacha.js';
 import {
-    relAttachToCard, relPublicBadge, relSyncCatalog, relSyncInventory, relVerifyCard, relVerifyInventory,
+    relAttachToCard, relClaimGift, relGiftUrl, relReconcileServerInventory, relPublicBadge, relSyncCatalog, relSyncInventory, relVerifyCard, relVerifyInventory,
 } from './relic.js';
+
+import { giftParse, giftRecallSent, giftRedeem, giftSend } from './gift.js';
+import { nestConsumeHints, nestDetach, nestOperationKey, nestPassport, nestQueueCare, nestSanitizeLabel, nestSnapshot, nestStoryOps, nestTransport } from './coopNest.js';
+import { vCrRenderGifts, vCrRenderJoin, vCrRenderNest, vCrRenderRelicClaim } from './views/cradle-social.js';
 
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -172,6 +176,9 @@ export function createRpStudioController(bridge) {
     let lastCasinoOutcome = null;
     let dossierBusy = false;
     let summonBusy = false;
+    let giftTarget = null, giftAlias = '', giftNote = '', giftDraft = '', giftLatest = '', giftBusy = false;
+    let nestCreateTarget = null, nestAliasDraft = null, nestInviteDraft = '', nestLastPull = 0, nestSyncing = null, nestBusy = false;
+    let relicClaimDraft = '', relicClaimKey = '', relicClaimCode = '', relicClaiming = false;
     let relicCatalog = [];
     let relicSyncStatus = '';
     let relicChecking = false;
@@ -186,6 +193,8 @@ export function createRpStudioController(bridge) {
         getKey: () => bridge.getEffectiveKey(),
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
     });
+
+    const nestApi = new nestTransport(api);
 
     const hostRoot = el(doc, 'div', { className: 'clodex-rp-root' });
     const backdropEl = el(doc, 'div', { className: 'clodex-rp-video-backdrop', hidden: true });
@@ -393,6 +402,7 @@ export function createRpStudioController(bridge) {
         drawerBackdrop.style.pointerEvents = drawerOpen ? 'auto' : 'none';
         if (drawerOpen) {
             if (activeTab === 'scene') syncCachedCharName();
+            if (activeTab === 'cradle') void nestRefresh();
             renderDrawer();
         } else {
             drawerPanel.replaceChildren();
@@ -780,6 +790,8 @@ export function createRpStudioController(bridge) {
     }
 
     async function hatchPendingEgg(eggId, state) {
+        const linked = rpPrefs.pendingEggs.find(item => item.id === eggId && item.sharedNestUid);
+        if (linked) return nestDoCare(eggId, { action: 'hatch' });
         const result = gaHatchEgg(rpPrefs, eggId);
         if (!result.ok) { errorBanner = t(`gacha.error.${result.reason}`); renderAll(); return null; }
         const egg = result.egg;
@@ -811,7 +823,11 @@ export function createRpStudioController(bridge) {
             relSyncCatalog(api), relSyncInventory(api),
         ]);
         if (!inventoryResult.unavailable) {
-            await saveRpEntitlements({ ...rpPrefs, relics: inventoryResult.relics });
+            const state = bridge.getChatState();
+            const ownedBefore = state.companions.filter(item => item.relicUid).length;
+            const next = relReconcileServerInventory(rpPrefs, inventoryResult, state);
+            if (state.companions.filter(item => item.relicUid).length !== ownedBefore) await bridge.saveChatState(state);
+            await saveRpEntitlements(next);
             verifiedRelics = await relVerifyInventory(rpPrefs.relics);
         }
         return { editions: catalogResult.editions, catalogueUnavailable: catalogResult.unavailable, inventoryUnavailable: inventoryResult.unavailable };
@@ -1232,7 +1248,9 @@ export function createRpStudioController(bridge) {
         renderAll();
         try {
             // 1. turnKey of the reply being analysed (variant-aware), 2. phone cadence gate (spec 10.6)
+            const scope = bridge.getChatScope?.();
             const turnKey = await getLatestTurnKeySafe(checkpointKey);
+            if (scope !== bridge.getChatScope?.()) return false;
             const state = bridge.getChatState();
             const includePhone = Boolean(phoneShouldInclude(state));
             const messages = buildTrackerExtractionMessages(state, rp.recentMessages, {
@@ -1244,7 +1262,7 @@ export function createRpStudioController(bridge) {
             const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: TRACKER_MAX_TOKENS, jsonMode: true });
             // Do not apply a late response to a swiped/deleted branch.
             const currentTurnKey = await getLatestTurnKeySafe(turnKey);
-            if (turnKey && currentTurnKey && turnKey !== currentTurnKey) return false;
+            if (scope !== bridge.getChatScope?.() || (turnKey && currentTurnKey && turnKey !== currentTurnKey)) return false;
             let delta = {};
             try {
                 delta = parseTrackerExtraction(raw) || {};
@@ -1255,8 +1273,27 @@ export function createRpStudioController(bridge) {
             }
             const phoneEvents = includePhone && Array.isArray(delta.phoneEvents) ? delta.phoneEvents.slice(0, 2) : [];
             if (!includePhone && 'phoneEvents' in delta) delete delta.phoneEvents;
-            // 4. compact state + checkpoint for this exact variant
+            // 4. Compact state + checkpoint. The shared pet is intentionally
+            // excluded from branch-local simulation and only gets typed deltas.
+            const sharedCare = nestStoryOps(state.companions, delta);
             applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey, saveCheckpoint: false });
+            let queued = false;
+            if (sharedCare.length) {
+                const stableKey = (turnKey || checkpointKey) ? JSON.stringify([scope, turnKey || checkpointKey]) : '';
+                const opKey = await nestOperationKey(stableKey);
+                if (scope !== bridge.getChatScope?.()) return false;
+                for (const { item, care } of sharedCare) {
+                    try {
+                        queued = nestQueueCare(rpPrefs, item, care, opKey) || queued;
+                    } catch (err) {
+                        if (!silent || err?.message === 'queue_full') nestUserError(err);
+                    }
+                }
+            }
+            if (queued) {
+                await saveRpEntitlements(rpPrefs);
+                if (!silent) void nestRefresh({ pull: false });
+            }
             // 6. Anti-Slop rule is recomputed locally after every reply (0 requests)
             try {
                 await recomputeSlop({ state, save: false });
@@ -2835,6 +2872,370 @@ export function createRpStudioController(bridge) {
         return container;
     }
 
+    function copyCradleCode(value) {
+        if (bridge.copyText) return bridge.copyText(value);
+        if (win.navigator?.clipboard?.writeText) return win.navigator.clipboard.writeText(value);
+        return Promise.reject(new Error('clipboard'));
+    }
+
+    function displayCradleError(group, err, known) {
+        const code = err?.code || err?.message;
+        errorBanner = t(group + '.error.' + (known.includes(code) ? code : 'invalid'));
+        renderAll();
+    }
+
+    async function runGift(action, change) {
+        if (giftBusy) return;
+        giftBusy = true;
+        try {
+            const scope = bridge.getChatScope?.();
+            const state = bridge.getChatState();
+            const sentBefore = rpPrefs.sentGifts;
+            const prefs = structuredClone(rpPrefs);
+            const updated = structuredClone(state);
+            const result = change(updated, prefs);
+            const name = result.name ?? result.entity?.name ?? '';
+            const summary = t(`gift.activity.${action}`, { name });
+            updated.activityLog = [...(updated.activityLog || []), { atDate: updated.world.rpDate, summary }].slice(-40);
+            // Persist the backup first on send; no pet may be removed without
+            // a saved capsule to recover it. Keep a selectable copy in the UI.
+            if (action === 'sent') {
+                await saveRpEntitlements(prefs);
+                if (scope !== bridge.getChatScope?.() && result.kind === 'companion') {
+                    // The source chat is no longer writable. Don't leave an
+                    // exportable backup for a pet that was never removed.
+                    await saveRpEntitlements({ ...rpPrefs, sentGifts: sentBefore });
+                    return;
+                }
+            }
+            if (scope === bridge.getChatScope?.()) await bridge.saveChatState(updated);
+            if (action !== 'sent') await saveRpEntitlements(prefs);
+            giftLatest = result.code || '';
+            giftDraft = '';
+            giftTarget = null;
+            errorBanner = '';
+            bridge.notify?.(summary);
+            if (result.code) await copyCradleCode(result.code).catch(() => {});
+        } catch (err) {
+            displayCradleError('gift', err, ['invalid', 'tooLarge', 'relic', 'shared', 'full', 'sentHere', 'alreadyRedeemed', 'clipboard']);
+        } finally {
+            giftBusy = false;
+            renderAll();
+        }
+    }
+
+    function renderGiftPanel() {
+        const confirm = async () => {
+            if (!giftTarget) return;
+            const scope = bridge.getChatScope?.();
+            const { id, kind } = giftTarget;
+            if (!await bridge.confirm?.(t('gift.confirm')) || scope !== bridge.getChatScope?.()) return;
+            return runGift('sent', (state, prefs) => giftSend(state, prefs, kind, id, { fromAlias: giftAlias, note: giftNote }));
+        };
+        return vCrRenderGifts(doc, t, {
+            target: giftTarget, alias: giftAlias, note: giftNote, draft: giftDraft, latest: giftLatest, sent: rpPrefs.sentGifts, busy: giftBusy,
+        }, {
+            onAlias: value => { giftAlias = value; },
+            onNote: value => { giftNote = value; },
+            onDraft: value => { giftDraft = value; },
+            onCancel: () => { giftTarget = null; renderAll(); },
+            onConfirm: confirm,
+            onRedeem: () => runGift('received', (state, prefs) => giftRedeem(state, prefs, giftDraft)),
+            onRecall: async id => {
+                if (!await bridge.confirm?.(t('gift.confirmRecall'))) return;
+                return runGift('recalled', (state, prefs) => giftRecallSent(state, prefs, id));
+            },
+            onCopy: code => {
+                giftLatest = code;
+                renderAll();
+                copyCradleCode(code).catch(err => displayCradleError('gift', err, ['clipboard']));
+            },
+            onExport: async code => {
+                try {
+                    const capsule = giftParse(code);
+                    await bridge.exportPet(capsule.giftId + '.clodex-pet', JSON.stringify(capsule));
+                } catch (err) { displayCradleError('gift', err, ['tooLarge']); }
+            },
+            onImport: async () => {
+                try {
+                    const raw = await bridge.importPet?.();
+                    if (raw) await runGift('received', (state, prefs) => giftRedeem(state, prefs, raw));
+                } catch (err) { displayCradleError('gift', err, ['tooLarge']); }
+            },
+        });
+    }
+
+    function cradleGiftButton(item, kind) {
+        const inNest = Boolean(item.sharedNestUid);
+        const relic = Boolean(item.relicUid);
+        return el(doc, relic && !inNest ? 'a' : 'button', {
+            className: 'clodex-rp-btn-mini',
+            ...(relic && !inNest ? { href: relGiftUrl(item.relicUid), target: '_blank', rel: 'noopener noreferrer' } : { type: 'button' }),
+            onClick: relic && !inNest ? undefined : () => {
+                if (inNest) return displayCradleError('gift', new Error('shared'), ['shared']);
+                giftTarget = { id: item.id, kind, name: item.name };
+                giftLatest = '';
+                renderAll();
+                drawerPanel.querySelector?.('[data-rp-view="pet-gifts"]')?.scrollIntoView?.({ block: 'nearest' });
+            },
+        }, '🎁 ' + t(relic && !inNest ? 'relic.giftOnWeb' : 'gift.send'));
+    }
+
+    function nestItems(state) {
+        return [...state.companions, ...rpPrefs.pendingEggs];
+    }
+
+    function nestApplyView(raw, state, current, insert = false) {
+        const known = current || nestItems(state).find(item => item.sharedNestUid === raw.nestUid);
+        if (!known && !insert) return false;
+        const snapshot = nestSnapshot(raw, known);
+        if (!snapshot) return false;
+        const { kind, fields } = snapshot;
+        const isEgg = kind === 'egg';
+        const wasEgg = known && rpPrefs.pendingEggs.includes(known);
+        if (known && isEgg === wasEgg) {
+            const stageChanged = !isEgg && known.stage !== fields.stage;
+            Object.assign(known, fields, { needsStageArt: stageChanged || Boolean(known.needsStageArt) });
+            delete known.nestCreateKey;
+            if (!fields.relicUid) delete known.relicUid;
+            if (fields.eggSkin && !rpPrefs.unlockedEggSkins.includes(fields.eggSkin)) rpPrefs.unlockedEggSkins.push(fields.eggSkin);
+            return true;
+        }
+        const dest = isEgg ? rpPrefs.pendingEggs : state.companions;
+        if (dest.length >= (isEgg ? 24 : 6)) throw new Error('full');
+        const local = { ...fields, id: known?.id || raw.nestUid.slice(0, 40), needsStageArt: true, cradleCarry: true };
+        if (known && wasEgg) {
+            rpPrefs.pendingEggs = rpPrefs.pendingEggs.filter(egg => egg !== known);
+            if (fields.relicUid && !rpPrefs.hatchedRelicUids.includes(fields.relicUid)) rpPrefs.hatchedRelicUids.push(fields.relicUid);
+        } else if (known) {
+            state.companions = state.companions.filter(item => item !== known);
+            if (isEgg && known.relicUid) rpPrefs.hatchedRelicUids = rpPrefs.hatchedRelicUids.filter(uid => uid !== known.relicUid);
+        }
+        if (fields.eggSkin && !rpPrefs.unlockedEggSkins.includes(fields.eggSkin)) rpPrefs.unlockedEggSkins.push(fields.eggSkin);
+        dest.push(isEgg ? gaNormalizeEgg(local) : normalizeCompanion(local));
+        return true;
+    }
+
+    async function nestPersist(state) {
+        await Promise.all([saveRpEntitlements(rpPrefs), bridge.saveChatState(state)]);
+    }
+
+    function nestUserError(err) {
+        if (err?.code === 'nest_local_capacity') err = new Error('full');
+        displayCradleError('nest', err, ['full', 'queue_full', 'hatch_pending', 'nest_full', 'nest_forbidden', 'nest_state_changed',
+            'nest_not_found', 'nest_limit_reached', 'rate_limited', 'network_error', 'no_key']);
+    }
+
+    async function nestRun(kind, itemId = '') {
+        if (nestBusy || nestSyncing) return;
+        const scope = bridge.getChatScope?.();
+        const start = bridge.getChatState();
+        let item = itemId && nestItems(start).find(entry => entry.id === itemId);
+        if (itemId && !item) return;
+        const isEgg = item && rpPrefs.pendingEggs.includes(item);
+        const alias = nestSanitizeLabel(nestAliasDraft ?? rpPrefs.guardianAlias);
+        nestBusy = true;
+        renderAll();
+        try {
+            if (!bridge.getEffectiveKey()) throw new Error('no_key');
+            let view;
+            if (kind === 'create') {
+                if (!alias || !item || item.sharedNestUid) throw new Error('invalid_input');
+                if (!item.nestCreateKey) {
+                    const key = await nestOperationKey();
+                    if (scope !== bridge.getChatScope?.()) return;
+                    item = nestItems(bridge.getChatState()).find(entry => entry.id === itemId);
+                    if (!item || item.sharedNestUid) return;
+                    item.nestCreateKey = key;
+                    if (!isEgg) item.cradleCarry = true;
+                    if (isEgg) await saveRpEntitlements(rpPrefs);
+                    else await bridge.saveChatState(bridge.getChatState());
+                    // Hosts may replace their state with a normalized copy on save.
+                    if (scope !== bridge.getChatScope?.()) return;
+                    item = nestItems(bridge.getChatState()).find(entry => entry.id === itemId);
+                    if (!item?.nestCreateKey) return;
+                }
+                view = await nestApi.create(alias, nestPassport(item, isEgg ? 'egg' : 'companion'), item.nestCreateKey);
+            } else if (kind === 'join') {
+                if (!alias || !nestInviteDraft) throw new Error('invalid_input');
+                const eggRoom = rpPrefs.pendingEggs.length < 24;
+                const companionRoom = start.companions.length < 6;
+                if (!eggRoom && !companionRoom) throw new Error('full');
+                const acceptKind = eggRoom === companionRoom ? undefined : eggRoom ? 'egg' : 'companion';
+                view = await nestApi.join(alias, nestInviteDraft, acceptKind);
+            } else if (kind === 'rotate') {
+                view = await nestApi.rotate(item.sharedNestUid);
+            } else if (kind === 'leave') {
+                if (!await bridge.confirm?.(t('nest.leaveConfirm')) || scope !== bridge.getChatScope?.()) return;
+                await nestApi.leave(item.sharedNestUid).catch(err => { if (err.status !== 404) throw err; });
+                rpPrefs.pendingNestOps = rpPrefs.pendingNestOps.filter(op => op.uid !== item.sharedNestUid);
+                await saveRpEntitlements(rpPrefs);
+            }
+            // Never bind a late create/join response to another chat. A repeat in
+            // the original chat uses the saved create key or existing membership.
+            if (scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            const current = itemId && nestItems(state).find(entry => entry.id === itemId);
+            if (kind === 'leave') {
+                if (current) nestDetach(current);
+            } else {
+                if (itemId && !current) return;
+                nestApplyView(view, state, current, true);
+                if (kind === 'join') nestInviteDraft = '';
+                rpPrefs.guardianAlias = alias || rpPrefs.guardianAlias;
+            }
+            nestCreateTarget = null;
+            errorBanner = '';
+            await nestPersist(state);
+        } catch (err) {
+            if (scope !== bridge.getChatScope?.()) return;
+            if (kind === 'create' && err?.code === 'nest_state_changed') {
+                const state = bridge.getChatState();
+                const current = nestItems(state).find(entry => entry.id === itemId);
+                if (current) {
+                    delete current.nestCreateKey;
+                    await nestPersist(state).catch(() => {});
+                }
+            }
+            nestUserError(err);
+        } finally { nestBusy = false; renderAll(); }
+    }
+
+    async function nestFlush() {
+        if (!bridge.getEffectiveKey()) return;
+        while (rpPrefs.pendingNestOps.length) {
+            const op = rpPrefs.pendingNestOps[0];
+            let view;
+            let failure;
+            try { view = await nestApi.care(op); }
+            catch (err) {
+                if (![400, 403, 404, 409].includes(err.status)) break;
+                failure = err;
+            }
+            rpPrefs.pendingNestOps = rpPrefs.pendingNestOps.filter(item => item.uid !== op.uid || item.key !== op.key);
+            const state = bridge.getChatState();
+            if (view && !rpPrefs.pendingNestOps.some(item => item.uid === op.uid)) {
+                try { nestApplyView(view, state); }
+                catch (err) { failure = err; } // e.g. the result hatched, but the local roster filled up
+            }
+            if (failure?.status === 404) {
+                const item = nestItems(state).find(entry => entry.sharedNestUid === op.uid);
+                if (item) nestDetach(item);
+            }
+            await nestPersist(state);
+            if (failure && drawerOpen && activeTab === 'cradle') nestUserError(failure);
+        }
+    }
+
+    function nestRefresh({ manual = false, pull = true } = {}) {
+        if (!bridge.getEffectiveKey() || nestBusy) return Promise.resolve();
+        if (nestSyncing) return nestSyncing;
+        const now = Date.now();
+        if (pull && !manual && now - nestLastPull < 30000) pull = false;
+        if (pull) nestLastPull = now;
+        nestSyncing = (async () => {
+            await nestFlush();
+            if (!pull) return;
+            const scope = bridge.getChatScope?.();
+            const views = await nestApi.list();
+            if (!Array.isArray(views) || scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            let changed = false;
+            const wanted = new Set(nestItems(state).map(item => item.sharedNestUid).filter(Boolean));
+            for (const item of nestItems(state)) {
+                if (!item.sharedNestUid || rpPrefs.pendingNestOps.some(op => op.uid === item.sharedNestUid)) continue;
+                if (!views.some(view => view.nestUid === item.sharedNestUid)) { nestDetach(item); changed = true; }
+            }
+            for (const view of views) {
+                if (rpPrefs.pendingNestOps.some(op => op.uid === view.nestUid)) continue;
+                if (!wanted.has(view.nestUid)) continue;
+                try { changed = nestApplyView(view, state) || changed; }
+                catch (err) { if (manual) nestUserError(err); }
+            }
+            if (changed) await nestPersist(state);
+            if (manual) bridge.notify?.(t('nest.synced'));
+        })().catch(err => { if (manual) nestUserError(err); }).finally(() => {
+            nestSyncing = null;
+            if (drawerOpen && activeTab === 'cradle') renderAll();
+        });
+        return nestSyncing;
+    }
+
+    async function nestDoCare(itemId, care, { memoryHint = '', noticeName = '' } = {}) {
+        try {
+            const scope = bridge.getChatScope?.();
+            const key = await nestOperationKey();
+            if (scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            const item = nestItems(state).find(entry => entry.id === itemId);
+            if (!item?.sharedNestUid) return;
+            if (care.hatch && state.companions.length >= 6) throw new Error('full');
+            if (care.hatch && item.warmth < 100) throw new Error('nest_state_changed');
+            if (!nestQueueCare(rpPrefs, item, care, key)) return;
+            if (memoryHint && state?.world) state.world.pendingMemoryHint = memoryHint;
+            // Keep the egg visible while an irreversible hatch is queued.
+            // Only the server's accepted companion snapshot can replace it.
+            await nestPersist(state);
+            if (noticeName) bridge.notify?.(t('cradle.careNotice', { name: noticeName }));
+            renderAll();
+            void nestRefresh({ pull: false });
+        } catch (err) { nestUserError(err); }
+    }
+
+    function renderNestJoin() {
+        return vCrRenderJoin(doc, t, {
+            alias: nestAliasDraft ?? rpPrefs.guardianAlias, code: nestInviteDraft, busy: nestBusy, target: nestCreateTarget,
+        }, {
+            onAlias: alias => { nestAliasDraft = alias; },
+            onCode: code => { nestInviteDraft = code.trim().toUpperCase(); },
+            onJoin: () => nestRun('join'),
+            onCreate: () => nestRun('create', nestCreateTarget?.id),
+            onCancel: () => { nestCreateTarget = null; renderAll(); },
+            onRefresh: () => nestRefresh({ manual: true }),
+        });
+    }
+
+    function renderNestItem(item) {
+        return vCrRenderNest(doc, t, item, {
+            waiting: rpPrefs.pendingNestOps.some(op => op.uid === item.sharedNestUid),
+            busy: nestBusy,
+        }, {
+            onCreate: () => {
+                nestCreateTarget = { id: item.id, name: item.name };
+                renderAll();
+                drawerPanel.querySelector?.('[data-rp-view="nest-join"]')?.scrollIntoView?.({ block: 'nearest' });
+            },
+            onRotate: () => nestRun('rotate', item.id),
+            onLeave: () => nestRun('leave', item.id),
+            onRefresh: () => nestRefresh({ manual: true }),
+            onCopy: code => copyCradleCode(code).catch(err => displayCradleError('gift', err, ['clipboard'])),
+        });
+    }
+
+    async function claimGiftRelic(rawCode) {
+        if (relicClaiming) return;
+        relicClaiming = true;
+        try {
+            const code = rawCode.trim().toUpperCase();
+            if (relicClaimCode !== code) {
+                relicClaimKey = await nestOperationKey();
+                relicClaimCode = code;
+            }
+            const entry = await relClaimGift(api, code, relicClaimKey);
+            verifiedRelics.set(entry.claims.relicUid, entry);
+            const relics = [...rpPrefs.relics.filter(item => item.payload !== entry.payload), { payload: entry.payload, sig: entry.sig }];
+            const unlockedEggSkins = [...rpPrefs.unlockedEggSkins, entry.claims.eggSkin];
+            await saveRpEntitlements({ ...rpPrefs, relics, unlockedEggSkins });
+            relicClaimCode = '';
+            relicClaimDraft = '';
+            errorBanner = '';
+            bridge.notify?.(t('relic.giftClaimed'));
+        } catch (err) {
+            displayCradleError('relic', err, ['invalid_input', 'transfer_expired', 'transfer_not_found', 'cannot_claim_own_relic',
+                'rate_limited', 'network_error', 'unverified']);
+        } finally { relicClaiming = false; renderAll(); }
+    }
+
     function renderCradleTab(state) {
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
         const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-3 clodex-rp-subtabs', dataset: { rpView: 'cradle-subtabs' } },
@@ -2851,7 +3252,7 @@ export function createRpStudioController(bridge) {
         );
         container.append(subNav);
         if (cradleSub === 'gacha') {
-            container.append(renderGachaSub(state));
+            container.append(renderNestJoin(), renderGachaSub(state), renderGiftPanel());
             return container;
         }
         if (cradleSub === 'relics') {
@@ -2859,6 +3260,7 @@ export function createRpStudioController(bridge) {
             return container;
         }
         if (!Array.isArray(state.companions)) state.companions = [];
+        container.append(renderNestJoin(), renderGiftPanel());
 
         if (state.world.pendingMemoryHint) {
             container.append(el(doc, 'div', { className: 'clodex-rp-banner' },
@@ -3035,8 +3437,10 @@ export function createRpStudioController(bridge) {
                                 type: 'button',
                                 className: 'clodex-rp-btn-mini',
                                 title: t('cradle.removeBtn'),
+                                disabled: Boolean(activeComp.sharedNestUid),
                                 onClick: async () => {
                                     state.companions = state.companions.filter(c => c.id !== activeComp.id);
+                                    if (activeComp.cradleCarry) state.cradleRemoved = [...state.cradleRemoved, activeComp.id].slice(-100);
                                     activeCompanionId = state.companions[0]?.id || '';
                                     await bridge.saveChatState(state);
                                     renderAll();
@@ -3066,7 +3470,7 @@ export function createRpStudioController(bridge) {
                             : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
                                 ...traits.map(tr => el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, String(tr)))),
                     ),
-                    unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    !activeComp.sharedNestUid && unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
                         el(doc, 'span', {}, t('gacha.equipSkinLabel')),
                         el(doc, 'select', {
                             className: 'clodex-rp-input',
@@ -3099,7 +3503,10 @@ export function createRpStudioController(bridge) {
                         value: activeComp.name,
                         onChange: async e => {
                             const nextName = e.target.value.trim().slice(0, 60);
-                            if (nextName) activeComp.name = nextName;
+                            if (nextName) {
+                                activeComp.name = nextName;
+                                if (!activeComp.sharedNestUid) delete activeComp.cradleRemoteLabel;
+                            }
                             await bridge.saveChatState(state);
                             renderAll();
                         },
@@ -3151,6 +3558,8 @@ export function createRpStudioController(bridge) {
                     );
                 }),
             ),
+            el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                cradleGiftButton(activeComp, 'companion'), renderNestItem(activeComp)),
             el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
                 el(doc, 'strong', {}, `💞 ${t('cradle.careTitle')}`),
                 el(doc, 'div', { className: 'clodex-rp-muted' }, t('cradle.careHint')),
@@ -3159,6 +3568,13 @@ export function createRpStudioController(bridge) {
                         type: 'button',
                         className: 'clodex-rp-btn',
                         onClick: async () => {
+                            if (activeComp.sharedNestUid) {
+                                const preview = interactWithCompanion({ ...activeComp }, act, { rpDate: state.world.rpDate });
+                                return nestDoCare(activeComp.id, { action: act, ...preview.care }, {
+                                    memoryHint: preview?.memoryHint || '',
+                                    noticeName: activeComp.name,
+                                });
+                            }
                             const res = interactWithCompanion(activeComp, act, { rpDate: state.world.rpDate });
                             const updated = res?.companion ?? activeComp;
                             const idx = state.companions.findIndex(c => c.id === activeComp.id);
@@ -4371,7 +4787,9 @@ export function createRpStudioController(bridge) {
                 renderAll();
             },
             onPaidRitual: () => runPaidGachaRitual(),
+            renderSocial: egg => [cradleGiftButton(egg, 'egg'), renderNestItem(egg)],
             onWarm: async eggId => {
+                if (rpPrefs.pendingEggs.some(egg => egg.id === eggId && egg.sharedNestUid)) return nestDoCare(eggId, { action: 'pet', warmthDelta: 20 });
                 const warmed = gaWarmEgg(rpPrefs, eggId, 20);
                 if (!warmed.ok) {
                     errorBanner = t(`gacha.error.${warmed.reason || 'egg_not_found'}`);
@@ -4384,6 +4802,9 @@ export function createRpStudioController(bridge) {
             },
             onHatch: eggId => hatchPendingEgg(eggId, state),
             onEquipEggSkin: async (eggId, skinId) => {
+                const egg = rpPrefs.pendingEggs.find(egg => egg.id === eggId);
+                if (egg?.relicUid) return;
+                if (egg?.sharedNestUid) return nestDoCare(eggId, { action: 'skin', eggSkin: skinId });
                 const eq = gaEquipSkinOnEgg(rpPrefs, eggId, skinId);
                 if (!eq.ok) {
                     errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
@@ -4448,7 +4869,7 @@ export function createRpStudioController(bridge) {
     }
 
     function renderRelicsSub() {
-        return vGaRenderRelics(doc, t, {
+        const view = vGaRenderRelics(doc, t, {
             catalog: relicCatalog,
             relics: rpPrefs.relics,
             verifiedRelics,
@@ -4477,6 +4898,11 @@ export function createRpStudioController(bridge) {
                 renderAll();
             },
         });
+        view.prepend(vCrRenderRelicClaim(doc, t, { code: relicClaimDraft, busy: relicClaiming }, {
+            onInput: code => { relicClaimDraft = code; },
+            onClaim: () => claimGiftRelic(relicClaimDraft),
+        }));
+        return view;
     }
 
     function renderPacksSub() {
@@ -4615,6 +5041,7 @@ export function createRpStudioController(bridge) {
                     className: `clodex-rp-tab-btn ${activeTab === id ? 'active' : ''}`,
                     onClick: () => {
                         activeTab = id;
+                        if (id === 'cradle') void nestRefresh();
                         if (id === 'scene') syncCachedCharName();
                         renderDrawer();
                     },
@@ -4638,9 +5065,10 @@ export function createRpStudioController(bridge) {
     async function onAssistantMessageCommitted({ checkpointKey = '' } = {}) {
         const settings = bridge.getSettings();
         const state = bridge.getChatState();
+        if (checkpointKey && committedTurnKeys.has(String(checkpointKey))) return;
 
         // One-turn data is consumed only after a successfully committed reply (429 / Stop keep it).
-        let consumed = false;
+        let consumed = nestConsumeHints(state.companions);
         if (state.world.pendingMemoryHint) {
             state.world.pendingMemoryHint = '';
             consumed = true;
@@ -4659,6 +5087,7 @@ export function createRpStudioController(bridge) {
         // mode. This also writes the checkpoint only after tracker extraction
         // and local consequences have both completed.
         await applyLocalTurnConsequences(checkpointKey);
+        if (bridge.getChatState().companions.some(item => item.sharedNestUid)) void nestRefresh();
         if (!tracked) {
             // Anti-Slop is local: keep the radar fresh even without a key / with auto-track disabled.
             await recomputeSlop().catch(() => {});

@@ -3,7 +3,7 @@
 // All strings are rendered strictly as safe DOM text nodes.
 import { vEl } from './director.js';
 import { EGG_SKINS, GA_PITY_EPIC, GA_PITY_SSR, GA_RARITIES } from '../gacha.js';
-import { relMintUrl, relPublicBadge } from '../relic.js';
+import { relGiftUrl, relMintUrl, relPublicBadge } from '../relic.js';
 
 export function vGaRarityLabel(t, rarity) {
     const clean = GA_RARITIES.includes(rarity) ? rarity : 'common';
@@ -122,6 +122,7 @@ export function vGaRenderAltar(doc, t, model = {}, actions = {}) {
                     vEl(doc, 'select', {
                         className: 'clodex-rp-input',
                         dataset: { rpAction: 'gacha-egg-skin', eggId: String(egg.id) },
+                        disabled: Boolean(egg.relicUid),
                         onChange: e => actions.onEquipEggSkin?.(egg.id, String(e?.target?.value ?? '')),
                     }, ...skinOptionIds.map(skinId => vEl(doc, 'option', {
                         value: skinId,
@@ -144,6 +145,7 @@ export function vGaRenderAltar(doc, t, model = {}, actions = {}) {
                         onClick: () => actions.onHatch?.(egg.id),
                     }, `🐣 ${t('gacha.hatch')}`),
                 ),
+                ...(actions.renderSocial?.(egg) || []),
             );
 
             list.append(vEl(doc, 'article', {
@@ -286,6 +288,8 @@ export function vGaRenderRelics(doc, t, model = {}, actions = {}) {
                 vEl(doc, 'span', { className: 'clodex-rp-muted' },
                     `🥚 ${vGaSkinName(t, entry.claims.eggSkin)} · ${vGaRarityLabel(t, entry.claims.rarity)}`),
             ),
+            vEl(doc, 'a', { href: relGiftUrl(uid), target: '_blank', rel: 'noopener noreferrer', className: 'clodex-rp-btn-mini' },
+                '🎁 ' + t('relic.giftOnWeb')),
             vEl(doc, 'button', {
                 type: 'button',
                 className: 'clodex-rp-btn-mini',

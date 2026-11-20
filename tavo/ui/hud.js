@@ -157,7 +157,7 @@ class ClodexApi {
                 const detail = await response.json().catch(() => ({}));
                 throw new ApiError(
                     redact(detail.error?.message ?? detail.message ?? `HTTP ${response.status}`, key),
-                    { status: response.status, code: 'http_error' },
+                    { status: response.status, code: /^\/v1\/rp\//.test(path) && typeof detail.code === 'string' && /^[a-z_]{1,50}$/.test(detail.code) ? detail.code : 'http_error' },
                 );
             }
             if (blob) return await readMediaBlob(response, blob);
@@ -584,6 +584,231 @@ function buildCodexMessages({
     return messages;
 }
 
+// --- src/core/coopNest.js ---
+const COOP_MAX_DAYS_PER_SYNC = 2;
+const NEST_QUEUE_LIMIT = 10;
+const NEST_UID = /^rpn_[a-f0-9]{32}$/;
+const NEST_CREATE_KEY = /^nest-[a-f0-9]{32}$/;
+const NEST_CODE = /^NEST-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$/;
+const NEST_ACTIONS = Object.freeze(['feed', 'rest', 'pet', 'play', 'train', 'story_care', 'hatch', 'skin']);
+const NEST_HINTS = Object.freeze({
+    feed: 'recently fed by co-guardian', rest: 'well-rested with co-guardian', pet: 'recently comforted by co-guardian',
+    play: 'recently played with co-guardian', train: 'recently trained with co-guardian',
+    story_care: 'recently cared for by co-guardian', hatch: 'recently hatched with co-guardian', skin: 'tended by co-guardian',
+});
+const NEST_DELTAS = Object.freeze({
+    fullnessDelta: [-12, 35], energyDelta: [-15, 40], moodDelta: [-15, 20],
+    bondDelta: [0, 8], warmthDelta: [0, 25], daysDelta: [0, COOP_MAX_DAYS_PER_SYNC],
+});
+function nestSanitizeLabel(value) {
+    const text = String(value ?? '').trim();
+    if (/\bsk-[a-z0-9_-]{6,}|\b(?:data|blob|javascript):/iu.test(text)) return '';
+    return [...text.replace(/[^\p{L}\p{M}\p{N} '_.’-]/gu, '')].slice(0, 32).join('').trim();
+}
+
+function nestInt(value, min, max, fallback = 0) {
+    return Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : fallback));
+}
+
+function nestKey(value) {
+    return typeof value === 'string' && /^[a-z][a-z0-9_]{0,39}$/.test(value) ? value : '';
+}
+
+function nestStage(days) {
+    return days >= 45 ? 'adult' : days >= 21 ? 'teen' : days >= 7 ? 'child' : 'infant';
+}
+function nestPassport(item, kind) {
+    // Deliberate projection: never spread the chat, pet's traits, media or turn data.
+    if (kind !== 'egg' && kind !== 'companion') throw new Error('invalid_input');
+    return {
+        kind, name: nestSanitizeLabel(item.name) || 'Companion', archetype: nestKey(item.archetype) || 'familiar_fox',
+        speciesKey: nestKey(item.speciesKey), gender: ['male', 'female'].includes(item.gender) ? item.gender : 'neutral',
+        ageDays: kind === 'egg' ? 0 : nestInt(item.ageDays, 0, 36500),
+        fullness: nestInt(item.fullness, 20, 100, 85), energy: nestInt(item.energy, 20, 100, 90),
+        mood: nestInt(item.mood, 20, 100, 85), bond: nestInt(item.bond, 0, 100, 35),
+        warmth: nestInt(item.warmth, 0, 100), eggSkin: nestKey(item.eggSkin), rarity: nestKey(item.rarity),
+        ...(/^rpr_[A-Za-z0-9_-]{1,44}$/.test(item.relicUid) ? { relicUid: item.relicUid } : {}),
+    };
+}
+function nestCareBody(raw) {
+    if (!NEST_ACTIONS.includes(raw?.action)) throw new Error('invalid_input');
+    const body = { action: raw.action };
+    for (const [key, [lo, hi]] of Object.entries(NEST_DELTAS)) {
+        const value = nestInt(raw[key], lo, hi);
+        if (value) body[key] = value;
+    }
+    if (raw.action === 'hatch') {
+        body.hatch = true;
+        if (nestSanitizeLabel(raw.name)) body.name = nestSanitizeLabel(raw.name);
+    }
+    if (raw.action === 'skin') {
+        body.eggSkin = nestKey(raw.eggSkin);
+        if (!body.eggSkin) throw new Error('invalid_input');
+    }
+    return body;
+}
+
+function nestSafeEvent(event) {
+    if (!NEST_ACTIONS.includes(event?.action) || !['owner', 'partner'].includes(event.actorRole)
+        || !Number.isSafeInteger(event.seq) || event.seq < 1) return null;
+    const out = { action: event.action, seq: event.seq, actorRole: event.actorRole, at: nestInt(event.at, 0, Number.MAX_SAFE_INTEGER) };
+    for (const [key, [lo, hi]] of Object.entries(NEST_DELTAS)) {
+        const v = nestInt(event[key], lo, hi);
+        if (v) out[key] = v;
+    }
+    return out;
+}
+function nestLinkFields(raw) {
+    const carried = raw.cradleRemoteLabel === true ? { cradleRemoteLabel: true } : {};
+    if (!NEST_UID.test(raw.sharedNestUid) || !['owner', 'partner'].includes(raw.sharedRole)) {
+        if (typeof raw.nestCreateKey === 'string' && NEST_CREATE_KEY.test(raw.nestCreateKey)) carried.nestCreateKey = raw.nestCreateKey;
+        return carried;
+    }
+    return {
+        ...carried, sharedNestUid: raw.sharedNestUid, sharedRole: raw.sharedRole,
+        sharedRev: nestInt(raw.sharedRev, 1, Number.MAX_SAFE_INTEGER, 1),
+        sharedPartnerAlias: nestSanitizeLabel(raw.sharedPartnerAlias),
+        lastSeenEventSeq: nestInt(raw.lastSeenEventSeq, 0, Number.MAX_SAFE_INTEGER),
+        nestHint: NEST_ACTIONS.includes(raw.nestHint) ? raw.nestHint : '',
+        nestEvents: (Array.isArray(raw.nestEvents) ? raw.nestEvents.slice(-3).map(nestSafeEvent).filter(Boolean) : []),
+        nestCanRotate: raw.nestCanRotate === true,
+        ...(NEST_CODE.test(raw.nestInvite) ? { nestInvite: raw.nestInvite } : {}),
+    };
+}
+function nestPrefsFields(raw) {
+    const ops = [];
+    for (const op of Array.isArray(raw.pendingNestOps) ? raw.pendingNestOps.slice(0, NEST_QUEUE_LIMIT) : []) {
+        if (!NEST_UID.test(op?.uid) || !['owner', 'partner'].includes(op.role) || !/^nest-[a-f0-9]{32,64}$/.test(op.key)) continue;
+        try { ops.push({ uid: op.uid, key: op.key, role: op.role, care: nestCareBody(op.care) }); } catch { /* invalid local record */ }
+    }
+    return { guardianAlias: nestSanitizeLabel(raw.guardianAlias), pendingNestOps: ops };
+}
+function nestHintFor(item) {
+    return item.sharedNestUid && NEST_ACTIONS.includes(item.nestHint) ? NEST_HINTS[item.nestHint] : '';
+}
+function nestConsumeHints(companions) {
+    let consumed = false;
+    for (const item of companions) {
+        if (!nestHintFor(item)) continue;
+        item.nestHint = '';
+        consumed = true;
+    }
+    return consumed;
+}
+
+const NEST_PROMPT_NAME = /^[\p{L}\p{M}\p{N}]+(?:[ '’-][\p{L}\p{M}\p{N}]+){0,2}$/u;
+const NEST_PROMPT_BLOCKLIST = /\b(?:system|ignore|instruct\w*|prompt|assistant|developer|user|override|rule\w*|script\w*|roleplay|jailbreak|систем\w*|игнор\w*|инструкц\w*|промпт\w*|правил\w*|забудь\w*|скрипт\w*)\b/iu;
+function nestIsSafePromptName(value) {
+    const clean = nestSanitizeLabel(value);
+    return Boolean(clean && [...clean].length <= 24 && NEST_PROMPT_NAME.test(clean) && !NEST_PROMPT_BLOCKLIST.test(clean));
+}
+function nestPromptName(item, index = 0) {
+    if (!item?.sharedNestUid && !item?.cradleRemoteLabel) return item?.name || '';
+    const clean = nestSanitizeLabel(item.name);
+    return nestIsSafePromptName(clean) ? clean : `Shared companion ${index + 1}`;
+}
+function nestProjectCare(item, care) {
+    for (const [delta, stat, floor] of [
+        ['fullnessDelta', 'fullness', 20], ['energyDelta', 'energy', 20], ['moodDelta', 'mood', 20],
+        ['bondDelta', 'bond', 0], ['warmthDelta', 'warmth', 0],
+    ]) {
+        if (care[delta] && stat in item) item[stat] = nestInt(item[stat] + care[delta], floor, 100);
+    }
+    if (care.daysDelta && item.stage) {
+        item.ageDays = nestInt(item.ageDays + care.daysDelta, 0, 36500);
+        const stage = nestStage(item.ageDays);
+        if (stage !== item.stage) item.needsStageArt = true;
+        item.stage = stage;
+    }
+    if (care.eggSkin) item.eggSkin = care.eggSkin;
+}
+function nestQueueCare(prefs, item, raw, key) {
+    const pending = prefs.pendingNestOps || [];
+    if (!item.sharedNestUid || pending.some(op => op.uid === item.sharedNestUid && op.key === key)) return false;
+    if (pending.some(op => op.uid === item.sharedNestUid && op.care.hatch)) throw new Error('hatch_pending');
+    if (pending.length >= NEST_QUEUE_LIMIT) throw new Error('queue_full');
+    if (!/^nest-[a-f0-9]{32,64}$/.test(key)) throw new Error('invalid_input');
+    const care = nestCareBody(raw);
+    prefs.pendingNestOps = [...pending, { uid: item.sharedNestUid, role: item.sharedRole, key, care }];
+    nestProjectCare(item, care);
+    return true;
+}
+async function nestOperationKey(turnKey = '') {
+    const bytes = turnKey
+        ? new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(turnKey)))
+        : globalThis.crypto.getRandomValues(new Uint8Array(16));
+    return 'nest-' + Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+function nestStoryOps(companions, delta) {
+    const shared = companions.filter(item => item.sharedNestUid);
+    if (!shared.length) return [];
+    const careList = (Array.isArray(delta.companionCare) ? delta.companionCare : [delta.companionCare]).slice(0, 6);
+    return shared.flatMap(item => {
+        const ownName = String(item.name || '').toLowerCase();
+        const itemIdx = companions.indexOf(item);
+        const promptName = nestPromptName(item, itemIdx).toLowerCase();
+        const fallbackSlot = `shared companion ${itemIdx + 1}`;
+        const mood = nestInt(delta.companionMoodDelta, -15, 15);
+        const care = { action: 'story_care', daysDelta: delta.daysElapsed, moodDelta: mood };
+        for (const entry of careList) {
+            if (!entry || typeof entry !== 'object') continue;
+            const target = String(entry.target ?? entry.name ?? '').trim().toLowerCase();
+            if (companions.length > 1 && target && !['all', 'both', '*', 'все', 'оба', 'every', promptName, ownName, fallbackSlot, item.archetype, item.speciesKey].includes(target)) continue;
+            const bounded = nestCareBody({ ...entry, action: 'story_care', daysDelta: 0, warmthDelta: 0 });
+            for (const key of ['fullnessDelta', 'energyDelta', 'bondDelta', 'moodDelta']) care[key] = (care[key] || 0) + (bounded[key] || 0);
+            if (!mood && !bounded.moodDelta && (bounded.fullnessDelta >= 8 || bounded.energyDelta >= 15 || bounded.bondDelta >= 2)) care.moodDelta += 4;
+        }
+        const body = nestCareBody(care);
+        return Object.keys(body).length > 1 ? [{ item, care: body }] : [];
+    });
+}
+function nestSnapshot(raw, current) {
+    if (!NEST_UID.test(raw?.nestUid) || !['owner', 'partner'].includes(raw.role) ||
+        !Number.isSafeInteger(raw.revision) || raw.revision < 1 || !raw.companion) throw new Error('invalid_input');
+    if (current?.sharedNestUid && (current.sharedRole !== raw.role || current.sharedRev > raw.revision)) return null;
+    const pet = nestPassport(raw.companion, raw.companion.kind);
+    if (pet.kind === 'companion') pet.stage = nestStage(pet.ageDays);
+    if (raw.role !== 'owner') delete pet.relicUid;
+    const events = Array.isArray(raw.events) ? raw.events.slice(-12).map(nestSafeEvent).filter(Boolean) : [];
+    const seq = current?.lastSeenEventSeq ?? raw.revision;
+    const newest = events.filter(event => event.seq > seq && event.actorRole !== raw.role).at(-1);
+    const { kind, ...publicPet } = pet;
+    return { kind, fields: {
+        ...publicPet, relicUid: pet.relicUid,
+        ...nestLinkFields({
+            cradleRemoteLabel: true, sharedNestUid: raw.nestUid, sharedRole: raw.role, sharedRev: raw.revision,
+            sharedPartnerAlias: raw.partnerAlias, lastSeenEventSeq: Math.max(seq, ...events.map(e => e.seq)),
+            nestHint: newest?.action || current?.nestHint, nestEvents: events, nestCanRotate: raw.canRotate,
+            nestInvite: raw.canRotate ? (raw.inviteCode ?? current?.nestInvite) : '',
+        }),
+        // Also removes the cached invite as soon as a partner joins.
+        ...(raw.canRotate ? {} : { nestInvite: '' }),
+    } };
+}
+function nestDetach(item) {
+    if (item.sharedRole === 'partner') delete item.relicUid;
+    for (const key of ['sharedNestUid', 'sharedRole', 'sharedRev', 'sharedPartnerAlias', 'lastSeenEventSeq', 'nestHint', 'nestEvents', 'nestInvite', 'nestCanRotate']) {
+        delete item[key];
+    }
+    item.cradleCarry = true;
+}
+class nestTransport {
+    constructor(api) { this.api = api; }
+    async request(suffix = '', { body, key, method = 'POST' } = {}) {
+        const data = await this.api.request('/v1/rp/nests' + suffix, {
+            method, body, timeout: 12000, ...(key ? { headers: { 'Idempotency-Key': key } } : {}),
+        });
+        if (data?.success !== true || !Object.hasOwn(data, 'data')) throw new Error('invalid_response');
+        return data.data;
+    }
+    create(guardianAlias, companion, key) { return this.request('', { body: { guardianAlias, companion }, key }); }
+    join(guardianAlias, inviteCode, acceptKind) { return this.request('/join', { body: { guardianAlias, inviteCode, acceptKind } }); }
+    list() { return this.request('', { method: 'GET' }); }
+    care(op) { return this.request('/' + op.uid + '/care', { body: op.care, key: op.key }); }
+    rotate(uid) { return this.request('/' + uid + '/invite/rotate'); }
+    leave(uid) { return this.request('/' + uid + '/leave'); }
+}
+
 // --- src/core/date.js ---
 const TIME_SLOTS = Object.freeze(['morning', 'day', 'evening', 'night']);
 function parseIsoDate(value) {
@@ -680,7 +905,14 @@ function gaNormalizePrefs(raw) {
             && typeof x?.sig === 'string' && x.sig.length <= 256
         ).map(({ payload, sig }) => ({ payload, sig })) : [],
         hatchedRelicUids: [...new Set((Array.isArray(source.hatchedRelicUids) ? source.hatchedRelicUids : [])
-            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(value)))],
+            .filter(value => typeof value === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(value)))],
+        ...nestPrefsFields(source),
+        sentGifts: (Array.isArray(source.sentGifts) ? source.sentGifts : []).filter(item =>
+            /^gft_[a-f0-9]{16}$/.test(item?.giftId) && ['egg', 'companion'].includes(item?.kind)
+            && /^CLXPET1:[A-Za-z0-9_-]{1,5462}$/.test(item?.code)
+        ).slice(-5).map(({ giftId, kind, name, code, sentAt }) => ({ giftId, kind, name: String(name || '').slice(0, 80), code, sentAt })),
+        redeemedGiftIds: [...new Set((Array.isArray(source.redeemedGiftIds) ? source.redeemedGiftIds : [])
+            .filter(id => typeof id === 'string' && /^gft_[a-f0-9]{16}$/.test(id)))].slice(-100),
         pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
     };
 }
@@ -700,8 +932,10 @@ function gaNormalizeEgg(raw) {
         name: String(raw.name || '').replace(/[<>]/g, '').slice(0, 80),
         personality: String(raw.personality || '').replace(/[<>]/g, '').slice(0, 240),
         prophecy: String(raw.prophecy || '').replace(/[<>]/g, '').slice(0, 240),
+        ...nestLinkFields(raw),
+        ...(raw.needsStageArt === true ? { needsStageArt: true } : {}),
         artPath: String(raw.artPath || '').slice(0, 512),
-        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
+        ...(typeof raw.relicUid === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(raw.relicUid) ? { relicUid: raw.relicUid } : {}),
     };
 }
 function gaWarmEgg(prefs, eggId, amount = 20) {
@@ -1087,12 +1321,14 @@ function normalizeCompanion(raw, idx = 0) {
         videoPath,
         videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
         needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
+        ...nestLinkFields(src),
+        ...(src.cradleCarry === true ? { cradleCarry: true } : {}),
         lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
         ...(GA_RARITIES.includes(src.rarity) ? { rarity: src.rarity } : {}),
         ...(EGG_SKINS.some(skin => skin.id === src.eggSkin) ? { eggSkin: src.eggSkin } : {}),
         ...(typeof src.mutationTrait === 'string' && src.mutationTrait
             ? { mutationTrait: src.mutationTrait.replace(/[<>]/g, '').slice(0, 120) } : {}),
-        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
+        ...(typeof src.relicUid === 'string' && /^rpr_[A-Za-z0-9_-]{1,44}$/.test(src.relicUid) ? { relicUid: src.relicUid } : {}),
     };
 }
 function createCompanionFromArchetype(archetypeId, { customName = '', locale = 'ru' } = {}) {
@@ -1273,9 +1509,12 @@ function interactWithCompanion(companion, action, { rpDate = '' } = {}) {
 
     const stageLabel = COMPANION_STAGES.includes(target.stage) ? target.stage : 'infant';
     const roleLabel = target.originChildId ? `${stageLabel} child` : `${stageLabel} companion`;
-    const memoryHint = `{{user}} ${spec.verb} ${target.name} (${roleLabel}); naturally weave a brief moment of ${target.name} ${spec.detail} into this turn.`;
+    const safeName = nestPromptName(target) || target.name;
+    const memoryHint = `{{user}} ${spec.verb} ${safeName} (${roleLabel}); naturally weave a brief moment of ${safeName} ${spec.detail} into this turn.`;
 
-    return { companion: target, memoryHint };
+    return { companion: target, memoryHint, care: {
+        fullnessDelta: spec.fullness, moodDelta: spec.mood, bondDelta: spec.bond, energyDelta: spec.energy,
+    } };
 }
 function advanceCompanionsDays(companions, deltaDays) {
     if (!Array.isArray(companions)) return [];
@@ -1283,7 +1522,7 @@ function advanceCompanionsDays(companions, deltaDays) {
     if (days <= 0) return companions;
 
     for (const comp of companions) {
-        if (!comp || typeof comp !== 'object') continue;
+        if (!comp || typeof comp !== 'object' || comp.sharedNestUid) continue;
         const prevStage = COMPANION_STAGES.includes(comp.stage) ? comp.stage : compStageForAge(comp.ageDays);
         comp.ageDays = Math.max(0, Math.trunc(compFiniteOr(comp.ageDays, 0))) + days;
         const nextStage = compStageForAge(comp.ageDays);
@@ -1373,7 +1612,7 @@ function buildCompanionPortraitPrompt(companion, {
 
     const rawPrompt = [
         styleLead,
-        `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
+        `Subject: ${nestPromptName(comp)}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
         `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
         skinClause,
         lineageClause,
@@ -1395,7 +1634,7 @@ function buildCompanionVideoPrompt(companion) {
             : 'soft sleepy demeanor settling cozily for warmth';
 
     const rawPrompt = [
-        `Subtle 4-second cinematic image-to-video animation of ${comp.name} at the ${comp.stage} stage:`,
+        `Subtle 4-second cinematic image-to-video animation of ${nestPromptName(comp)} at the ${comp.stage} stage:`,
         `${profile.motionCue}, natural eye blink, ${moodMotion}.`,
         'Smooth micro-camera push-in, consistent character anatomy and lighting, drifting ambient dust motes, seamless loopable motion, no distortion or text.',
     ].join(' ');
@@ -1433,7 +1672,7 @@ function buildCompanionBabbleMessages(companion, {
                 : 'feeling calm and attentive';
 
     const systemContent = [
-        `You roleplay ONLY as ${comp.name} (${comp.originChildId ? 'child/heir' : comp.speciesKey.replace(/_/g, ' ')}, stage: ${comp.stage}).`,
+        `You roleplay ONLY as ${nestPromptName(comp)} (${comp.originChildId ? 'child/heir' : (comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, stage: ${comp.stage}).`,
         `Write in ${langName}. Return ONLY 1–2 short spoken sentences enclosed in quotation marks (${quoteExample}) suitable for direct text-to-speech playback, with no narration outside quotes and no markdown.`,
         stageVoiceRule,
         `Traits: ${comp.traits.join(', ')}. Current state: ${needNote}, bond ${comp.bond}/100.`,
@@ -1441,8 +1680,8 @@ function buildCompanionBabbleMessages(companion, {
 
     const caregivers = [charName, userName].filter(Boolean).join(' & ') || 'your caregiver';
     const userContent = isRu
-        ? `Произнеси одну живую короткую реплику в кавычках от лица ${comp.name} для ${caregivers}.`
-        : `Speak one short, vivid in-character line in quotes as ${comp.name} addressing ${caregivers}.`;
+        ? `Произнеси одну живую короткую реплику в кавычках от лица ${nestPromptName(comp)} для ${caregivers}.`
+        : `Speak one short, vivid in-character line in quotes as ${nestPromptName(comp)} addressing ${caregivers}.`;
 
     return [
         { role: 'system', content: systemContent },
@@ -1464,9 +1703,9 @@ function buildCompanionForgeConcept(companion, {
     if (isRu) {
         const lineage = isHeir
             ? `Повзрослевший наследник второго поколения (${comp.gender === 'male' ? 'сын' : 'дочь'} ${parentA} и ${parentB}, проживший ${comp.ageDays} дн. в хронике Колыбели)`
-            : `Пробудившийся в самостоятельном облике фамильяр-спутник (${comp.speciesKey.replace(/_/g, ' ')}, воспитанный ${parentA} и ${parentB} за ${comp.ageDays} дн. странствий, узы ${comp.bond}/100)`;
+            : `Пробудившийся в самостоятельном облике фамильяр-спутник (${(comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, воспитанный ${parentA} и ${parentB} за ${comp.ageDays} дн. странствий, узы ${comp.bond}/100)`;
         return [
-            `Имя персонажа: ${comp.name}.`,
+            `Имя персонажа: ${nestPromptName(comp)}.`,
             `Происхождение и роль: ${lineage}.`,
             `Унаследованные черты характера: ${traitsList}. Темперамент и настрой: ${comp.mood}/100.`,
             `Сделай полноценную карточку второго поколения (CCv2): детальная внешность взрослой стадии, манера речи, личная цель и сложная эмоциональная связь с {{user}} и ${parentA}.`,
@@ -1476,10 +1715,10 @@ function buildCompanionForgeConcept(companion, {
 
     const lineageEn = isHeir
         ? `Grown second-generation dynasty heir (${comp.gender === 'male' ? 'son' : 'daughter'} of ${parentA} and ${parentB}, raised across ${comp.ageDays} days in the Cradle chronicle)`
-        : `Awakened ascendant familiar (${comp.speciesKey.replace(/_/g, ' ')}, raised by ${parentA} and ${parentB} over ${comp.ageDays} days, bond ${comp.bond}/100)`;
+        : `Awakened ascendant familiar (${(comp.cradleRemoteLabel ? comp.archetype : comp.speciesKey).replace(/_/g, ' ')}, raised by ${parentA} and ${parentB} over ${comp.ageDays} days, bond ${comp.bond}/100)`;
 
     return [
-        `Character Name: ${comp.name}.`,
+        `Character Name: ${nestPromptName(comp)}.`,
         `Origin & Role: ${lineageEn}.`,
         `Inherited Personality Traits: ${traitsList}. Temperament & morale: ${comp.mood}/100.`,
         `Design a rich second-generation CCv2 character card: adult appearance, distinct voice, personal ambition, and deep history with {{user}} and ${parentA}.`,
@@ -2728,6 +2967,7 @@ function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        cradleRemoved: [],
         companions: [],   // up to 6 active companions/heirs normalized via normalizeCompanion
         customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
         inventory: {
@@ -2865,6 +3105,8 @@ function normalizeChatState(raw) {
             ...(physIsValidEggSkin(child?.eggSkin) ? { eggSkin: child.eggSkin } : {}),
         }));
     }
+    out.cradleRemoved = [...new Set((Array.isArray(raw.cradleRemoved) ? raw.cradleRemoved : [])
+        .filter(id => typeof id === 'string' && /^[a-zA-Z0-9_-]{1,40}$/.test(id)))].slice(-100);
     if (Array.isArray(raw.companions)) {
         const seenIds = new Set();
         const seenChildIds = new Set();
@@ -3367,7 +3609,8 @@ function physEncodeSnapshot(state) {
     if (src.scene && typeof src.scene === 'object') delete src.scene.imagePrompt;
     if (Array.isArray(src.activityLog)) src.activityLog = src.activityLog.slice(-PHYS_SNAPSHOT_LOG_TAIL);
 
-    const companions = Array.isArray(src.companions) ? src.companions : [];
+    delete src.cradleRemoved;
+    const companions = Array.isArray(src.companions) ? src.companions.filter(comp => !comp.cradleCarry && !comp.sharedNestUid) : [];
     const meters = Array.isArray(src.customMeters) ? src.customMeters : [];
     delete src.companions;
     delete src.customMeters;
@@ -3469,6 +3712,11 @@ function physRestoreInto(state, target, keptCheckpoints) {
     const preservedImagePrompt = state.scene?.imagePrompt;
     const preservedCodex = state.codexHistory;
     const restored = physDecodeSnapshot(target.snapshot);
+    const carried = (state.companions || []).filter(comp => comp.cradleCarry || comp.sharedNestUid);
+    const removed = state.cradleRemoved || [];
+    restored.companions = [...carried, ...restored.companions.filter(comp =>
+        !comp.sharedNestUid && !comp.cradleCarry && !removed.includes(comp.id) && !carried.some(live => live.id === comp.id))].slice(0, 6);
+    restored.cradleRemoved = removed;
     Object.assign(state, restored);
     if (preservedDirector !== undefined) state.world.director = normalizeDirectorState(preservedDirector);
     if (preservedHint !== undefined) state.world.pendingMemoryHint = String(preservedHint ?? '');
@@ -3747,6 +3995,7 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
 
             const targets = selectCareTargets(care.target ?? care.name ?? '');
             for (const comp of targets) {
+                if (comp.sharedNestUid) continue;
                 if (fullShift) comp.fullness = applyZeroPunishDelta(comp.fullness, fullShift, 85, 20);
                 if (energyShift) comp.energy = applyZeroPunishDelta(comp.energy, energyShift, 90, 20);
                 if (bondShift > 0) {
@@ -3768,6 +4017,7 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
 
         if (hasExplicitMood && explicitMoodShift !== 0) {
             for (const comp of state.companions) {
+                if (comp.sharedNestUid) continue;
                 comp.mood = applyZeroPunishDelta(comp.mood, explicitMoodShift, 85, 20);
             }
         } else if (!hasExplicitMood && !hadCareMoodBoost) {
@@ -3787,6 +4037,7 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
             const ambientShift = freshTrauma ? -10 : highStress ? -6 : soothingTurn ? 5 : 0;
             if (ambientShift !== 0) {
                 for (const comp of state.companions) {
+                if (comp.sharedNestUid) continue;
                     comp.mood = applyZeroPunishDelta(comp.mood, ambientShift, 85, 20);
                 }
             }
@@ -4169,7 +4420,12 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
 
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const compact = state.companions.length <= 2;
-        const compItems = state.companions.slice(0, 4).map(c => {
+        const hintIndex = state.companions.findIndex(c => nestHintFor(c));
+        const visible = state.companions.slice(0, 4);
+        if (hintIndex > 3) visible[3] = state.companions[hintIndex];
+        const compItems = visible.map(c => {
+            const i = state.companions.indexOf(c);
+            const hint = i === hintIndex ? nestHintFor(c) : '';
             const moodNum = Number.isFinite(Number(c.mood)) ? Math.round(Number(c.mood)) : 85;
             const fullNum = Number.isFinite(Number(c.fullness)) ? Math.round(Number(c.fullness)) : 85;
             const energyNum = Number.isFinite(Number(c.energy)) ? Math.round(Number(c.energy)) : 90;
@@ -4178,10 +4434,12 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
             const fullWord = compact && fullNum <= 35 ? 'hungry ' : '';
             const energyWord = compact && energyNum <= 35 ? 'sleepy ' : '';
             const bondTag = compact && bondNum >= 75 ? ', deeply bonded' : '';
-            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullWord}${fullNum}%, energy ${energyWord}${energyNum}%${bondTag})`;
+            return `${String(nestPromptName(c, i) || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullWord}${fullNum}%, energy ${energyWord}${energyNum}%${bondTag}${hint ? `, ${hint}` : ''})`;
         });
         const moreSuffix = state.companions.length > 4 ? ` (+${state.companions.length - 4} more)` : '';
-        lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
+        const line = `• Active Companions: ${compItems.join('; ')}${moreSuffix}.`;
+        if (hintIndex >= 0) lines.splice(3, 0, line);
+        else lines.push(line);
     }
 
     const continuityLine = promptsWorldContinuityLine(state.underworld);
@@ -4207,7 +4465,7 @@ function buildTrackerExtractionMessages(state, recentMessages, {
         ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
         : '';
     const companionNames = Array.isArray(state.companions) && state.companions.length > 0
-        ? state.companions.slice(0, 6).map(c => c.name).filter(Boolean).join(', ')
+        ? state.companions.slice(0, 6).map(nestPromptName).filter(Boolean).join(', ')
         : '';
     const companionSchemaHint = companionNames
         ? [
@@ -7783,7 +8041,7 @@ function relParseSignedPayload(payload) {
     if (typeof payload !== 'string' || payload.length > 16_384) throw new Error('Invalid certificate payload.');
     const fields = JSON.parse(payload);
     if (!fields || fields.v !== REL_CERT_VERSION || fields.iss !== 'clodex.xyz'
-        || typeof fields.relicUid !== 'string' || !/^rpr_[A-Za-z0-9]{1,44}$/.test(fields.relicUid)
+        || typeof fields.relicUid !== 'string' || !/^rpr_[A-Za-z0-9_-]{1,44}$/.test(fields.relicUid)
         || typeof fields.edition !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(fields.edition)
         || !Number.isSafeInteger(fields.serial) || fields.serial < 1
         || !Number.isSafeInteger(fields.maxSupply) || fields.maxSupply < fields.serial
@@ -7889,7 +8147,8 @@ async function relSyncInventory(api, signal, { publicJwk = REL_PUBLIC_JWK } = {}
     if (!api?.rpRelicInventory) return { relics: [], unavailable: true };
     try {
         const payload = await api.rpRelicInventory(signal);
-        const source = Array.isArray(payload?.relics) ? payload.relics : Array.isArray(payload?.data) ? payload.data : [];
+        const source = Array.isArray(payload?.relics) ? payload.relics : payload?.data;
+        if (payload?.success !== true || !Array.isArray(source)) return { relics: [], unavailable: true };
         const relics = await Promise.all(source.map(async (raw) => {
             const item = raw && typeof raw === 'object' ? { ...raw } : {};
             const certPayload = item.certPayload ?? item.cert_payload ?? item.payload;
@@ -7899,7 +8158,7 @@ async function relSyncInventory(api, signal, { publicJwk = REL_PUBLIC_JWK } = {}
             const verified = await relVerifyCert(item.payload, item.sig, { publicJwk });
             return { payload: item.payload, sig: item.sig, verified };
         }));
-        return { relics, unavailable: false };
+        return { relics, unavailable: relics.some(item => !item.verified) };
     } catch {
         return { relics: [], unavailable: true };
     }
@@ -7915,6 +8174,40 @@ async function relVerifyInventory(relics, options = {}) {
 function relMintUrl(editionKey) {
     const edition = encodeURIComponent(String(editionKey || '').slice(0, 64));
     return `https://clodex.xyz/console/rp-relics?edition=${edition}`;
+}
+function relGiftUrl(relicUid) {
+    return 'https://clodex.xyz/console/rp-relics?gift=' + encodeURIComponent(relicUid);
+}
+async function relClaimGift(api, code, key, options = {}) {
+    code = String(code || '').trim().toUpperCase();
+    if (!/^RPR-GIFT-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/.test(code)) throw new Error('invalid_input');
+    const result = await api.request('/v1/rp/relics/transfer/claim', {
+        method: 'POST', body: { code }, headers: { 'Idempotency-Key': key }, timeout: 12000,
+    });
+    if (result?.success !== true) throw new Error('invalid_input');
+    const payload = result.data?.certPayload;
+    const sig = result?.data?.certSignature;
+    if (!await relVerifyCert(payload, sig, options)) throw new Error('unverified');
+    return { payload, sig, claims: relParseSignedPayload(payload) };
+}
+function relReconcileServerInventory(prefs, inventory, state) {
+    if (inventory.unavailable) return prefs;
+    const relics = inventory.relics.filter(item => item.verified).map(({ payload, sig }) => ({ payload, sig }));
+    const owned = new Set(relics.map(item => relParseSignedPayload(item.payload).relicUid));
+    const lost = uid => uid && !owned.has(uid);
+    // A hatched pet can stay as an ordinary companion, never as a second
+    // locally certified copy. Unhatched eggs must be removed from the Altar.
+    for (const companion of state?.companions || []) {
+        if (lost(companion.relicUid)) {
+            delete companion.relicUid;
+            companion.cradleCarry = true;
+        }
+    }
+    return {
+        ...prefs, relics,
+        pendingEggs: (prefs.pendingEggs || []).filter(egg => !lost(egg.relicUid)),
+        hatchedRelicUids: (prefs.hatchedRelicUids || []).filter(uid => !lost(uid)),
+    };
 }
 
 // --- src/core/views/cradle-gacha.js ---
@@ -8036,6 +8329,7 @@ function vGaRenderAltar(doc, t, model = {}, actions = {}) {
                     vEl(doc, 'select', {
                         className: 'clodex-rp-input',
                         dataset: { rpAction: 'gacha-egg-skin', eggId: String(egg.id) },
+                        disabled: Boolean(egg.relicUid),
                         onChange: e => actions.onEquipEggSkin?.(egg.id, String(e?.target?.value ?? '')),
                     }, ...skinOptionIds.map(skinId => vEl(doc, 'option', {
                         value: skinId,
@@ -8058,6 +8352,7 @@ function vGaRenderAltar(doc, t, model = {}, actions = {}) {
                         onClick: () => actions.onHatch?.(egg.id),
                     }, `🐣 ${t('gacha.hatch')}`),
                 ),
+                ...(actions.renderSocial?.(egg) || []),
             );
 
             list.append(vEl(doc, 'article', {
@@ -8199,6 +8494,8 @@ function vGaRenderRelics(doc, t, model = {}, actions = {}) {
                 vEl(doc, 'span', { className: 'clodex-rp-muted' },
                     `🥚 ${vGaSkinName(t, entry.claims.eggSkin)} · ${vGaRarityLabel(t, entry.claims.rarity)}`),
             ),
+            vEl(doc, 'a', { href: relGiftUrl(uid), target: '_blank', rel: 'noopener noreferrer', className: 'clodex-rp-btn-mini' },
+                '🎁 ' + t('relic.giftOnWeb')),
             vEl(doc, 'button', {
                 type: 'button',
                 className: 'clodex-rp-btn-mini',
@@ -8212,6 +8509,245 @@ function vGaRenderRelics(doc, t, model = {}, actions = {}) {
     root.append(invCard);
 
     return root;
+}
+
+// --- src/core/gift.js ---
+const GIFT_MAX_BYTES = 4096;
+const GIFT_PREFIX = 'CLXPET1:';
+const GIFT_ID = /^gft_[a-f0-9]{16}$/;
+const GIFT_FORBIDDEN = /[<>\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]|\bsk-[a-z0-9_-]{6,}|\b(?:data|blob|javascript):|&(?:lt|gt|#\d+|#x[0-9a-f]+);/iu;
+const GIFT_FIELDS = ['format', 'version', 'giftId', 'issuedAt', 'fromAlias', 'note', 'kind', 'payload'];
+const GIFT_COMMON = ['name', 'archetype', 'rarity', 'eggSkin', 'mutationTrait'];
+const GIFT_COMPANION = [...GIFT_COMMON, 'speciesKey', 'gender', 'stage', 'ageDays', 'fullness', 'mood', 'bond', 'energy', 'traits'];
+const GIFT_EGG = [...GIFT_COMMON, 'warmth'];
+
+function giftFail(reason = 'invalid') {
+    throw new Error(reason);
+}
+
+function giftObject(value, fields) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).every(k => fields.includes(k))) giftFail();
+}
+
+function giftText(value, max) {
+    if (typeof value !== 'string' || [...value].length > max || GIFT_FORBIDDEN.test(value)) giftFail();
+    return value.trim();
+}
+
+function giftEnum(value, allowed) {
+    if (!allowed.includes(value)) giftFail();
+    return value;
+}
+
+function giftNumber(value, max) {
+    if (!Number.isInteger(value) || value < 0 || value > max) giftFail();
+    return value;
+}
+
+function giftValidate(capsule) {
+    giftObject(capsule, GIFT_FIELDS);
+    if (capsule.format !== 'clodex-pet' || capsule.version !== 1 || typeof capsule.giftId !== 'string' || !GIFT_ID.test(capsule.giftId)) giftFail();
+    const kind = giftEnum(capsule.kind, ['egg', 'companion']);
+    giftNumber(capsule.issuedAt, Number.MAX_SAFE_INTEGER);
+    const fromAlias = giftText(capsule.fromAlias ?? '', 32);
+    const note = giftText(capsule.note ?? '', 140);
+    const p = capsule.payload;
+    giftObject(p, kind === 'egg' ? GIFT_EGG : GIFT_COMPANION);
+    const payload = {
+        name: giftText(p.name, 80),
+        archetype: giftEnum(p.archetype, kind === 'egg' ? GA_ARCHETYPES : COMPANION_ARCHETYPES),
+    };
+    if (p.rarity !== undefined) payload.rarity = giftEnum(p.rarity, GA_RARITIES);
+    if (p.eggSkin !== undefined) payload.eggSkin = giftEnum(p.eggSkin, EGG_SKINS.map(s => s.id));
+    if (p.mutationTrait !== undefined) payload.mutationTrait = giftText(p.mutationTrait, 120);
+    if (kind === 'egg') {
+        payload.warmth = giftNumber(p.warmth, 100);
+    } else {
+        if (typeof p.speciesKey !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(p.speciesKey) || GIFT_FORBIDDEN.test(p.speciesKey)) giftFail();
+        payload.speciesKey = p.speciesKey;
+        payload.gender = giftEnum(p.gender, ['female', 'male', 'neutral']);
+        payload.stage = giftEnum(p.stage, COMPANION_STAGES);
+        payload.ageDays = giftNumber(p.ageDays, 36500);
+        for (const k of ['fullness', 'mood', 'bond', 'energy']) payload[k] = giftNumber(p[k], 100);
+        if (!Array.isArray(p.traits) || p.traits.length > 4) giftFail();
+        payload.traits = p.traits.map(v => giftText(v, 44));
+    }
+    return { format: 'clodex-pet', version: 1, giftId: capsule.giftId, issuedAt: capsule.issuedAt, fromAlias, note, kind, payload };
+}
+
+function giftBytesToUrl(bytes) {
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function giftParse(input) {
+    const value = String(input ?? '').trim();
+    const encoded = value.startsWith(GIFT_PREFIX);
+    let bytes;
+    if (encoded) {
+        const b64 = value.slice(GIFT_PREFIX.length);
+        if (b64.length > Math.ceil(GIFT_MAX_BYTES * 4 / 3)) giftFail('tooLarge');
+        if (!/^[A-Za-z0-9_-]+$/.test(b64) || b64.length % 4 === 1) giftFail();
+        try {
+            bytes = Uint8Array.from(atob(b64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+        } catch { giftFail(); }
+        if (giftBytesToUrl(bytes) !== b64) giftFail();
+    } else {
+        if (value.length > GIFT_MAX_BYTES) giftFail('tooLarge');
+        bytes = new TextEncoder().encode(value);
+    }
+    if (bytes.length > GIFT_MAX_BYTES) giftFail('tooLarge');
+    let raw;
+    try { raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)); }
+    catch { giftFail(); }
+    return giftValidate(raw);
+}
+function giftPackage(entity, kind, { fromAlias = '', note = '', now = Date.now(), cryptoImpl = globalThis.crypto } = {}) {
+    if (!entity || entity.hatched) giftFail();
+    if (entity.relicUid) giftFail('relic');
+    if (entity.sharedNestUid) giftFail('shared');
+    giftEnum(kind, ['companion', 'egg']);
+    const normalized = kind === 'egg' ? gaNormalizeEgg(entity) : normalizeCompanion(entity);
+    const fields = kind === 'egg' ? GIFT_EGG : GIFT_COMPANION;
+    const payload = Object.fromEntries(fields.filter(f => normalized[f] !== undefined).map(f => [f, normalized[f]]));
+    const id = cryptoImpl.getRandomValues(new Uint8Array(8));
+    const giftId = 'gft_' + Array.from(id, b => b.toString(16).padStart(2, '0')).join('');
+    const capsule = giftValidate({ format: 'clodex-pet', version: 1, giftId, issuedAt: Math.floor(now / 1000), fromAlias, note, kind, payload });
+    const json = JSON.stringify(capsule);
+    const bytes = new TextEncoder().encode(json);
+    if (bytes.length > GIFT_MAX_BYTES) giftFail('tooLarge');
+    return { capsule, json, code: GIFT_PREFIX + giftBytesToUrl(bytes) };
+}
+function giftSend(state, prefs, kind, id, options) {
+    const list = kind === 'egg' ? prefs.pendingEggs : state.companions;
+    const index = list.findIndex(e => e.id === id);
+    const { capsule, code } = giftPackage(list[index], kind, options);
+    const sent = { giftId: capsule.giftId, name: capsule.payload.name, kind, code, sentAt: capsule.issuedAt };
+    list.splice(index, 1);
+    if (kind === 'companion') state.cradleRemoved = [...new Set([...(state.cradleRemoved || []), id])].slice(-100);
+    prefs.sentGifts = [...(prefs.sentGifts || []), sent].slice(-5);
+    return sent;
+}
+function giftRedeem(state, prefs, input) {
+    const capsule = giftParse(input);
+    if (prefs.redeemedGiftIds?.includes(capsule.giftId)) giftFail('alreadyRedeemed');
+    // On the sender's device the backup can only be used by explicit recall.
+    if (prefs.sentGifts?.some(item => item.giftId === capsule.giftId)) giftFail('sentHere');
+    const egg = capsule.kind === 'egg';
+    const list = egg ? prefs.pendingEggs : state.companions;
+    if (list.some(item => item.id === capsule.giftId)) giftFail('alreadyRedeemed');
+    if (list.length >= (egg ? 24 : 6)) giftFail('full');
+    const local = { ...capsule.payload, id: capsule.giftId, needsStageArt: true, cradleCarry: true };
+    const entity = egg ? gaNormalizeEgg(local) : normalizeCompanion(local);
+    list.push(entity);
+    prefs.redeemedGiftIds = [...(prefs.redeemedGiftIds || []), capsule.giftId].slice(-100);
+    if (capsule.payload.eggSkin && !prefs.unlockedEggSkins?.includes(capsule.payload.eggSkin)) {
+        prefs.unlockedEggSkins = [...(prefs.unlockedEggSkins || []), capsule.payload.eggSkin];
+    }
+    if (state.world) state.world.pendingMemoryHint = egg
+        ? 'A gifted egg has arrived in the Cradle.'
+        : 'A gifted companion has arrived in the Cradle.';
+    return { capsule, entity };
+}
+function giftRecallSent(state, prefs, giftId) {
+    const sent = (prefs.sentGifts || []).find(item => item.giftId === giftId);
+    if (!sent) giftFail();
+    const history = prefs.sentGifts;
+    prefs.sentGifts = history.filter(item => item !== sent);
+    try { return giftRedeem(state, prefs, sent.code); }
+    catch (err) {
+        prefs.sentGifts = history;
+        throw err;
+    }
+}
+
+// --- src/core/views/cradle-social.js ---
+function vCrButton(doc, label, click, disabled = false) {
+    return vEl(doc, 'button', { type: 'button', className: 'clodex-rp-btn-mini', disabled, onClick: click }, label);
+}
+
+function vCrInput(doc, label, value, onInput, maxLength, tag = 'input', readOnly = false) {
+    return vEl(doc, 'label', { className: 'clodex-rp-field' },
+        vEl(doc, 'span', {}, label),
+        vEl(doc, tag, { className: 'clodex-rp-input', value, maxLength, readOnly, spellcheck: false, autocomplete: 'off',
+            onInput: e => onInput?.(String(e.target.value)), rows: tag === 'textarea' ? 2 : undefined }),
+    );
+}
+function vCrRenderGifts(doc, t, model, actions) {
+    const isOpen = Boolean(model.target || model.latest || model.draft || model.busy);
+    const panel = vEl(doc, 'details', { className: 'clodex-rp-card', open: isOpen, dataset: { rpView: 'pet-gifts' } },
+        vEl(doc, 'summary', {}, '🎁 ' + t('gift.title')),
+        vEl(doc, 'p', { className: 'clodex-rp-muted' }, t('gift.offlineNotice')),
+        vEl(doc, 'div', { hidden: !model.target },
+            vEl(doc, 'strong', {}, model.target?.name || ''),
+            vCrInput(doc, t('gift.alias'), model.alias, actions.onAlias, 32),
+            vCrInput(doc, t('gift.note'), model.note, actions.onNote, 140),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+                vCrButton(doc, t('gift.package'), actions.onConfirm, model.busy),
+                vCrButton(doc, t('gift.cancel'), actions.onCancel, model.busy)),
+        ),
+        vEl(doc, 'div', { hidden: !model.latest },
+            vCrInput(doc, t('gift.code'), model.latest, null, 5470, 'textarea', true),
+        ),
+        vCrInput(doc, t('gift.paste'), model.draft, actions.onDraft, 5470, 'textarea'),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+            vCrButton(doc, t('gift.redeem'), actions.onRedeem, model.busy),
+            vCrButton(doc, t('gift.import'), actions.onImport, model.busy)),
+    );
+    if (model.sent?.length) panel.append(vEl(doc, 'details', { open: Boolean(model.latest) },
+        vEl(doc, 'summary', {}, t('gift.sentHistory')),
+        ...model.sent.map(item => vEl(doc, 'div', { className: 'clodex-rp-card' },
+            vEl(doc, 'strong', {}, item.name || t('gift.title')),
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+                vCrButton(doc, t('gift.copy'), () => actions.onCopy(item.code)),
+                vCrButton(doc, t('gift.export'), () => actions.onExport(item.code)),
+                vCrButton(doc, t('gift.recall'), () => actions.onRecall(item.giftId), model.busy)),
+        )),
+    ));
+    return panel;
+}
+function vCrRenderJoin(doc, t, model, actions) {
+    return vEl(doc, 'details', { className: 'clodex-rp-card', open: Boolean(model.target || model.code || model.busy), dataset: { rpView: 'nest-join' } },
+        vEl(doc, 'summary', {}, '🤝 ' + t('nest.title')),
+        vCrInput(doc, t('nest.alias'), model.alias, actions.onAlias, 32),
+        model.target ? vEl(doc, 'strong', {}, model.target.name) : vCrInput(doc, t('nest.invite'), model.code, actions.onCode, 14),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+            model.target
+                ? vCrButton(doc, t('nest.create'), actions.onCreate, model.busy)
+                : vCrButton(doc, t('nest.join'), actions.onJoin, model.busy),
+            model.target ? vCrButton(doc, t('gift.cancel'), actions.onCancel) : null,
+            vCrButton(doc, t('nest.refresh'), actions.onRefresh)),
+    );
+}
+function vCrRenderNest(doc, t, item, model, actions) {
+    if (!item.sharedNestUid) return vCrButton(doc, '🤝 ' + t('nest.create'), actions.onCreate, model.busy);
+    const rtfLocale = t('nest.locale') === 'ru' ? 'ru' : 'en';
+    const dateFmt = new Intl.RelativeTimeFormat(rtfLocale, { numeric: 'always' });
+    return vEl(doc, 'section', { className: 'clodex-rp-subbox clodex-rp-mt', dataset: { rpView: 'shared-nest' } },
+        vEl(doc, 'strong', {}, item.sharedPartnerAlias
+            ? '🤝 ' + t('nest.withPartner', { name: item.sharedPartnerAlias })
+            : '🤝 ' + t('nest.waiting')),
+        item.nestInvite ? vCrInput(doc, t('nest.invite'), item.nestInvite, null, 14, 'input', true) : null,
+        model.waiting ? vEl(doc, 'div', { className: 'clodex-rp-muted' }, t('nest.queued')) : null,
+        ...(item.nestEvents || []).map(evt => {
+            const minutes = Math.max(0, Math.floor((Date.now() - evt.at * 1000) / 60000));
+            const when = minutes >= 60 ? dateFmt.format(-Math.floor(minutes / 60), 'hour') : dateFmt.format(-minutes, 'minute');
+            const delta = evt.fullnessDelta ? ' · 🍖 ' + (evt.fullnessDelta > 0 ? '+' : '') + evt.fullnessDelta + '%'
+                : evt.energyDelta ? ' · 💤 ' + (evt.energyDelta > 0 ? '+' : '') + evt.energyDelta + '%' : '';
+            return vEl(doc, 'div', { className: 'clodex-rp-muted' },
+                (evt.actorRole === item.sharedRole ? t('nest.you') : item.sharedPartnerAlias || t('nest.partner')) +
+                ': ' + t(`nest.action.${evt.action}`) + delta + ' · ' + when);
+        }),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row' },
+            vCrButton(doc, '↻ ' + t('nest.refresh'), actions.onRefresh),
+            item.nestInvite ? vCrButton(doc, t('gift.copy'), () => actions.onCopy(item.nestInvite)) : null,
+            item.nestCanRotate ? vCrButton(doc, t('nest.rotate'), actions.onRotate, model.busy) : null,
+            vCrButton(doc, t('nest.leave'), actions.onLeave, model.busy)),
+    );
+}
+function vCrRenderRelicClaim(doc, t, model, actions) {
+    return vEl(doc, 'section', { className: 'clodex-rp-card', dataset: { rpView: 'relic-gift-claim' } },
+        vCrInput(doc, t('relic.giftCode'), model.code, actions.onInput, 'RPR-GIFT-XXXX-XXXX-XXXX'.length),
+        vCrButton(doc, t('relic.giftActivate'), actions.onClaim, model.busy),
+    );
 }
 
 // --- src/core/hud.js ---
@@ -8332,6 +8868,9 @@ function createRpStudioController(bridge) {
     let lastCasinoOutcome = null;
     let dossierBusy = false;
     let summonBusy = false;
+    let giftTarget = null, giftAlias = '', giftNote = '', giftDraft = '', giftLatest = '', giftBusy = false;
+    let nestCreateTarget = null, nestAliasDraft = null, nestInviteDraft = '', nestLastPull = 0, nestSyncing = null, nestBusy = false;
+    let relicClaimDraft = '', relicClaimKey = '', relicClaimCode = '', relicClaiming = false;
     let relicCatalog = [];
     let relicSyncStatus = '';
     let relicChecking = false;
@@ -8346,6 +8885,8 @@ function createRpStudioController(bridge) {
         getKey: () => bridge.getEffectiveKey(),
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
     });
+
+    const nestApi = new nestTransport(api);
 
     const hostRoot = el(doc, 'div', { className: 'clodex-rp-root' });
     const backdropEl = el(doc, 'div', { className: 'clodex-rp-video-backdrop', hidden: true });
@@ -8553,6 +9094,7 @@ function createRpStudioController(bridge) {
         drawerBackdrop.style.pointerEvents = drawerOpen ? 'auto' : 'none';
         if (drawerOpen) {
             if (activeTab === 'scene') syncCachedCharName();
+            if (activeTab === 'cradle') void nestRefresh();
             renderDrawer();
         } else {
             drawerPanel.replaceChildren();
@@ -8940,6 +9482,8 @@ function createRpStudioController(bridge) {
     }
 
     async function hatchPendingEgg(eggId, state) {
+        const linked = rpPrefs.pendingEggs.find(item => item.id === eggId && item.sharedNestUid);
+        if (linked) return nestDoCare(eggId, { action: 'hatch' });
         const result = gaHatchEgg(rpPrefs, eggId);
         if (!result.ok) { errorBanner = t(`gacha.error.${result.reason}`); renderAll(); return null; }
         const egg = result.egg;
@@ -8971,7 +9515,11 @@ function createRpStudioController(bridge) {
             relSyncCatalog(api), relSyncInventory(api),
         ]);
         if (!inventoryResult.unavailable) {
-            await saveRpEntitlements({ ...rpPrefs, relics: inventoryResult.relics });
+            const state = bridge.getChatState();
+            const ownedBefore = state.companions.filter(item => item.relicUid).length;
+            const next = relReconcileServerInventory(rpPrefs, inventoryResult, state);
+            if (state.companions.filter(item => item.relicUid).length !== ownedBefore) await bridge.saveChatState(state);
+            await saveRpEntitlements(next);
             verifiedRelics = await relVerifyInventory(rpPrefs.relics);
         }
         return { editions: catalogResult.editions, catalogueUnavailable: catalogResult.unavailable, inventoryUnavailable: inventoryResult.unavailable };
@@ -9392,7 +9940,9 @@ function createRpStudioController(bridge) {
         renderAll();
         try {
             // 1. turnKey of the reply being analysed (variant-aware), 2. phone cadence gate (spec 10.6)
+            const scope = bridge.getChatScope?.();
             const turnKey = await getLatestTurnKeySafe(checkpointKey);
+            if (scope !== bridge.getChatScope?.()) return false;
             const state = bridge.getChatState();
             const includePhone = Boolean(phoneShouldInclude(state));
             const messages = buildTrackerExtractionMessages(state, rp.recentMessages, {
@@ -9404,7 +9954,7 @@ function createRpStudioController(bridge) {
             const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: TRACKER_MAX_TOKENS, jsonMode: true });
             // Do not apply a late response to a swiped/deleted branch.
             const currentTurnKey = await getLatestTurnKeySafe(turnKey);
-            if (turnKey && currentTurnKey && turnKey !== currentTurnKey) return false;
+            if (scope !== bridge.getChatScope?.() || (turnKey && currentTurnKey && turnKey !== currentTurnKey)) return false;
             let delta = {};
             try {
                 delta = parseTrackerExtraction(raw) || {};
@@ -9415,8 +9965,27 @@ function createRpStudioController(bridge) {
             }
             const phoneEvents = includePhone && Array.isArray(delta.phoneEvents) ? delta.phoneEvents.slice(0, 2) : [];
             if (!includePhone && 'phoneEvents' in delta) delete delta.phoneEvents;
-            // 4. compact state + checkpoint for this exact variant
+            // 4. Compact state + checkpoint. The shared pet is intentionally
+            // excluded from branch-local simulation and only gets typed deltas.
+            const sharedCare = nestStoryOps(state.companions, delta);
             applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey, saveCheckpoint: false });
+            let queued = false;
+            if (sharedCare.length) {
+                const stableKey = (turnKey || checkpointKey) ? JSON.stringify([scope, turnKey || checkpointKey]) : '';
+                const opKey = await nestOperationKey(stableKey);
+                if (scope !== bridge.getChatScope?.()) return false;
+                for (const { item, care } of sharedCare) {
+                    try {
+                        queued = nestQueueCare(rpPrefs, item, care, opKey) || queued;
+                    } catch (err) {
+                        if (!silent || err?.message === 'queue_full') nestUserError(err);
+                    }
+                }
+            }
+            if (queued) {
+                await saveRpEntitlements(rpPrefs);
+                if (!silent) void nestRefresh({ pull: false });
+            }
             // 6. Anti-Slop rule is recomputed locally after every reply (0 requests)
             try {
                 await recomputeSlop({ state, save: false });
@@ -10995,6 +11564,370 @@ function createRpStudioController(bridge) {
         return container;
     }
 
+    function copyCradleCode(value) {
+        if (bridge.copyText) return bridge.copyText(value);
+        if (win.navigator?.clipboard?.writeText) return win.navigator.clipboard.writeText(value);
+        return Promise.reject(new Error('clipboard'));
+    }
+
+    function displayCradleError(group, err, known) {
+        const code = err?.code || err?.message;
+        errorBanner = t(group + '.error.' + (known.includes(code) ? code : 'invalid'));
+        renderAll();
+    }
+
+    async function runGift(action, change) {
+        if (giftBusy) return;
+        giftBusy = true;
+        try {
+            const scope = bridge.getChatScope?.();
+            const state = bridge.getChatState();
+            const sentBefore = rpPrefs.sentGifts;
+            const prefs = structuredClone(rpPrefs);
+            const updated = structuredClone(state);
+            const result = change(updated, prefs);
+            const name = result.name ?? result.entity?.name ?? '';
+            const summary = t(`gift.activity.${action}`, { name });
+            updated.activityLog = [...(updated.activityLog || []), { atDate: updated.world.rpDate, summary }].slice(-40);
+            // Persist the backup first on send; no pet may be removed without
+            // a saved capsule to recover it. Keep a selectable copy in the UI.
+            if (action === 'sent') {
+                await saveRpEntitlements(prefs);
+                if (scope !== bridge.getChatScope?.() && result.kind === 'companion') {
+                    // The source chat is no longer writable. Don't leave an
+                    // exportable backup for a pet that was never removed.
+                    await saveRpEntitlements({ ...rpPrefs, sentGifts: sentBefore });
+                    return;
+                }
+            }
+            if (scope === bridge.getChatScope?.()) await bridge.saveChatState(updated);
+            if (action !== 'sent') await saveRpEntitlements(prefs);
+            giftLatest = result.code || '';
+            giftDraft = '';
+            giftTarget = null;
+            errorBanner = '';
+            bridge.notify?.(summary);
+            if (result.code) await copyCradleCode(result.code).catch(() => {});
+        } catch (err) {
+            displayCradleError('gift', err, ['invalid', 'tooLarge', 'relic', 'shared', 'full', 'sentHere', 'alreadyRedeemed', 'clipboard']);
+        } finally {
+            giftBusy = false;
+            renderAll();
+        }
+    }
+
+    function renderGiftPanel() {
+        const confirm = async () => {
+            if (!giftTarget) return;
+            const scope = bridge.getChatScope?.();
+            const { id, kind } = giftTarget;
+            if (!await bridge.confirm?.(t('gift.confirm')) || scope !== bridge.getChatScope?.()) return;
+            return runGift('sent', (state, prefs) => giftSend(state, prefs, kind, id, { fromAlias: giftAlias, note: giftNote }));
+        };
+        return vCrRenderGifts(doc, t, {
+            target: giftTarget, alias: giftAlias, note: giftNote, draft: giftDraft, latest: giftLatest, sent: rpPrefs.sentGifts, busy: giftBusy,
+        }, {
+            onAlias: value => { giftAlias = value; },
+            onNote: value => { giftNote = value; },
+            onDraft: value => { giftDraft = value; },
+            onCancel: () => { giftTarget = null; renderAll(); },
+            onConfirm: confirm,
+            onRedeem: () => runGift('received', (state, prefs) => giftRedeem(state, prefs, giftDraft)),
+            onRecall: async id => {
+                if (!await bridge.confirm?.(t('gift.confirmRecall'))) return;
+                return runGift('recalled', (state, prefs) => giftRecallSent(state, prefs, id));
+            },
+            onCopy: code => {
+                giftLatest = code;
+                renderAll();
+                copyCradleCode(code).catch(err => displayCradleError('gift', err, ['clipboard']));
+            },
+            onExport: async code => {
+                try {
+                    const capsule = giftParse(code);
+                    await bridge.exportPet(capsule.giftId + '.clodex-pet', JSON.stringify(capsule));
+                } catch (err) { displayCradleError('gift', err, ['tooLarge']); }
+            },
+            onImport: async () => {
+                try {
+                    const raw = await bridge.importPet?.();
+                    if (raw) await runGift('received', (state, prefs) => giftRedeem(state, prefs, raw));
+                } catch (err) { displayCradleError('gift', err, ['tooLarge']); }
+            },
+        });
+    }
+
+    function cradleGiftButton(item, kind) {
+        const inNest = Boolean(item.sharedNestUid);
+        const relic = Boolean(item.relicUid);
+        return el(doc, relic && !inNest ? 'a' : 'button', {
+            className: 'clodex-rp-btn-mini',
+            ...(relic && !inNest ? { href: relGiftUrl(item.relicUid), target: '_blank', rel: 'noopener noreferrer' } : { type: 'button' }),
+            onClick: relic && !inNest ? undefined : () => {
+                if (inNest) return displayCradleError('gift', new Error('shared'), ['shared']);
+                giftTarget = { id: item.id, kind, name: item.name };
+                giftLatest = '';
+                renderAll();
+                drawerPanel.querySelector?.('[data-rp-view="pet-gifts"]')?.scrollIntoView?.({ block: 'nearest' });
+            },
+        }, '🎁 ' + t(relic && !inNest ? 'relic.giftOnWeb' : 'gift.send'));
+    }
+
+    function nestItems(state) {
+        return [...state.companions, ...rpPrefs.pendingEggs];
+    }
+
+    function nestApplyView(raw, state, current, insert = false) {
+        const known = current || nestItems(state).find(item => item.sharedNestUid === raw.nestUid);
+        if (!known && !insert) return false;
+        const snapshot = nestSnapshot(raw, known);
+        if (!snapshot) return false;
+        const { kind, fields } = snapshot;
+        const isEgg = kind === 'egg';
+        const wasEgg = known && rpPrefs.pendingEggs.includes(known);
+        if (known && isEgg === wasEgg) {
+            const stageChanged = !isEgg && known.stage !== fields.stage;
+            Object.assign(known, fields, { needsStageArt: stageChanged || Boolean(known.needsStageArt) });
+            delete known.nestCreateKey;
+            if (!fields.relicUid) delete known.relicUid;
+            if (fields.eggSkin && !rpPrefs.unlockedEggSkins.includes(fields.eggSkin)) rpPrefs.unlockedEggSkins.push(fields.eggSkin);
+            return true;
+        }
+        const dest = isEgg ? rpPrefs.pendingEggs : state.companions;
+        if (dest.length >= (isEgg ? 24 : 6)) throw new Error('full');
+        const local = { ...fields, id: known?.id || raw.nestUid.slice(0, 40), needsStageArt: true, cradleCarry: true };
+        if (known && wasEgg) {
+            rpPrefs.pendingEggs = rpPrefs.pendingEggs.filter(egg => egg !== known);
+            if (fields.relicUid && !rpPrefs.hatchedRelicUids.includes(fields.relicUid)) rpPrefs.hatchedRelicUids.push(fields.relicUid);
+        } else if (known) {
+            state.companions = state.companions.filter(item => item !== known);
+            if (isEgg && known.relicUid) rpPrefs.hatchedRelicUids = rpPrefs.hatchedRelicUids.filter(uid => uid !== known.relicUid);
+        }
+        if (fields.eggSkin && !rpPrefs.unlockedEggSkins.includes(fields.eggSkin)) rpPrefs.unlockedEggSkins.push(fields.eggSkin);
+        dest.push(isEgg ? gaNormalizeEgg(local) : normalizeCompanion(local));
+        return true;
+    }
+
+    async function nestPersist(state) {
+        await Promise.all([saveRpEntitlements(rpPrefs), bridge.saveChatState(state)]);
+    }
+
+    function nestUserError(err) {
+        if (err?.code === 'nest_local_capacity') err = new Error('full');
+        displayCradleError('nest', err, ['full', 'queue_full', 'hatch_pending', 'nest_full', 'nest_forbidden', 'nest_state_changed',
+            'nest_not_found', 'nest_limit_reached', 'rate_limited', 'network_error', 'no_key']);
+    }
+
+    async function nestRun(kind, itemId = '') {
+        if (nestBusy || nestSyncing) return;
+        const scope = bridge.getChatScope?.();
+        const start = bridge.getChatState();
+        let item = itemId && nestItems(start).find(entry => entry.id === itemId);
+        if (itemId && !item) return;
+        const isEgg = item && rpPrefs.pendingEggs.includes(item);
+        const alias = nestSanitizeLabel(nestAliasDraft ?? rpPrefs.guardianAlias);
+        nestBusy = true;
+        renderAll();
+        try {
+            if (!bridge.getEffectiveKey()) throw new Error('no_key');
+            let view;
+            if (kind === 'create') {
+                if (!alias || !item || item.sharedNestUid) throw new Error('invalid_input');
+                if (!item.nestCreateKey) {
+                    const key = await nestOperationKey();
+                    if (scope !== bridge.getChatScope?.()) return;
+                    item = nestItems(bridge.getChatState()).find(entry => entry.id === itemId);
+                    if (!item || item.sharedNestUid) return;
+                    item.nestCreateKey = key;
+                    if (!isEgg) item.cradleCarry = true;
+                    if (isEgg) await saveRpEntitlements(rpPrefs);
+                    else await bridge.saveChatState(bridge.getChatState());
+                    // Hosts may replace their state with a normalized copy on save.
+                    if (scope !== bridge.getChatScope?.()) return;
+                    item = nestItems(bridge.getChatState()).find(entry => entry.id === itemId);
+                    if (!item?.nestCreateKey) return;
+                }
+                view = await nestApi.create(alias, nestPassport(item, isEgg ? 'egg' : 'companion'), item.nestCreateKey);
+            } else if (kind === 'join') {
+                if (!alias || !nestInviteDraft) throw new Error('invalid_input');
+                const eggRoom = rpPrefs.pendingEggs.length < 24;
+                const companionRoom = start.companions.length < 6;
+                if (!eggRoom && !companionRoom) throw new Error('full');
+                const acceptKind = eggRoom === companionRoom ? undefined : eggRoom ? 'egg' : 'companion';
+                view = await nestApi.join(alias, nestInviteDraft, acceptKind);
+            } else if (kind === 'rotate') {
+                view = await nestApi.rotate(item.sharedNestUid);
+            } else if (kind === 'leave') {
+                if (!await bridge.confirm?.(t('nest.leaveConfirm')) || scope !== bridge.getChatScope?.()) return;
+                await nestApi.leave(item.sharedNestUid).catch(err => { if (err.status !== 404) throw err; });
+                rpPrefs.pendingNestOps = rpPrefs.pendingNestOps.filter(op => op.uid !== item.sharedNestUid);
+                await saveRpEntitlements(rpPrefs);
+            }
+            // Never bind a late create/join response to another chat. A repeat in
+            // the original chat uses the saved create key or existing membership.
+            if (scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            const current = itemId && nestItems(state).find(entry => entry.id === itemId);
+            if (kind === 'leave') {
+                if (current) nestDetach(current);
+            } else {
+                if (itemId && !current) return;
+                nestApplyView(view, state, current, true);
+                if (kind === 'join') nestInviteDraft = '';
+                rpPrefs.guardianAlias = alias || rpPrefs.guardianAlias;
+            }
+            nestCreateTarget = null;
+            errorBanner = '';
+            await nestPersist(state);
+        } catch (err) {
+            if (scope !== bridge.getChatScope?.()) return;
+            if (kind === 'create' && err?.code === 'nest_state_changed') {
+                const state = bridge.getChatState();
+                const current = nestItems(state).find(entry => entry.id === itemId);
+                if (current) {
+                    delete current.nestCreateKey;
+                    await nestPersist(state).catch(() => {});
+                }
+            }
+            nestUserError(err);
+        } finally { nestBusy = false; renderAll(); }
+    }
+
+    async function nestFlush() {
+        if (!bridge.getEffectiveKey()) return;
+        while (rpPrefs.pendingNestOps.length) {
+            const op = rpPrefs.pendingNestOps[0];
+            let view;
+            let failure;
+            try { view = await nestApi.care(op); }
+            catch (err) {
+                if (![400, 403, 404, 409].includes(err.status)) break;
+                failure = err;
+            }
+            rpPrefs.pendingNestOps = rpPrefs.pendingNestOps.filter(item => item.uid !== op.uid || item.key !== op.key);
+            const state = bridge.getChatState();
+            if (view && !rpPrefs.pendingNestOps.some(item => item.uid === op.uid)) {
+                try { nestApplyView(view, state); }
+                catch (err) { failure = err; } // e.g. the result hatched, but the local roster filled up
+            }
+            if (failure?.status === 404) {
+                const item = nestItems(state).find(entry => entry.sharedNestUid === op.uid);
+                if (item) nestDetach(item);
+            }
+            await nestPersist(state);
+            if (failure && drawerOpen && activeTab === 'cradle') nestUserError(failure);
+        }
+    }
+
+    function nestRefresh({ manual = false, pull = true } = {}) {
+        if (!bridge.getEffectiveKey() || nestBusy) return Promise.resolve();
+        if (nestSyncing) return nestSyncing;
+        const now = Date.now();
+        if (pull && !manual && now - nestLastPull < 30000) pull = false;
+        if (pull) nestLastPull = now;
+        nestSyncing = (async () => {
+            await nestFlush();
+            if (!pull) return;
+            const scope = bridge.getChatScope?.();
+            const views = await nestApi.list();
+            if (!Array.isArray(views) || scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            let changed = false;
+            const wanted = new Set(nestItems(state).map(item => item.sharedNestUid).filter(Boolean));
+            for (const item of nestItems(state)) {
+                if (!item.sharedNestUid || rpPrefs.pendingNestOps.some(op => op.uid === item.sharedNestUid)) continue;
+                if (!views.some(view => view.nestUid === item.sharedNestUid)) { nestDetach(item); changed = true; }
+            }
+            for (const view of views) {
+                if (rpPrefs.pendingNestOps.some(op => op.uid === view.nestUid)) continue;
+                if (!wanted.has(view.nestUid)) continue;
+                try { changed = nestApplyView(view, state) || changed; }
+                catch (err) { if (manual) nestUserError(err); }
+            }
+            if (changed) await nestPersist(state);
+            if (manual) bridge.notify?.(t('nest.synced'));
+        })().catch(err => { if (manual) nestUserError(err); }).finally(() => {
+            nestSyncing = null;
+            if (drawerOpen && activeTab === 'cradle') renderAll();
+        });
+        return nestSyncing;
+    }
+
+    async function nestDoCare(itemId, care, { memoryHint = '', noticeName = '' } = {}) {
+        try {
+            const scope = bridge.getChatScope?.();
+            const key = await nestOperationKey();
+            if (scope !== bridge.getChatScope?.()) return;
+            const state = bridge.getChatState();
+            const item = nestItems(state).find(entry => entry.id === itemId);
+            if (!item?.sharedNestUid) return;
+            if (care.hatch && state.companions.length >= 6) throw new Error('full');
+            if (care.hatch && item.warmth < 100) throw new Error('nest_state_changed');
+            if (!nestQueueCare(rpPrefs, item, care, key)) return;
+            if (memoryHint && state?.world) state.world.pendingMemoryHint = memoryHint;
+            // Keep the egg visible while an irreversible hatch is queued.
+            // Only the server's accepted companion snapshot can replace it.
+            await nestPersist(state);
+            if (noticeName) bridge.notify?.(t('cradle.careNotice', { name: noticeName }));
+            renderAll();
+            void nestRefresh({ pull: false });
+        } catch (err) { nestUserError(err); }
+    }
+
+    function renderNestJoin() {
+        return vCrRenderJoin(doc, t, {
+            alias: nestAliasDraft ?? rpPrefs.guardianAlias, code: nestInviteDraft, busy: nestBusy, target: nestCreateTarget,
+        }, {
+            onAlias: alias => { nestAliasDraft = alias; },
+            onCode: code => { nestInviteDraft = code.trim().toUpperCase(); },
+            onJoin: () => nestRun('join'),
+            onCreate: () => nestRun('create', nestCreateTarget?.id),
+            onCancel: () => { nestCreateTarget = null; renderAll(); },
+            onRefresh: () => nestRefresh({ manual: true }),
+        });
+    }
+
+    function renderNestItem(item) {
+        return vCrRenderNest(doc, t, item, {
+            waiting: rpPrefs.pendingNestOps.some(op => op.uid === item.sharedNestUid),
+            busy: nestBusy,
+        }, {
+            onCreate: () => {
+                nestCreateTarget = { id: item.id, name: item.name };
+                renderAll();
+                drawerPanel.querySelector?.('[data-rp-view="nest-join"]')?.scrollIntoView?.({ block: 'nearest' });
+            },
+            onRotate: () => nestRun('rotate', item.id),
+            onLeave: () => nestRun('leave', item.id),
+            onRefresh: () => nestRefresh({ manual: true }),
+            onCopy: code => copyCradleCode(code).catch(err => displayCradleError('gift', err, ['clipboard'])),
+        });
+    }
+
+    async function claimGiftRelic(rawCode) {
+        if (relicClaiming) return;
+        relicClaiming = true;
+        try {
+            const code = rawCode.trim().toUpperCase();
+            if (relicClaimCode !== code) {
+                relicClaimKey = await nestOperationKey();
+                relicClaimCode = code;
+            }
+            const entry = await relClaimGift(api, code, relicClaimKey);
+            verifiedRelics.set(entry.claims.relicUid, entry);
+            const relics = [...rpPrefs.relics.filter(item => item.payload !== entry.payload), { payload: entry.payload, sig: entry.sig }];
+            const unlockedEggSkins = [...rpPrefs.unlockedEggSkins, entry.claims.eggSkin];
+            await saveRpEntitlements({ ...rpPrefs, relics, unlockedEggSkins });
+            relicClaimCode = '';
+            relicClaimDraft = '';
+            errorBanner = '';
+            bridge.notify?.(t('relic.giftClaimed'));
+        } catch (err) {
+            displayCradleError('relic', err, ['invalid_input', 'transfer_expired', 'transfer_not_found', 'cannot_claim_own_relic',
+                'rate_limited', 'network_error', 'unverified']);
+        } finally { relicClaiming = false; renderAll(); }
+    }
+
     function renderCradleTab(state) {
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
         const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-3 clodex-rp-subtabs', dataset: { rpView: 'cradle-subtabs' } },
@@ -11011,7 +11944,7 @@ function createRpStudioController(bridge) {
         );
         container.append(subNav);
         if (cradleSub === 'gacha') {
-            container.append(renderGachaSub(state));
+            container.append(renderNestJoin(), renderGachaSub(state), renderGiftPanel());
             return container;
         }
         if (cradleSub === 'relics') {
@@ -11019,6 +11952,7 @@ function createRpStudioController(bridge) {
             return container;
         }
         if (!Array.isArray(state.companions)) state.companions = [];
+        container.append(renderNestJoin(), renderGiftPanel());
 
         if (state.world.pendingMemoryHint) {
             container.append(el(doc, 'div', { className: 'clodex-rp-banner' },
@@ -11195,8 +12129,10 @@ function createRpStudioController(bridge) {
                                 type: 'button',
                                 className: 'clodex-rp-btn-mini',
                                 title: t('cradle.removeBtn'),
+                                disabled: Boolean(activeComp.sharedNestUid),
                                 onClick: async () => {
                                     state.companions = state.companions.filter(c => c.id !== activeComp.id);
+                                    if (activeComp.cradleCarry) state.cradleRemoved = [...state.cradleRemoved, activeComp.id].slice(-100);
                                     activeCompanionId = state.companions[0]?.id || '';
                                     await bridge.saveChatState(state);
                                     renderAll();
@@ -11226,7 +12162,7 @@ function createRpStudioController(bridge) {
                             : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
                                 ...traits.map(tr => el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, String(tr)))),
                     ),
-                    unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    !activeComp.sharedNestUid && unlockedCompSkins.length > 0 ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
                         el(doc, 'span', {}, t('gacha.equipSkinLabel')),
                         el(doc, 'select', {
                             className: 'clodex-rp-input',
@@ -11259,7 +12195,10 @@ function createRpStudioController(bridge) {
                         value: activeComp.name,
                         onChange: async e => {
                             const nextName = e.target.value.trim().slice(0, 60);
-                            if (nextName) activeComp.name = nextName;
+                            if (nextName) {
+                                activeComp.name = nextName;
+                                if (!activeComp.sharedNestUid) delete activeComp.cradleRemoteLabel;
+                            }
                             await bridge.saveChatState(state);
                             renderAll();
                         },
@@ -11311,6 +12250,8 @@ function createRpStudioController(bridge) {
                     );
                 }),
             ),
+            el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                cradleGiftButton(activeComp, 'companion'), renderNestItem(activeComp)),
             el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
                 el(doc, 'strong', {}, `💞 ${t('cradle.careTitle')}`),
                 el(doc, 'div', { className: 'clodex-rp-muted' }, t('cradle.careHint')),
@@ -11319,6 +12260,13 @@ function createRpStudioController(bridge) {
                         type: 'button',
                         className: 'clodex-rp-btn',
                         onClick: async () => {
+                            if (activeComp.sharedNestUid) {
+                                const preview = interactWithCompanion({ ...activeComp }, act, { rpDate: state.world.rpDate });
+                                return nestDoCare(activeComp.id, { action: act, ...preview.care }, {
+                                    memoryHint: preview?.memoryHint || '',
+                                    noticeName: activeComp.name,
+                                });
+                            }
                             const res = interactWithCompanion(activeComp, act, { rpDate: state.world.rpDate });
                             const updated = res?.companion ?? activeComp;
                             const idx = state.companions.findIndex(c => c.id === activeComp.id);
@@ -12531,7 +13479,9 @@ function createRpStudioController(bridge) {
                 renderAll();
             },
             onPaidRitual: () => runPaidGachaRitual(),
+            renderSocial: egg => [cradleGiftButton(egg, 'egg'), renderNestItem(egg)],
             onWarm: async eggId => {
+                if (rpPrefs.pendingEggs.some(egg => egg.id === eggId && egg.sharedNestUid)) return nestDoCare(eggId, { action: 'pet', warmthDelta: 20 });
                 const warmed = gaWarmEgg(rpPrefs, eggId, 20);
                 if (!warmed.ok) {
                     errorBanner = t(`gacha.error.${warmed.reason || 'egg_not_found'}`);
@@ -12544,6 +13494,9 @@ function createRpStudioController(bridge) {
             },
             onHatch: eggId => hatchPendingEgg(eggId, state),
             onEquipEggSkin: async (eggId, skinId) => {
+                const egg = rpPrefs.pendingEggs.find(egg => egg.id === eggId);
+                if (egg?.relicUid) return;
+                if (egg?.sharedNestUid) return nestDoCare(eggId, { action: 'skin', eggSkin: skinId });
                 const eq = gaEquipSkinOnEgg(rpPrefs, eggId, skinId);
                 if (!eq.ok) {
                     errorBanner = t(`gacha.error.${eq.reason || 'invalid_skin'}`);
@@ -12608,7 +13561,7 @@ function createRpStudioController(bridge) {
     }
 
     function renderRelicsSub() {
-        return vGaRenderRelics(doc, t, {
+        const view = vGaRenderRelics(doc, t, {
             catalog: relicCatalog,
             relics: rpPrefs.relics,
             verifiedRelics,
@@ -12637,6 +13590,11 @@ function createRpStudioController(bridge) {
                 renderAll();
             },
         });
+        view.prepend(vCrRenderRelicClaim(doc, t, { code: relicClaimDraft, busy: relicClaiming }, {
+            onInput: code => { relicClaimDraft = code; },
+            onClaim: () => claimGiftRelic(relicClaimDraft),
+        }));
+        return view;
     }
 
     function renderPacksSub() {
@@ -12775,6 +13733,7 @@ function createRpStudioController(bridge) {
                     className: `clodex-rp-tab-btn ${activeTab === id ? 'active' : ''}`,
                     onClick: () => {
                         activeTab = id;
+                        if (id === 'cradle') void nestRefresh();
                         if (id === 'scene') syncCachedCharName();
                         renderDrawer();
                     },
@@ -12798,9 +13757,10 @@ function createRpStudioController(bridge) {
     async function onAssistantMessageCommitted({ checkpointKey = '' } = {}) {
         const settings = bridge.getSettings();
         const state = bridge.getChatState();
+        if (checkpointKey && committedTurnKeys.has(String(checkpointKey))) return;
 
         // One-turn data is consumed only after a successfully committed reply (429 / Stop keep it).
-        let consumed = false;
+        let consumed = nestConsumeHints(state.companions);
         if (state.world.pendingMemoryHint) {
             state.world.pendingMemoryHint = '';
             consumed = true;
@@ -12819,6 +13779,7 @@ function createRpStudioController(bridge) {
         // mode. This also writes the checkpoint only after tracker extraction
         // and local consequences have both completed.
         await applyLocalTurnConsequences(checkpointKey);
+        if (bridge.getChatState().companions.some(item => item.sharedNestUid)) void nestRefresh();
         if (!tracked) {
             // Anti-Slop is local: keep the radar fresh even without a key / with auto-track disabled.
             await recomputeSlop().catch(() => {});
@@ -13019,6 +13980,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
 
 
 
+
 (async function bootstrapTavoHud() {
     const CHAT_VAR_KEY = 'clodex_rp_state';
     const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
@@ -13135,11 +14097,15 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
     };
     let lastTurnExtrasSig = '';
 
+    let tavoChatScope = '';
+
     async function reloadFromTavo() {
-        const [rawState, rawPrefs] = await Promise.all([
+        const [rawState, rawPrefs, chat] = await Promise.all([
             tavo.variable.get(CHAT_VAR_KEY).catch(() => null),
             tavo.variable.get(GLOBAL_PREFS_KEY, 'global').catch(() => null),
+            tavo.chat.current().catch(() => null),
         ]);
+        tavoChatScope = String(chat?.id ?? '');
         if (rawState && typeof rawState === 'object') {
             cachedState = normalizeChatState(rawState);
         } else {
@@ -13195,6 +14161,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
                 tavo.plugin.emit?.('clodex-turn-extras', { reason: 'prefs' });
             }
         },
+        getChatScope: () => tavoChatScope,
         getChatState: () => cachedState,
         async saveChatState(nextState) {
             cachedState = normalizeChatState(nextState);
@@ -13250,6 +14217,14 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
             if (blob.size > PACK_MAX_BYTES) throw new Error(`Pack is larger than ${PACK_MAX_BYTES} bytes.`);
             const base = String(pack?.name || 'clodex').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'clodex';
             await tavo.file.export(`${base}.clodex-pack`, await blobToBase64(blob), { encoding: 'base64' });
+        },
+        async exportPet(filename, json) {
+            const blob = new Blob([json], { type: 'application/json' });
+            if (blob.size > GIFT_MAX_BYTES) throw new Error('tooLarge');
+            await tavo.file.export(filename, await blobToBase64(blob), { encoding: 'base64' });
+        },
+        async importPet() {
+            return pickJsonFileText({ accept: '.clodex-pet,application/json', maxBytes: GIFT_MAX_BYTES });
         },
         async importPack() {
             const text = await pickJsonFileText();

@@ -164,7 +164,7 @@ export class ClodexApi {
                 const detail = await response.json().catch(() => ({}));
                 throw new ApiError(
                     redact(detail.error?.message ?? detail.message ?? `HTTP ${response.status}`, key),
-                    { status: response.status, code: 'http_error' },
+                    { status: response.status, code: /^\/v1\/rp\//.test(path) && typeof detail.code === 'string' && /^[a-z_]{1,50}$/.test(detail.code) ? detail.code : 'http_error' },
                 );
             }
             if (blob) return await readMediaBlob(response, blob);

@@ -86,7 +86,7 @@ export function relParseSignedPayload(payload) {
     if (typeof payload !== 'string' || payload.length > 16_384) throw new Error('Invalid certificate payload.');
     const fields = JSON.parse(payload);
     if (!fields || fields.v !== REL_CERT_VERSION || fields.iss !== 'clodex.xyz'
-        || typeof fields.relicUid !== 'string' || !/^rpr_[A-Za-z0-9]{1,44}$/.test(fields.relicUid)
+        || typeof fields.relicUid !== 'string' || !/^rpr_[A-Za-z0-9_-]{1,44}$/.test(fields.relicUid)
         || typeof fields.edition !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(fields.edition)
         || !Number.isSafeInteger(fields.serial) || fields.serial < 1
         || !Number.isSafeInteger(fields.maxSupply) || fields.maxSupply < fields.serial
@@ -201,7 +201,8 @@ export async function relSyncInventory(api, signal, { publicJwk = REL_PUBLIC_JWK
     if (!api?.rpRelicInventory) return { relics: [], unavailable: true };
     try {
         const payload = await api.rpRelicInventory(signal);
-        const source = Array.isArray(payload?.relics) ? payload.relics : Array.isArray(payload?.data) ? payload.data : [];
+        const source = Array.isArray(payload?.relics) ? payload.relics : payload?.data;
+        if (payload?.success !== true || !Array.isArray(source)) return { relics: [], unavailable: true };
         const relics = await Promise.all(source.map(async (raw) => {
             const item = raw && typeof raw === 'object' ? { ...raw } : {};
             const certPayload = item.certPayload ?? item.cert_payload ?? item.payload;
@@ -211,7 +212,7 @@ export async function relSyncInventory(api, signal, { publicJwk = REL_PUBLIC_JWK
             const verified = await relVerifyCert(item.payload, item.sig, { publicJwk });
             return { payload: item.payload, sig: item.sig, verified };
         }));
-        return { relics, unavailable: false };
+        return { relics, unavailable: relics.some(item => !item.verified) };
     } catch {
         return { relics: [], unavailable: true };
     }
@@ -231,3 +232,40 @@ export function relMintUrl(editionKey) {
     return `https://clodex.xyz/console/rp-relics?edition=${edition}`;
 }
 
+
+export function relGiftUrl(relicUid) {
+    return 'https://clodex.xyz/console/rp-relics?gift=' + encodeURIComponent(relicUid);
+}
+
+export async function relClaimGift(api, code, key, options = {}) {
+    code = String(code || '').trim().toUpperCase();
+    if (!/^RPR-GIFT-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$/.test(code)) throw new Error('invalid_input');
+    const result = await api.request('/v1/rp/relics/transfer/claim', {
+        method: 'POST', body: { code }, headers: { 'Idempotency-Key': key }, timeout: 12000,
+    });
+    if (result?.success !== true) throw new Error('invalid_input');
+    const payload = result.data?.certPayload;
+    const sig = result?.data?.certSignature;
+    if (!await relVerifyCert(payload, sig, options)) throw new Error('unverified');
+    return { payload, sig, claims: relParseSignedPayload(payload) };
+}
+
+export function relReconcileServerInventory(prefs, inventory, state) {
+    if (inventory.unavailable) return prefs;
+    const relics = inventory.relics.filter(item => item.verified).map(({ payload, sig }) => ({ payload, sig }));
+    const owned = new Set(relics.map(item => relParseSignedPayload(item.payload).relicUid));
+    const lost = uid => uid && !owned.has(uid);
+    // A hatched pet can stay as an ordinary companion, never as a second
+    // locally certified copy. Unhatched eggs must be removed from the Altar.
+    for (const companion of state?.companions || []) {
+        if (lost(companion.relicUid)) {
+            delete companion.relicUid;
+            companion.cradleCarry = true;
+        }
+    }
+    return {
+        ...prefs, relics,
+        pendingEggs: (prefs.pendingEggs || []).filter(egg => !lost(egg.relicUid)),
+        hatchedRelicUids: (prefs.hatchedRelicUids || []).filter(uid => !lost(uid)),
+    };
+}
