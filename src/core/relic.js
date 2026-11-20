@@ -1,9 +1,18 @@
 // R1: offline ES256 verification and read-only relic sync helpers.
 
 export const REL_CERT_VERSION = 1;
-// Replaced by the packager only from the operator-provided public key. Neither
-// a downloaded catalogue nor a card/prefs file can appoint its own verifier.
-export const REL_PUBLIC_JWK = /* rel:public-key */ null;
+// Pinned production clodex.xyz ES256 public key (overrideable only at build
+// time via CLODEX_RP_RELIC_PUBLIC_JWK). Neither a downloaded catalogue nor a
+// card/prefs file can appoint its own verifier at runtime.
+export const REL_PUBLIC_JWK = /* rel:public-key-start */ Object.freeze({
+    kty: 'EC',
+    crv: 'P-256',
+    x: 'FwXYKdj1VSwJc7yu3SKdT7vWSL4az7rRxMwYH-czxpI',
+    y: 'Gn0AqhLySNWQqxRyiA-zbLgHcJeE6yKhA-21wfwsYeQ',
+    alg: 'ES256',
+    use: 'sig',
+    ext: true,
+}) /* rel:public-key-end */;
 
 function relBase64UrlToBytes(value) {
     const raw = String(value ?? '');

@@ -51,9 +51,9 @@
 ## Установка в Tavo AI (`tavoai.dev` — iOS / Android / Web / Desktop)
 
 1. Скачайте готовый пакет **`.tpg`** из последнего релиза:
-   **[Скачать CLODEx-RP-Studio-1.4.0.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.0/CLODEx-RP-Studio-1.4.0.tpg)**
+   **[Скачать CLODEx-RP-Studio-1.4.1.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.1/CLODEx-RP-Studio-1.4.1.tpg)**
 2. В **Tavo AI** включите **Advanced Rendering** для чата.
-3. Откройте **More → Plugins → Import (`.tpg`)**, выберите скачанный файл `CLODEx-RP-Studio-1.4.0.tpg` и включите плагин.
+3. Откройте **More → Plugins → Import (`.tpg`)**, выберите скачанный файл `CLODEx-RP-Studio-1.4.1.tpg` и включите плагин.
 4. В настройках плагина (или прямо внутри чата по кнопке **🔑 «Ключ и Модели»**) вставьте ключ `sk-...` с `https://clodex.xyz` и нажмите **«Подключить и обновить каталог»**.
 
 ---
@@ -69,7 +69,7 @@
 3. Обновите страницу (F5). Сверху чата появится перетаскиваемая статус-полоска **CLODEx RP Studio**, а над полем ввода — свёрнутая панель **🎬 Режиссёр**.
 
 ### Вариант Б — Вручную из архива
-Скачайте **[CLODEx-RP-Studio-SillyTavern-1.4.0.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.0/CLODEx-RP-Studio-SillyTavern-1.4.0.zip)** и распакуйте папку `CLODEx-RP-Studio` в `<SillyTavern>/data/<профиль>/extensions/CLODEx-RP-Studio`, затем обновите страницу.
+Скачайте **[CLODEx-RP-Studio-SillyTavern-1.4.1.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.4.1/CLODEx-RP-Studio-SillyTavern-1.4.1.zip)** и распакуйте папку `CLODEx-RP-Studio` в `<SillyTavern>/data/<профиль>/extensions/CLODEx-RP-Studio`, затем обновите страницу.
 
 ### Слэш-команды SillyTavern
 - `/clodex-rp` — открыть Трекер; `/clodex-cradle` — Колыбель; `/clodex-codex` — Кодекс; `/clodex-scene` — Сцена и голос; `/clodex-forge` — Кузница и Паки; `/clodex-speak` — озвучить последний ответ.

@@ -9,6 +9,7 @@ import {
     extractRelicFromCharacterCard,
 } from '../src/core/pngCard.js';
 import {
+    REL_PUBLIC_JWK,
     relAttachToCard,
     relBytesToBase64Url,
     relCanonicalPayload,
@@ -142,5 +143,21 @@ test('relic extension survives PNG CCv2 card round-trip', () => {
     const embedded = embedCharacterCardInPng(Buffer.from(TINY_PNG_B64, 'base64'), card);
     const extracted = extractCharacterCardFromPng(embedded);
     assert.deepEqual(extractRelicFromCharacterCard(extracted), { payload, sig: 'signature' });
+});
+
+test('pinned production clodex.xyz REL_PUBLIC_JWK is frozen and WebCrypto-importable', async () => {
+    assert.ok(REL_PUBLIC_JWK && Object.isFrozen(REL_PUBLIC_JWK));
+    const normalized = relNormalizePublicJwk(REL_PUBLIC_JWK);
+    assert.ok(normalized);
+    assert.equal(normalized.alg, 'ES256');
+    assert.equal(normalized.crv, 'P-256');
+    const imported = await webcrypto.subtle.importKey(
+        'jwk',
+        normalized,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify'],
+    );
+    assert.equal(imported.type, 'public');
 });
 

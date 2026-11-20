@@ -11,22 +11,27 @@ import vm from 'node:vm';
 import { webcrypto } from 'node:crypto';
 import { deflateSync } from 'node:zlib';
 import { EN_CATALOG, RU_CATALOG } from '../src/core/localesData.js';
-import { relNormalizePublicJwk } from '../src/core/relic.js';
+import { REL_PUBLIC_JWK, relNormalizePublicJwk } from '../src/core/relic.js';
 import { findBundleCollisions, resolveBundleFiles, TAVO_BUNDLES } from './bundles.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 const relicKeySetting = process.env.CLODEX_RP_RELIC_PUBLIC_JWK;
-const relicPublicKey = relicKeySetting ? relNormalizePublicJwk(JSON.parse(relicKeySetting)) : null;
-if (relicKeySetting) {
-    if (!relicPublicKey) throw new Error('CLODEX_RP_RELIC_PUBLIC_JWK must be an ES256 public JWK.');
-    await webcrypto.subtle.importKey('jwk', relicPublicKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+const relicPublicKey = relicKeySetting
+    ? relNormalizePublicJwk(JSON.parse(relicKeySetting))
+    : relNormalizePublicJwk(REL_PUBLIC_JWK);
+if (!relicPublicKey) {
+    throw new Error('Effective RP Relic public JWK must be a valid ES256 P-256 public JWK.');
 }
+await webcrypto.subtle.importKey('jwk', relicPublicKey, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
 
 function packageRpSource(relativePath, source) {
     if (relativePath !== 'src/core/relic.js') return source;
-    const marker = '/* rel:public-key */ null';
-    if (!source.includes(marker)) throw new Error('Missing RP Relic public-key marker.');
-    return source.replace(marker, relicPublicKey ? `Object.freeze(${JSON.stringify(relicPublicKey)})` : 'null');
+    const markerRe = /\/\* rel:public-key-start \*\/[\s\S]*?\/\* rel:public-key-end \*\//;
+    if (!markerRe.test(source)) throw new Error('Missing RP Relic public-key marker.');
+    return source.replace(
+        markerRe,
+        `/* rel:public-key-start */ Object.freeze(${JSON.stringify(relicPublicKey)}) /* rel:public-key-end */`,
+    );
 }
 
 function crc32(buffer) {

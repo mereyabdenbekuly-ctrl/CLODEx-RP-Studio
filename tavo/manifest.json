@@ -2,12 +2,12 @@
   "specVersion": 2,
   "id": "xyz.clodex.rp-studio",
   "name": { "$t": "plugin.name" },
-  "version": "1.4.0",
+  "version": "1.4.1",
   "minAppVersion": "0.93.0",
   "entry": "entry.js",
   "author": "CLODEx",
   "description": { "$t": "plugin.description" },
-  "releaseNotes": { "$t": "releaseNotes.1_4_0" },
+  "releaseNotes": { "$t": "releaseNotes.1_4_1" },
   "localization": {
     "defaultLocale": "en",
     "resources": {

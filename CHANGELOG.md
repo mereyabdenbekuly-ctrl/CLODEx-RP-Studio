@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1 — 2026-11-20
+
+- **Genesis I Verified Relics Live (`https://clodex.xyz/console/rp-relics`)**:
+  - Baked the live `clodex.xyz` `ES256` (`P-256`) public verification key (`REL_PUBLIC_JWK`) directly into `CLODEx RP Studio` across **Tavo AI (`.tpg`)**, **SillyTavern (`.zip`)**, and **SillyTavern Git extension installs**.
+  - Limited-edition **Genesis I** relics (`ash_seraph_2026` `#0001..#0050`, `astral_archon_2026` `#0001..#0050`, `abyssal_raven_2026` `#0001..#0100`, `crimson_wyrm_2026` `#0001..#0100`) minted on `https://clodex.xyz/console/rp-relics` now sync read-only via `GET /v1/rp/relics/inventory` and verify cryptographically offline inside exported `PNG CCv2` character cards (`💎 Verified CLODEx Relic #NNNN`).
+
 ## 1.4.0 — 2026-11-20
 
 - **Underworld, Wanted & Relics («Подполье, Розыск и Реликвии»)** — full offline-first economy, shadow reputation, summoning altar, and cryptographically signed relic companions with strict FinOps and prompt-budget discipline:
