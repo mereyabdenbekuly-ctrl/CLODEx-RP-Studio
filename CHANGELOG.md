@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.2 — 2026-11-20
+
+- **Two-Way Narrative Companion Care (Zero Extra API Calls)**:
+  - **Automatic Care Extraction from Story Text**: feeding, giving treats, sleeping/resting, or petting/playing/protecting a companion directly in the roleplay message now updates **`fullness`**, **`energy`**, **`bond`**, **`mood`**, and `lastActionAt` automatically via `companionCare` in the existing background tracker pass (supporting both single companions and named targets in multi-companion parties, while preserving the Zero-Punishment `20` floor and swipe/deletion rollback).
+  - **Richer Companion Continuity Cues**: `buildSystemContext` now includes `energy` plus compact `hungry` / `sleepy` / `deeply bonded` cues within the 35-word budget so the AI naturally roleplays a hungry or sleepy pet back in the scene.
+
 ## 1.4.1 — 2026-11-20
 
 - **Genesis I Verified Relics Live (`https://clodex.xyz/console/rp-relics`)**:

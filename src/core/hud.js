@@ -3153,6 +3153,7 @@ export function createRpStudioController(bridge) {
             ),
             el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
                 el(doc, 'strong', {}, `💞 ${t('cradle.careTitle')}`),
+                el(doc, 'div', { className: 'clodex-rp-muted' }, t('cradle.careHint')),
                 el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
                     ...careActions.map(([act, icon]) => el(doc, 'button', {
                         type: 'button',

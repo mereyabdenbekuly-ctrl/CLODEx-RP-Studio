@@ -177,10 +177,15 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
     if (Array.isArray(state.companions) && state.companions.length > 0) {
         const compact = state.companions.length <= 2;
         const compItems = state.companions.slice(0, 4).map(c => {
-            const moodNum = Math.round(Number(c.mood) || 0);
-            const fullNum = Math.round(Number(c.fullness) || 0);
+            const moodNum = Number.isFinite(Number(c.mood)) ? Math.round(Number(c.mood)) : 85;
+            const fullNum = Number.isFinite(Number(c.fullness)) ? Math.round(Number(c.fullness)) : 85;
+            const energyNum = Number.isFinite(Number(c.energy)) ? Math.round(Number(c.energy)) : 90;
+            const bondNum = Number.isFinite(Number(c.bond)) ? Math.round(Number(c.bond)) : 35;
             const moodWord = compact ? (moodNum >= 75 ? 'cheerful ' : moodNum >= 45 ? 'calm ' : 'restless ') : '';
-            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullNum}%)`;
+            const fullWord = compact && fullNum <= 35 ? 'hungry ' : '';
+            const energyWord = compact && energyNum <= 35 ? 'sleepy ' : '';
+            const bondTag = compact && bondNum >= 75 ? ', deeply bonded' : '';
+            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullWord}${fullNum}%, energy ${energyWord}${energyNum}%${bondTag})`;
         });
         const moreSuffix = state.companions.length > 4 ? ` (+${state.companions.length - 4} more)` : '';
         lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
@@ -209,8 +214,14 @@ export function buildTrackerExtractionMessages(state, recentMessages, {
     const meterSchemaHint = Array.isArray(state.customMeters) && state.customMeters.length > 0
         ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
         : '';
-    const companionSchemaHint = Array.isArray(state.companions) && state.companions.length > 0
-        ? `  "companionMoodDelta": 0, // integer -15..15 reflecting how this exchange affected companion(s): ${state.companions.slice(0, 4).map(c => c.name).join(', ')}`
+    const companionNames = Array.isArray(state.companions) && state.companions.length > 0
+        ? state.companions.slice(0, 6).map(c => c.name).filter(Boolean).join(', ')
+        : '';
+    const companionSchemaHint = companionNames
+        ? [
+            `  "companionMoodDelta": 0, // integer -15..15 reflecting how this exchange affected companion(s): ${companionNames}`,
+            '  "companionCare": { "target": "", "fullnessDelta": 0, "energyDelta": 0, "bondDelta": 0 }, // ONLY when this turn explicitly depicts feeding/treats (+10..35 fullness), sleeping/napping/resting (+15..40 energy, or -5..-12 on heavy exertion/play), or petting/playing/praising/protecting (+1..8 bond); target is companion name if specific or "" for all',
+        ].join('\n')
         : '';
 
     const systemPrompt = [

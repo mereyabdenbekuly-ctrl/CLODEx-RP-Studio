@@ -266,12 +266,13 @@ test('Simulation integration: advanceSimulationDays, applyTurnExtraction mood de
     const sysCtx = buildSystemContext(state, { userName: 'Dante', charName: 'Vergil' });
     const compLine = sysCtx.split('\n').find(l => l.includes('Active Companions:'));
     assert.ok(compLine, 'Expected Active Companions line in system context');
-    assert.match(compLine, /Lumen \(infant, mood cheerful 95%, fullness 85%\)/);
+    assert.match(compLine, /Lumen \(infant, mood cheerful 95%, fullness 85%, energy 90%\)/);
     assert.ok(countWords(compLine) <= 35, `Companion context line too verbose: ${compLine}`);
 
-    // Extraction schema includes companionMoodDelta when companions are active
+    // Extraction schema includes companionMoodDelta and companionCare when companions are active
     const extMsgs = buildTrackerExtractionMessages(state, [{ role: 'assistant', content: 'The light flickers.' }]);
     assert.match(extMsgs[0].content, /"companionMoodDelta": 0/);
+    assert.match(extMsgs[0].content, /"companionCare": \{ "target": "", "fullnessDelta": 0, "energyDelta": 0, "bondDelta": 0 \}/);
 
     // Turn 2: 8-day timeskip + combat bleeding trauma -> grows to child, needsStageArt, reacts to battle stress
     applyTurnExtraction(state, {
@@ -296,6 +297,74 @@ test('Simulation integration: advanceSimulationDays, applyTurnExtraction mood de
     // Direct advanceSimulationDays also advances companions
     advanceSimulationDays(state, 22);
     assert.equal(state.companions[0].stage, 'teen');
+});
+
+test('Two-way narrative companion care: feeding, sleeping, multi-pet targeting, Zero-Punishment floor, and context cues', () => {
+    const state = createChatState('2026-11-20');
+    const fox = createCompanionFromArchetype('familiar_fox', { customName: 'Кицу', locale: 'ru' });
+    fox.fullness = 30;
+    fox.energy = 28;
+    fox.mood = 60;
+    fox.bond = 72;
+    state.companions.push(fox);
+
+    // Hungry + sleepy cues appear automatically in buildSystemContext when <= 35%
+    const hungryCtx = buildSystemContext(state, { userName: 'Лидия', charName: 'Маттео' });
+    assert.match(hungryCtx, /Кицу \(infant, mood calm 60%, fullness hungry 30%, energy sleepy 28%\)/);
+
+    // Schema in buildTrackerExtractionMessages remains valid JSON with active companions
+    const promptText = buildTrackerExtractionMessages(state, [
+        { role: 'user', content: 'Даю лисёнку миску тёплого молока и укладываю спать на пледе.' },
+    ])[0].content;
+    const schemaStart = promptText.indexOf('JSON schema:\n') + 'JSON schema:\n'.length;
+    const schemaEnd = promptText.lastIndexOf('\n}\n') + 2;
+    const parsedSchema = JSON.parse(
+        promptText.slice(schemaStart, schemaEnd)
+            .replace(/\/\*[\s\S]*?\*\//g, '')
+            .replace(/\/\/.*$/gm, '')
+            .replace(/"[^"]*"\s*(?:\|\s*"[^"]*"\s*)+/g, '"morning"'),
+    );
+    assert.deepEqual(parsedSchema.companionCare, {
+        target: '',
+        fullnessDelta: 0,
+        energyDelta: 0,
+        bondDelta: 0,
+    });
+
+    // Solo pet matches even if user/model writes generic target ("лисёнок"); updates fullness, energy, bond, mood (+4), lastActionAt
+    applyTurnExtraction(state, {
+        companionCare: { target: 'лисёнок', fullnessDelta: 25, energyDelta: 32, bondDelta: 5 },
+    }, { checkpointKey: 'care-1' });
+    assert.equal(state.companions[0].fullness, 55);
+    assert.equal(state.companions[0].energy, 60);
+    assert.equal(state.companions[0].bond, 77);
+    assert.equal(state.companions[0].mood, 64);
+    assert.equal(state.companions[0].lastActionAt, '2026-11-20');
+
+    // Deeply bonded cue (>= 75%) appears and hungry/sleepy disappear once fed & rested
+    const caredCtx = buildSystemContext(state, { userName: 'Лидия', charName: 'Маттео' });
+    assert.match(caredCtx, /Кицу \(infant, mood calm 64%, fullness 55%, energy 60%, deeply bonded\)/);
+
+    // Multi-companion targeted care updates only the named pet + Zero-Punishment floor 20 holds on exertion
+    const raven = createCompanionFromArchetype('shadow_raven', { customName: 'Nocturne', locale: 'en' });
+    raven.fullness = 40;
+    raven.energy = 24;
+    state.companions.push(raven);
+
+    applyTurnExtraction(state, {
+        companionCare: [
+            { target: 'Nocturne', fullnessDelta: 20, energyDelta: -15, bondDelta: -5 },
+        ],
+    }, { checkpointKey: 'care-2' });
+    assert.equal(state.companions[0].fullness, 55, 'Кицу untouched when Nocturne was targeted');
+    assert.equal(state.companions[1].fullness, 60);
+    assert.equal(state.companions[1].energy, 20, 'Zero-Punishment floor 20 prevents energy dropping below 20');
+    assert.equal(state.companions[1].bond, 35, 'bond never drops on negative bondDelta');
+
+    // Swipe rollback restores previous stats cleanly
+    assert.equal(restoreCheckpointBefore(state, 'care-2'), true);
+    assert.equal(state.companions.length, 1);
+    assert.equal(state.companions[0].fullness, 55);
 });
 
 test('Classic-IIFE bundler compatibility: core modules concatenate into strict VM script with zero identifier collisions', async () => {

@@ -1237,21 +1237,77 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
         physRepApplyWorldDelta(state.underworld, delta.worldDelta);
     }
 
-    // Companion mood reaction to explicit delta or scene combat / stress atmosphere
+    // Companion narrative care (feeding, sleeping/resting, petting/playing) + mood reaction
     if (Array.isArray(state.companions) && state.companions.length > 0) {
+        const applyZeroPunishDelta = (curRaw, shift, fallback = 85, floor = 20) => {
+            const cur = Number.isFinite(Number(curRaw)) ? Number(curRaw) : fallback;
+            if (!shift) return Math.round(clamp(cur, 0, 100));
+            if (shift > 0) return Math.min(100, Math.round(cur + shift));
+            return cur <= floor ? Math.round(cur) : Math.max(floor, Math.round(cur + shift));
+        };
+        const selectCareTargets = rawTarget => {
+            const q = String(rawTarget ?? '').trim().toLowerCase();
+            if (state.companions.length === 1) return state.companions;
+            if (!q || ['all', 'both', '*', 'все', 'оба', 'every'].includes(q)) return state.companions;
+            const exact = state.companions.filter(c => String(c.name || '').trim().toLowerCase() === q);
+            if (exact.length > 0) return exact;
+            const partial = state.companions.filter(c => {
+                const name = String(c.name || '').trim().toLowerCase();
+                const arch = String(c.archetype || '').toLowerCase();
+                const species = String(c.speciesKey || '').toLowerCase();
+                return (name && (name.includes(q) || q.includes(name))) || arch === q || species === q;
+            });
+            return partial;
+        };
+
+        const rawCareList = Array.isArray(delta.companionCare)
+            ? delta.companionCare.filter(item => item && typeof item === 'object').slice(0, 6)
+            : (delta.companionCare && typeof delta.companionCare === 'object' ? [delta.companionCare] : []);
+
+        let hadCareMoodBoost = false;
         const hasExplicitMood = delta.companionMoodDelta !== undefined
             && delta.companionMoodDelta !== null
             && delta.companionMoodDelta !== ''
             && Number.isFinite(Number(delta.companionMoodDelta));
+        const explicitMoodShift = hasExplicitMood ? Math.round(clamp(Number(delta.companionMoodDelta), -15, 15)) : 0;
 
-        if (hasExplicitMood) {
-            const moodShift = Math.round(clamp(Number(delta.companionMoodDelta), -15, 15));
-            if (moodShift !== 0) {
-                for (const comp of state.companions) {
-                    comp.mood = Math.round(clamp((Number(comp.mood) || 0) + moodShift, 0, 100));
+        for (const care of rawCareList) {
+            const fullShift = Number.isFinite(Number(care.fullnessDelta))
+                ? Math.round(clamp(Number(care.fullnessDelta), -12, 35)) : 0;
+            const energyShift = Number.isFinite(Number(care.energyDelta))
+                ? Math.round(clamp(Number(care.energyDelta), -15, 40)) : 0;
+            const bondShift = Number.isFinite(Number(care.bondDelta))
+                ? Math.round(clamp(Number(care.bondDelta), 0, 8)) : 0;
+            const localMoodShift = Number.isFinite(Number(care.moodDelta))
+                ? Math.round(clamp(Number(care.moodDelta), -15, 15)) : 0;
+            if (!fullShift && !energyShift && !bondShift && !localMoodShift) continue;
+
+            const targets = selectCareTargets(care.target ?? care.name ?? '');
+            for (const comp of targets) {
+                if (fullShift) comp.fullness = applyZeroPunishDelta(comp.fullness, fullShift, 85, 20);
+                if (energyShift) comp.energy = applyZeroPunishDelta(comp.energy, energyShift, 90, 20);
+                if (bondShift > 0) {
+                    const curBond = Number.isFinite(Number(comp.bond)) ? Number(comp.bond) : 35;
+                    comp.bond = Math.min(100, Math.round(curBond + bondShift));
+                }
+                if (localMoodShift) {
+                    comp.mood = applyZeroPunishDelta(comp.mood, localMoodShift, 85, 20);
+                    hadCareMoodBoost = true;
+                } else if (explicitMoodShift === 0 && (fullShift >= 8 || bondShift >= 2 || energyShift >= 15)) {
+                    comp.mood = applyZeroPunishDelta(comp.mood, 4, 85, 20);
+                    hadCareMoodBoost = true;
+                }
+                if (fullShift > 0 || energyShift > 0 || bondShift > 0) {
+                    comp.lastActionAt = String(state.world.rpDate || comp.lastActionAt || '').slice(0, 40);
                 }
             }
-        } else {
+        }
+
+        if (hasExplicitMood && explicitMoodShift !== 0) {
+            for (const comp of state.companions) {
+                comp.mood = applyZeroPunishDelta(comp.mood, explicitMoodShift, 85, 20);
+            }
+        } else if (!hasExplicitMood && !hadCareMoodBoost) {
             const freshTrauma = ['user', 'char'].some(r => {
                 const ed = delta.entities?.[r];
                 return ed && (Boolean(ed.newWound) || Number(ed.bloodLossDelta) > 0);
@@ -1268,10 +1324,7 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
             const ambientShift = freshTrauma ? -10 : highStress ? -6 : soothingTurn ? 5 : 0;
             if (ambientShift !== 0) {
                 for (const comp of state.companions) {
-                    const curMood = Number.isFinite(Number(comp.mood)) ? Number(comp.mood) : 85;
-                    comp.mood = ambientShift < 0
-                        ? Math.max(20, Math.round(curMood + ambientShift))
-                        : Math.min(100, Math.round(curMood + ambientShift));
+                    comp.mood = applyZeroPunishDelta(comp.mood, ambientShift, 85, 20);
                 }
             }
         }
