@@ -1,3 +1,5 @@
+import { RLS_CLIENT_VERSION, rlsNormalizeHost } from './release.js';
+
 export const ORIGIN = 'https://clodex.xyz';
 export const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
@@ -121,11 +123,15 @@ export function base64ToBlob(base64, mimeType = 'image/png') {
 export class ClodexApi {
     constructor({
         getKey,
+        host = 'other',
+        clientVersion = RLS_CLIENT_VERSION,
         fetchImpl = globalThis.fetch?.bind(globalThis),
         sleep = abortableDelay,
         now = Date.now,
     } = {}) {
         this.getKey = getKey;
+        this.host = rlsNormalizeHost(host);
+        this.clientVersion = String(clientVersion || RLS_CLIENT_VERSION);
         this.fetch = fetchImpl;
         this.sleep = sleep;
         this.now = now;
@@ -139,6 +145,8 @@ export class ClodexApi {
         const key = auth ? validateKey(this.getKey?.()) : '';
         const headers = new Headers();
         if (key) headers.set('Authorization', `Bearer ${key}`);
+        if (this.clientVersion) headers.set('X-Clodex-Client', `rp-studio/${this.clientVersion}`);
+        if (this.host && this.host !== 'other') headers.set('X-Clodex-Host', this.host);
         if (body !== undefined) headers.set('Content-Type', 'application/json');
         for (const [name, value] of Object.entries(extraHeaders || {})) {
             if (value !== undefined && value !== null) headers.set(name, String(value));
@@ -219,6 +227,19 @@ export class ClodexApi {
 
     status(signal) {
         return this.request('/api/status', { signal, auth: false, timeout: 15_000 });
+    }
+
+    studioRelease(signal) {
+        return this.request('/v1/rp/studio/release', { signal, auth: false, timeout: 12_000 });
+    }
+
+    sendFeedback({ category = 'idea', message = '', contact = '' } = {}, signal) {
+        return this.request('/v1/rp/studio/feedback', {
+            method: 'POST',
+            body: { category, message, contact, host: this.host, clientVersion: this.clientVersion },
+            signal,
+            timeout: 15_000,
+        });
     }
 
     voices(model, { search = '', page = 1, signal } = {}) {

@@ -627,6 +627,21 @@ export async function initializeSillyTavern({
         async exportForgedCharacter({ pngBytes, fileName }) {
             downloadBlob(new Blob([pngBytes], { type: 'image/png' }), fileName || 'clodex-card.png');
         },
+        host: 'sillytavern',
+        async selfUpdateExtension() {
+            const ctx = getContext();
+            const baseHeaders = ctx.getRequestHeaders?.() ?? { 'Content-Type': 'application/json' };
+            for (const globalFlag of [false, true]) {
+                const res = await fetchImpl('/api/extensions/update', {
+                    method: 'POST',
+                    headers: { ...baseHeaders, 'Content-Type': 'application/json' },
+                    credentials: 'same-origin',
+                    body: JSON.stringify({ extensionName: 'CLODEx-RP-Studio', global: globalFlag }),
+                }).catch(() => null);
+                if (res?.ok) return true;
+            }
+            return false;
+        },
         loadHudPosition: () => settings.hudPos,
         saveHudPosition(pos) {
             settings.hudPos = pos;

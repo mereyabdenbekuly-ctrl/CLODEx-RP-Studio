@@ -5,6 +5,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { RLS_CLIENT_VERSION } from '../src/core/release.js';
 import { findBundleCollisions, resolveBundleFiles, TAVO_BUNDLES } from './bundles.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
@@ -67,6 +68,7 @@ for (const file of jsFiles) {
 const pkg = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
 const stManifest = JSON.parse(await readFile(resolve(root, 'manifest.json'), 'utf8'));
 assert.equal(stManifest.version, pkg.version, 'ST manifest version must match package.json');
+assert.equal(RLS_CLIENT_VERSION, pkg.version, 'RLS_CLIENT_VERSION must match package.json');
 for (const rel of [stManifest.js, stManifest.css, 'settings.html', ...Object.values(stManifest.i18n)]) {
     await readFile(resolve(root, rel));
 }

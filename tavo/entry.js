@@ -1274,6 +1274,12 @@ function gaNormalizePrefs(raw) {
         ).slice(-5).map(({ giftId, kind, name, code, sentAt }) => ({ giftId, kind, name: String(name || '').slice(0, 80), code, sentAt })),
         redeemedGiftIds: [...new Set((Array.isArray(source.redeemedGiftIds) ? source.redeemedGiftIds : [])
             .filter(id => typeof id === 'string' && /^gft_[a-f0-9]{16}$/.test(id)))].slice(-100),
+        dismissedReleaseVersion: typeof source.dismissedReleaseVersion === 'string'
+            && /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[a-z0-9.]{1,16})?$/.test(source.dismissedReleaseVersion)
+            ? source.dismissedReleaseVersion : '',
+        dismissedAnnouncementId: typeof source.dismissedAnnouncementId === 'string'
+            && /^[a-zA-Z0-9_-]{1,48}$/.test(source.dismissedAnnouncementId)
+            ? source.dismissedAnnouncementId : '',
         pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
     };
 }

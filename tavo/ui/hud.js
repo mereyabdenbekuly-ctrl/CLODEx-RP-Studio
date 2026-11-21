@@ -2,6 +2,108 @@
 (function () {
 'use strict';
 
+// --- src/core/release.js ---
+const RLS_CLIENT_VERSION = '1.5.1';
+
+const RLS_SEMVER_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?:-([a-z0-9.]{1,16}))?$/;
+const RLS_ANNOUNCE_ID_RE = /^[a-zA-Z0-9_-]{1,48}$/;
+const RLS_SECRET_RE = /\bsk-[a-z0-9_-]{6,}/gi;
+function rlsNormalizeHost(raw) {
+    const val = String(raw ?? '').trim().toLowerCase();
+    if (val === 'tavo') return 'tavo';
+    if (val === 'sillytavern' || val === 'st') return 'sillytavern';
+    return 'other';
+}
+function rlsParseSemver(raw) {
+    const m = String(raw ?? '').trim().match(RLS_SEMVER_RE);
+    if (!m) return null;
+    return {
+        raw: m[0],
+        major: Number(m[1]),
+        minor: Number(m[2]),
+        patch: Number(m[3]),
+        pre: m[4] || '',
+    };
+}
+function rlsIsNewerVersion(remoteVer, localVer = RLS_CLIENT_VERSION) {
+    const rem = rlsParseSemver(remoteVer);
+    const loc = rlsParseSemver(localVer);
+    if (!rem || !loc) return false;
+    if (rem.major !== loc.major) return rem.major > loc.major;
+    if (rem.minor !== loc.minor) return rem.minor > loc.minor;
+    if (rem.patch !== loc.patch) return rem.patch > loc.patch;
+    if (loc.pre && !rem.pre) return true;
+    return false;
+}
+function rlsSafeUrl(raw) {
+    const trimmed = String(raw ?? '').trim();
+    if (!trimmed || trimmed.length > 512) return '';
+    try {
+        const u = new URL(trimmed);
+        if (u.protocol !== 'https:' || u.username || u.password || u.hash) return '';
+        const host = u.hostname.toLowerCase();
+        if (host === 'clodex.xyz') return u.href;
+        if (host === 'github.com' && u.pathname.startsWith('/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/')) return u.href;
+        return '';
+    } catch {
+        return '';
+    }
+}
+
+function rlsCleanLine(raw, maxLen = 140) {
+    return String(raw ?? '')
+        .replace(RLS_SECRET_RE, '[redacted]')
+        .replace(/[\u0000-\u001f\u007f<>]/g, '')
+        .trim()
+        .slice(0, maxLen);
+}
+function rlsNormalizeBulletin(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const ver = rlsParseSemver(raw.latestVersion);
+    if (!ver) return null;
+    const tpgUrl = rlsSafeUrl(raw.tpgUrl);
+    const releaseUrl = rlsSafeUrl(raw.releaseUrl);
+    if (!tpgUrl || !releaseUrl) return null;
+    const zipUrl = rlsSafeUrl(raw.zipUrl);
+    const titleRu = rlsCleanLine(raw.titleRu, 120);
+    const titleEn = rlsCleanLine(raw.titleEn, 120);
+    if (!titleRu || !titleEn) return null;
+    const cleanArr = arr => (Array.isArray(arr) ? arr.map(x => rlsCleanLine(x, 140)).filter(Boolean).slice(0, 4) : []);
+    const announcementId = RLS_ANNOUNCE_ID_RE.test(String(raw.announcementId ?? '').trim())
+        ? String(raw.announcementId).trim()
+        : '';
+    const promo = String(raw.promoGiftCode ?? '').trim();
+    const promoGiftCode = /^CLXPET1:[A-Za-z0-9_-]{1,5462}$/.test(promo) ? promo : '';
+    return {
+        latestVersion: ver.raw,
+        titleRu,
+        titleEn,
+        highlightsRu: cleanArr(raw.highlightsRu),
+        highlightsEn: cleanArr(raw.highlightsEn),
+        tpgUrl,
+        zipUrl,
+        releaseUrl,
+        announcementId,
+        announcementRu: rlsCleanLine(raw.announcementRu, 280),
+        announcementEn: rlsCleanLine(raw.announcementEn, 280),
+        promoGiftCode,
+    };
+}
+function rlsSanitizeFeedback({ category = 'idea', message = '', contact = '' } = {}) {
+    const cat = ['idea', 'bug', 'praise'].includes(category) ? category : 'idea';
+    const msg = String(message ?? '')
+        .replace(RLS_SECRET_RE, '[redacted]')
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f<>]/g, '')
+        .trim()
+        .slice(0, 1000);
+    if ([...msg].length < 3) throw new Error('tooShort');
+    return {
+        category: cat,
+        message: msg,
+        contact: rlsCleanLine(contact, 80),
+    };
+}
+
 // --- src/core/api.js ---
 const ORIGIN = 'https://clodex.xyz';
 const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
@@ -114,11 +216,15 @@ function base64ToBlob(base64, mimeType = 'image/png') {
 class ClodexApi {
     constructor({
         getKey,
+        host = 'other',
+        clientVersion = RLS_CLIENT_VERSION,
         fetchImpl = globalThis.fetch?.bind(globalThis),
         sleep = abortableDelay,
         now = Date.now,
     } = {}) {
         this.getKey = getKey;
+        this.host = rlsNormalizeHost(host);
+        this.clientVersion = String(clientVersion || RLS_CLIENT_VERSION);
         this.fetch = fetchImpl;
         this.sleep = sleep;
         this.now = now;
@@ -132,6 +238,8 @@ class ClodexApi {
         const key = auth ? validateKey(this.getKey?.()) : '';
         const headers = new Headers();
         if (key) headers.set('Authorization', `Bearer ${key}`);
+        if (this.clientVersion) headers.set('X-Clodex-Client', `rp-studio/${this.clientVersion}`);
+        if (this.host && this.host !== 'other') headers.set('X-Clodex-Host', this.host);
         if (body !== undefined) headers.set('Content-Type', 'application/json');
         for (const [name, value] of Object.entries(extraHeaders || {})) {
             if (value !== undefined && value !== null) headers.set(name, String(value));
@@ -212,6 +320,19 @@ class ClodexApi {
 
     status(signal) {
         return this.request('/api/status', { signal, auth: false, timeout: 15_000 });
+    }
+
+    studioRelease(signal) {
+        return this.request('/v1/rp/studio/release', { signal, auth: false, timeout: 12_000 });
+    }
+
+    sendFeedback({ category = 'idea', message = '', contact = '' } = {}, signal) {
+        return this.request('/v1/rp/studio/feedback', {
+            method: 'POST',
+            body: { category, message, contact, host: this.host, clientVersion: this.clientVersion },
+            signal,
+            timeout: 15_000,
+        });
     }
 
     voices(model, { search = '', page = 1, signal } = {}) {
@@ -913,6 +1034,12 @@ function gaNormalizePrefs(raw) {
         ).slice(-5).map(({ giftId, kind, name, code, sentAt }) => ({ giftId, kind, name: String(name || '').slice(0, 80), code, sentAt })),
         redeemedGiftIds: [...new Set((Array.isArray(source.redeemedGiftIds) ? source.redeemedGiftIds : [])
             .filter(id => typeof id === 'string' && /^gft_[a-f0-9]{16}$/.test(id)))].slice(-100),
+        dismissedReleaseVersion: typeof source.dismissedReleaseVersion === 'string'
+            && /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:-[a-z0-9.]{1,16})?$/.test(source.dismissedReleaseVersion)
+            ? source.dismissedReleaseVersion : '',
+        dismissedAnnouncementId: typeof source.dismissedAnnouncementId === 'string'
+            && /^[a-zA-Z0-9_-]{1,48}$/.test(source.dismissedAnnouncementId)
+            ? source.dismissedAnnouncementId : '',
         pendingEggs: Array.isArray(source.pendingEggs) ? source.pendingEggs.map(gaNormalizeEgg).filter(Boolean).slice(-24) : [],
     };
 }
@@ -8750,6 +8877,150 @@ function vCrRenderRelicClaim(doc, t, model, actions) {
     );
 }
 
+// --- src/core/views/release-banner.js ---
+function vRlsRenderBanner(doc, t, model, actions) {
+    const { bulletin, showUpdate, showAnnouncement, host, updating } = model;
+    if (!bulletin || (!showUpdate && !showAnnouncement)) return null;
+    const isRu = model.locale === 'ru';
+    const title = isRu ? bulletin.titleRu : bulletin.titleEn;
+    const highlights = (isRu ? bulletin.highlightsRu : bulletin.highlightsEn) || [];
+    const announcementText = isRu ? (bulletin.announcementRu || bulletin.announcementEn) : (bulletin.announcementEn || bulletin.announcementRu);
+
+    const children = [];
+    if (showUpdate) {
+        const downloadUrl = host === 'sillytavern' ? (bulletin.zipUrl || bulletin.releaseUrl) : bulletin.tpgUrl;
+        const primaryAction = host === 'sillytavern' && actions.onSelfUpdate
+            ? vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn-mini active',
+                disabled: Boolean(updating),
+                dataset: { rpAction: 'release-self-update' },
+                onClick: () => actions.onSelfUpdate(),
+            }, updating ? t('release.updating') : `🔄 ${t('release.updateSt')}`)
+            : vEl(doc, 'a', {
+                className: 'clodex-rp-btn-mini active clodex-rp-link-btn',
+                href: downloadUrl,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                dataset: { rpAction: 'release-download' },
+            }, `📥 ${t(host === 'tavo' ? 'release.downloadTpg' : 'release.downloadZip', { version: bulletin.latestVersion })}`);
+        if (primaryAction.tagName === 'A') {
+            primaryAction.setAttribute?.('href', downloadUrl);
+            primaryAction.setAttribute?.('target', '_blank');
+            primaryAction.setAttribute?.('rel', 'noopener noreferrer');
+        }
+        const notesLink = vEl(doc, 'a', {
+            className: 'clodex-rp-btn-mini clodex-rp-link-btn',
+            href: bulletin.releaseUrl,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            dataset: { rpAction: 'release-notes' },
+        }, `↗ ${t('release.whatsNew')}`);
+        notesLink.setAttribute?.('href', bulletin.releaseUrl);
+        notesLink.setAttribute?.('target', '_blank');
+        notesLink.setAttribute?.('rel', 'noopener noreferrer');
+
+        children.push(
+            vEl(doc, 'div', { className: 'clodex-rp-list-item' },
+                vEl(doc, 'strong', {}, `🆕 ${title}`),
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini',
+                    title: t('release.dismiss'),
+                    dataset: { rpAction: 'release-dismiss' },
+                    onClick: () => actions.onDismissUpdate?.(bulletin.latestVersion),
+                }, '✕'),
+            ),
+            ...highlights.map(line => vEl(doc, 'div', { className: 'clodex-rp-muted' }, line)),
+            host === 'tavo' ? vEl(doc, 'div', { className: 'clodex-rp-muted' }, t('release.tavoHint')) : null,
+            vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' }, primaryAction, notesLink),
+        );
+    }
+
+    if (showAnnouncement && (announcementText || bulletin.promoGiftCode)) {
+        children.push(
+            vEl(doc, 'div', { className: 'clodex-rp-list-item clodex-rp-mt' },
+                vEl(doc, 'strong', {}, `📢 ${announcementText || t('release.promoTitle')}`),
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini',
+                    title: t('release.dismiss'),
+                    dataset: { rpAction: 'announcement-dismiss' },
+                    onClick: () => actions.onDismissAnnouncement?.(bulletin.announcementId),
+                }, '✕'),
+            ),
+            bulletin.promoGiftCode ? vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                vEl(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini active',
+                    dataset: { rpAction: 'claim-promo-pet' },
+                    onClick: () => actions.onClaimPromo?.(bulletin.promoGiftCode, bulletin.announcementId),
+                }, `🎁 ${t('release.claimPromoPet')}`),
+            ) : null,
+        );
+    }
+
+    return vEl(doc, 'section', { className: 'clodex-rp-card', dataset: { rpView: 'release-banner' } }, ...children);
+}
+function vRlsRenderFeedback(doc, t, model, actions) {
+    if (!model.open) return null;
+    const categories = [
+        ['idea', `💡 ${t('release.cat.idea')}`],
+        ['bug', `🐛 ${t('release.cat.bug')}`],
+        ['praise', `❤️ ${t('release.cat.praise')}`],
+    ];
+    return vEl(doc, 'section', { className: 'clodex-rp-card', dataset: { rpView: 'feedback-panel' } },
+        vEl(doc, 'div', { className: 'clodex-rp-list-item' },
+            vEl(doc, 'strong', {}, `💬 ${t('release.feedbackTitle')}`),
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn-mini',
+                dataset: { rpAction: 'feedback-close' },
+                onClick: () => actions.onClose?.(),
+            }, '✕'),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+            ...categories.map(([id, label]) => vEl(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-chip-btn ${model.category === id ? 'active' : ''}`,
+                dataset: { rpAction: 'feedback-cat', cat: id },
+                onClick: () => actions.onCategory?.(id),
+            }, label)),
+        ),
+        vEl(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+            vEl(doc, 'span', {}, t('release.feedbackPlaceholder')),
+            vEl(doc, 'textarea', {
+                className: 'clodex-rp-input',
+                rows: 2,
+                maxLength: 1000,
+                value: model.message,
+                dataset: { rpInput: 'feedback-message' },
+                onInput: e => actions.onMessage?.(String(e.target.value)),
+            }),
+        ),
+        vEl(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+            vEl(doc, 'span', {}, t('release.feedbackContact')),
+            vEl(doc, 'input', {
+                type: 'text',
+                className: 'clodex-rp-input',
+                maxLength: 80,
+                value: model.contact,
+                dataset: { rpInput: 'feedback-contact' },
+                onInput: e => actions.onContact?.(String(e.target.value)),
+            }),
+        ),
+        vEl(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+            vEl(doc, 'button', {
+                type: 'button',
+                className: 'clodex-rp-btn clodex-rp-btn-primary',
+                disabled: Boolean(model.busy),
+                dataset: { rpAction: 'feedback-submit' },
+                onClick: () => actions.onSubmit?.(),
+            }, model.busy ? t('release.feedbackSending') : t('release.feedbackSubmit')),
+        ),
+    );
+}
+
 // --- src/core/hud.js ---
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -8877,12 +9148,22 @@ function createRpStudioController(bridge) {
     let relicCardStatus = '';
     let relicCardVerified = false;
     let verifiedRelics = new Map();
+    let releaseBulletin = null;
+    let releaseUpdating = false;
+    let feedbackOpen = false;
+    let feedbackCategory = 'idea';
+    let feedbackMessage = '';
+    let feedbackContact = '';
+    let feedbackBusy = false;
     // A host may emit both MESSAGE_RECEIVED and its own assistant-turn event.
     // Keep turn consequences idempotent for the lifetime of this controller.
     const committedTurnKeys = new Set();
+    const clientHost = rlsNormalizeHost(bridge.host);
 
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
+        host: clientHost,
+        clientVersion: RLS_CLIENT_VERSION,
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
     });
 
@@ -9259,8 +9540,79 @@ function createRpStudioController(bridge) {
         }
 
         const chips = [...primary, ...secondary].slice(0, HUD_MAX_CHIPS);
+        if (hasReleaseUpdate() || hasActiveAnnouncement()) {
+            chips.push(el(doc, 'span', {
+                className: 'clodex-rp-head-badge',
+                dataset: { rpBadge: 'update' },
+                title: t('release.badgeTitle'),
+            }, '⬆'));
+        }
         hudPill.replaceChildren(...chips);
         syncVideoBackdrop();
+    }
+
+    function hasReleaseUpdate() {
+        return Boolean(
+            releaseBulletin
+            && rlsIsNewerVersion(releaseBulletin.latestVersion, RLS_CLIENT_VERSION)
+            && rpPrefs.dismissedReleaseVersion !== releaseBulletin.latestVersion,
+        );
+    }
+
+    function hasActiveAnnouncement() {
+        return Boolean(
+            releaseBulletin?.announcementId
+            && (releaseBulletin.announcementRu || releaseBulletin.announcementEn || releaseBulletin.promoGiftCode)
+            && rpPrefs.dismissedAnnouncementId !== releaseBulletin.announcementId,
+        );
+    }
+
+    async function checkStudioRelease() {
+        try {
+            const res = await api.studioRelease();
+            const parsed = rlsNormalizeBulletin(res?.data ?? res);
+            if (parsed) {
+                releaseBulletin = parsed;
+                renderAll();
+            }
+        } catch {
+            // Silent when offline or on older servers
+        }
+    }
+
+    async function submitFeedback() {
+        if (feedbackBusy) return;
+        if (!bridge.getEffectiveKey()) {
+            errorBanner = t('release.error.noKey');
+            renderAll();
+            return;
+        }
+        let payload;
+        try {
+            payload = rlsSanitizeFeedback({
+                category: feedbackCategory,
+                message: feedbackMessage,
+                contact: feedbackContact,
+            });
+        } catch {
+            errorBanner = t('release.error.tooShort');
+            renderAll();
+            return;
+        }
+        feedbackBusy = true;
+        renderDrawer();
+        try {
+            await api.sendFeedback(payload);
+            feedbackMessage = '';
+            feedbackOpen = false;
+            errorBanner = '';
+            bridge.notify?.(t('release.feedbackSent'));
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, bridge.getEffectiveKey());
+        } finally {
+            feedbackBusy = false;
+            renderAll();
+        }
     }
 
     async function refreshAccount() {
@@ -13668,9 +14020,79 @@ function createRpStudioController(bridge) {
         else body = renderTrackerTab(state);
 
         const unseen = Number(phoneCache.unseen) || 0;
+        const localeKey = String(bridge.getLocale?.() || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+        const releaseBannerNode = vRlsRenderBanner(doc, t, {
+            bulletin: releaseBulletin,
+            showUpdate: hasReleaseUpdate(),
+            showAnnouncement: hasActiveAnnouncement(),
+            host: clientHost,
+            locale: localeKey,
+            updating: releaseUpdating,
+        }, {
+            onDismissUpdate: async ver => {
+                await saveRpEntitlements({ ...rpPrefs, dismissedReleaseVersion: ver });
+                renderAll();
+            },
+            onDismissAnnouncement: async id => {
+                await saveRpEntitlements({ ...rpPrefs, dismissedAnnouncementId: id });
+                renderAll();
+            },
+            onSelfUpdate: typeof bridge.selfUpdateExtension === 'function' ? async () => {
+                if (releaseUpdating) return;
+                releaseUpdating = true;
+                renderDrawer();
+                try {
+                    const ok = await bridge.selfUpdateExtension();
+                    if (ok) {
+                        bridge.notify?.(t('release.updatedReload'));
+                    } else {
+                        errorBanner = t('release.updateManual');
+                    }
+                } finally {
+                    releaseUpdating = false;
+                    renderAll();
+                }
+            } : null,
+            onClaimPromo: async (promoCode, announceId) => {
+                await runGift('received', (st, prefs) => {
+                    const out = giftRedeem(st, prefs, promoCode);
+                    if (announceId) prefs.dismissedAnnouncementId = announceId;
+                    return out;
+                });
+                activeTab = 'cradle';
+                renderAll();
+            },
+        });
+        const feedbackNode = vRlsRenderFeedback(doc, t, {
+            open: feedbackOpen,
+            category: feedbackCategory,
+            message: feedbackMessage,
+            contact: feedbackContact,
+            busy: feedbackBusy,
+        }, {
+            onClose: () => { feedbackOpen = false; renderDrawer(); },
+            onCategory: cat => { feedbackCategory = cat; renderDrawer(); },
+            onMessage: val => { feedbackMessage = val; },
+            onContact: val => { feedbackContact = val; },
+            onSubmit: () => submitFeedback(),
+        });
+
         const drawerChildren = [
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
-                el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
+                el(doc, 'div', { style: 'display:flex;align-items:center;gap:6px;min-width:0' },
+                    el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-btn-mini ${feedbackOpen ? 'active' : ''}`,
+                        title: t('release.feedbackBtn'),
+                        'aria-label': t('release.feedbackBtn'),
+                        dataset: { rpAction: 'toggle-feedback' },
+                        onClick: () => {
+                            feedbackOpen = !feedbackOpen;
+                            renderDrawer();
+                        },
+                    }, `💬 ${t('release.feedbackBtn')}`),
+                ),
                 el(doc, 'div', { className: 'clodex-rp-head-actions' },
                     el(doc, 'button', {
                         type: 'button',
@@ -13743,6 +14165,8 @@ function createRpStudioController(bridge) {
         if (errorBanner) {
             drawerChildren.push(el(doc, 'div', { className: 'clodex-rp-error' }, errorBanner));
         }
+        if (releaseBannerNode) drawerChildren.push(releaseBannerNode);
+        if (feedbackNode) drawerChildren.push(feedbackNode);
         if (body) drawerChildren.push(body);
         drawerPanel.replaceChildren(...drawerChildren);
     }
@@ -13824,6 +14248,7 @@ function createRpStudioController(bridge) {
     syncCachedCharName();
     loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
     loadRpEntitlements().then(renderAll).catch(() => {});
+    checkStudioRelease();
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }
@@ -14383,6 +14808,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
             }
             return () => {};
         },
+        host: 'tavo',
     };
 
     const controller = createRpStudioController(bridge);

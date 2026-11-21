@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.1 — 2026-11-21
+
+- **In-App Update Notices, Promo Pet Drops & 1-Tap Feedback (`💬 Отзыв / Feedback`)**:
+  - Automatic non-intrusive release & announcement check via `GET /v1/rp/studio/release` (`0` extra GitHub calls): shows a subtle `⬆` badge on the HUD pill and a dismissible update card with direct `.tpg` download for **Tavo AI** or **1-click extension update** (`/api/extensions/update`) for **SillyTavern**.
+  - Supports remote promo announcements and 1-tap `CLXPET1:` gift pet drops directly inside the drawer.
+  - Added a `💬 Отзыв / Feedback` button in the drawer header to send ideas or bug reports directly to the developer (`POST /v1/rp/studio/feedback`, `0` quota charged) and privacy-safe `X-Clodex-Client` / `X-Clodex-Host` version headers.
+
 ## 1.5.0 — 2026-11-20
 
 - **Pet & Egg Gift Capsules (`🎁 Pet Gifts`, `CLXPET1:` / `.clodex-pet`)**: package any ordinary companion or Altar egg into an offline shareable `CLXPET1:` code or `.clodex-pet` file with sender alias and 140-char note (no local paths, chat text, or ownership tokens). Includes local replay guard, unlocked-skin transfer, and sender recall backup.

@@ -56,7 +56,9 @@ import {
 
 import { giftParse, giftRecallSent, giftRedeem, giftSend } from './gift.js';
 import { nestConsumeHints, nestDetach, nestOperationKey, nestPassport, nestQueueCare, nestSanitizeLabel, nestSnapshot, nestStoryOps, nestTransport } from './coopNest.js';
+import { RLS_CLIENT_VERSION, rlsIsNewerVersion, rlsNormalizeBulletin, rlsNormalizeHost, rlsSanitizeFeedback } from './release.js';
 import { vCrRenderGifts, vCrRenderJoin, vCrRenderNest, vCrRenderRelicClaim } from './views/cradle-social.js';
+import { vRlsRenderBanner, vRlsRenderFeedback } from './views/release-banner.js';
 
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -185,12 +187,22 @@ export function createRpStudioController(bridge) {
     let relicCardStatus = '';
     let relicCardVerified = false;
     let verifiedRelics = new Map();
+    let releaseBulletin = null;
+    let releaseUpdating = false;
+    let feedbackOpen = false;
+    let feedbackCategory = 'idea';
+    let feedbackMessage = '';
+    let feedbackContact = '';
+    let feedbackBusy = false;
     // A host may emit both MESSAGE_RECEIVED and its own assistant-turn event.
     // Keep turn consequences idempotent for the lifetime of this controller.
     const committedTurnKeys = new Set();
+    const clientHost = rlsNormalizeHost(bridge.host);
 
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
+        host: clientHost,
+        clientVersion: RLS_CLIENT_VERSION,
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
     });
 
@@ -567,8 +579,79 @@ export function createRpStudioController(bridge) {
         }
 
         const chips = [...primary, ...secondary].slice(0, HUD_MAX_CHIPS);
+        if (hasReleaseUpdate() || hasActiveAnnouncement()) {
+            chips.push(el(doc, 'span', {
+                className: 'clodex-rp-head-badge',
+                dataset: { rpBadge: 'update' },
+                title: t('release.badgeTitle'),
+            }, '⬆'));
+        }
         hudPill.replaceChildren(...chips);
         syncVideoBackdrop();
+    }
+
+    function hasReleaseUpdate() {
+        return Boolean(
+            releaseBulletin
+            && rlsIsNewerVersion(releaseBulletin.latestVersion, RLS_CLIENT_VERSION)
+            && rpPrefs.dismissedReleaseVersion !== releaseBulletin.latestVersion,
+        );
+    }
+
+    function hasActiveAnnouncement() {
+        return Boolean(
+            releaseBulletin?.announcementId
+            && (releaseBulletin.announcementRu || releaseBulletin.announcementEn || releaseBulletin.promoGiftCode)
+            && rpPrefs.dismissedAnnouncementId !== releaseBulletin.announcementId,
+        );
+    }
+
+    async function checkStudioRelease() {
+        try {
+            const res = await api.studioRelease();
+            const parsed = rlsNormalizeBulletin(res?.data ?? res);
+            if (parsed) {
+                releaseBulletin = parsed;
+                renderAll();
+            }
+        } catch {
+            // Silent when offline or on older servers
+        }
+    }
+
+    async function submitFeedback() {
+        if (feedbackBusy) return;
+        if (!bridge.getEffectiveKey()) {
+            errorBanner = t('release.error.noKey');
+            renderAll();
+            return;
+        }
+        let payload;
+        try {
+            payload = rlsSanitizeFeedback({
+                category: feedbackCategory,
+                message: feedbackMessage,
+                contact: feedbackContact,
+            });
+        } catch {
+            errorBanner = t('release.error.tooShort');
+            renderAll();
+            return;
+        }
+        feedbackBusy = true;
+        renderDrawer();
+        try {
+            await api.sendFeedback(payload);
+            feedbackMessage = '';
+            feedbackOpen = false;
+            errorBanner = '';
+            bridge.notify?.(t('release.feedbackSent'));
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, bridge.getEffectiveKey());
+        } finally {
+            feedbackBusy = false;
+            renderAll();
+        }
     }
 
     async function refreshAccount() {
@@ -4976,9 +5059,79 @@ export function createRpStudioController(bridge) {
         else body = renderTrackerTab(state);
 
         const unseen = Number(phoneCache.unseen) || 0;
+        const localeKey = String(bridge.getLocale?.() || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+        const releaseBannerNode = vRlsRenderBanner(doc, t, {
+            bulletin: releaseBulletin,
+            showUpdate: hasReleaseUpdate(),
+            showAnnouncement: hasActiveAnnouncement(),
+            host: clientHost,
+            locale: localeKey,
+            updating: releaseUpdating,
+        }, {
+            onDismissUpdate: async ver => {
+                await saveRpEntitlements({ ...rpPrefs, dismissedReleaseVersion: ver });
+                renderAll();
+            },
+            onDismissAnnouncement: async id => {
+                await saveRpEntitlements({ ...rpPrefs, dismissedAnnouncementId: id });
+                renderAll();
+            },
+            onSelfUpdate: typeof bridge.selfUpdateExtension === 'function' ? async () => {
+                if (releaseUpdating) return;
+                releaseUpdating = true;
+                renderDrawer();
+                try {
+                    const ok = await bridge.selfUpdateExtension();
+                    if (ok) {
+                        bridge.notify?.(t('release.updatedReload'));
+                    } else {
+                        errorBanner = t('release.updateManual');
+                    }
+                } finally {
+                    releaseUpdating = false;
+                    renderAll();
+                }
+            } : null,
+            onClaimPromo: async (promoCode, announceId) => {
+                await runGift('received', (st, prefs) => {
+                    const out = giftRedeem(st, prefs, promoCode);
+                    if (announceId) prefs.dismissedAnnouncementId = announceId;
+                    return out;
+                });
+                activeTab = 'cradle';
+                renderAll();
+            },
+        });
+        const feedbackNode = vRlsRenderFeedback(doc, t, {
+            open: feedbackOpen,
+            category: feedbackCategory,
+            message: feedbackMessage,
+            contact: feedbackContact,
+            busy: feedbackBusy,
+        }, {
+            onClose: () => { feedbackOpen = false; renderDrawer(); },
+            onCategory: cat => { feedbackCategory = cat; renderDrawer(); },
+            onMessage: val => { feedbackMessage = val; },
+            onContact: val => { feedbackContact = val; },
+            onSubmit: () => submitFeedback(),
+        });
+
         const drawerChildren = [
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
-                el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
+                el(doc, 'div', { style: 'display:flex;align-items:center;gap:6px;min-width:0' },
+                    el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-btn-mini ${feedbackOpen ? 'active' : ''}`,
+                        title: t('release.feedbackBtn'),
+                        'aria-label': t('release.feedbackBtn'),
+                        dataset: { rpAction: 'toggle-feedback' },
+                        onClick: () => {
+                            feedbackOpen = !feedbackOpen;
+                            renderDrawer();
+                        },
+                    }, `💬 ${t('release.feedbackBtn')}`),
+                ),
                 el(doc, 'div', { className: 'clodex-rp-head-actions' },
                     el(doc, 'button', {
                         type: 'button',
@@ -5051,6 +5204,8 @@ export function createRpStudioController(bridge) {
         if (errorBanner) {
             drawerChildren.push(el(doc, 'div', { className: 'clodex-rp-error' }, errorBanner));
         }
+        if (releaseBannerNode) drawerChildren.push(releaseBannerNode);
+        if (feedbackNode) drawerChildren.push(feedbackNode);
         if (body) drawerChildren.push(body);
         drawerPanel.replaceChildren(...drawerChildren);
     }
@@ -5132,6 +5287,7 @@ export function createRpStudioController(bridge) {
     syncCachedCharName();
     loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
     loadRpEntitlements().then(renderAll).catch(() => {});
+    checkStudioRelease();
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }

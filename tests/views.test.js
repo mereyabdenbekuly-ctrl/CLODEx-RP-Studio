@@ -315,6 +315,20 @@ function makeTestHarness({ locale = 'ru', bottomInput = 74, chatOverrides = {}, 
         if (u.endsWith('/api/pricing') || u.endsWith('/api/status')) {
             return new Response(JSON.stringify({ data: [] }), { status: 200 });
         }
+        if (u.endsWith('/v1/rp/studio/release')) {
+            return new Response(JSON.stringify({
+                success: true,
+                data: {
+                    latestVersion: '1.5.1',
+                    titleRu: 'CLODEx RP Studio v1.5.1',
+                    titleEn: 'CLODEx RP Studio v1.5.1',
+                    highlightsRu: [],
+                    highlightsEn: [],
+                    tpgUrl: 'https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.5.1/CLODEx-RP-Studio-1.5.1.tpg',
+                    releaseUrl: 'https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/tag/v1.5.1',
+                },
+            }), { status: 200 });
+        }
         if (u.endsWith('/v1/rp/relics/catalog')) {
             return new Response(JSON.stringify({ editions: [] }), { status: 200 });
         }
@@ -503,7 +517,7 @@ test('All screens, header order, single-row 4 tabs, HUD <= 4 chips, and RU/EN lo
 
             // No raw unresolved keys leaked into visible text
             const text = drawer.textContent;
-            assert.ok(!/\b(?:director|slop|turn|phone|wiki|pack|codex|tab|hud|account|uw|gacha|relic|cradle|bio|vitals|meters|inv|scene|voice|forge|tracker)\.[a-z][a-zA-Z0-9_]*\b/.test(text),
+            assert.ok(!/\b(?:director|slop|turn|phone|wiki|pack|codex|tab|hud|account|uw|gacha|relic|release|cradle|bio|vitals|meters|inv|scene|voice|forge|tracker)\.[a-z][a-zA-Z0-9_]*\b/.test(text),
                 `Raw key found in ${lang}/${tab}: ${text}`);
         }
     }

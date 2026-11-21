@@ -408,6 +408,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
             }
             return () => {};
         },
+        host: 'tavo',
     };
 
     const controller = createRpStudioController(bridge);
